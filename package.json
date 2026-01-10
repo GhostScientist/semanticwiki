@@ -1,6 +1,6 @@
 {
   "name": "ted-mosby",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Generate comprehensive architectural documentation wikis for code repositories with source traceability.",
   "main": "dist/cli.js",
   "bin": {

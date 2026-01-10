@@ -2,6 +2,14 @@
 
 All notable changes to ted-mosby will be documented in this file.
 
+## [1.1.2] - 2026-01-10
+
+### Changed
+- README rewrite highlighting two main capabilities upfront:
+  - **Wiki Generation** (`ted-mosby generate`) - Point at any codebase, get architectural docs
+  - **Agentic Codebase Assistant** - RAG-powered agent that explores, searches, and reasons about code
+- New "Two Ways to Use Ted Mosby" section explaining both use cases
+
 ## [1.1.1] - 2026-01-10
 
 ### Changed
