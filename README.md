@@ -2,23 +2,52 @@
 
 > "Kids, I'm going to tell you an incredible story... the story of your codebase architecture."
 
-An AI-powered CLI tool that generates comprehensive architectural documentation wikis for code repositories with source code traceability.
+An AI-powered CLI that does two things:
+
+1. **Generates architectural wikis** with source code traceability (`file:line` references)
+2. **Works as an agentic coding assistant** like Claude Code
 
 **Built with [buildanagentworkshop.com](https://buildanagentworkshop.com)**
 
 ---
 
-## What is Ted Mosby?
+## Two Ways to Use Ted Mosby
 
-Ted Mosby is an AI agent that reads your codebase and automatically generates professional architectural documentation. Unlike generic documentation tools, every concept in the generated wiki links directly to the source code (`file:line` references), making it easy to navigate from documentation to implementation.
+### 1. Generate Documentation (`ted-mosby generate`)
 
-### Generated Documentation Includes:
+Point Ted Mosby at any codebase and get a complete architectural wiki:
 
-- **Architecture Overview** - High-level system design with Mermaid diagrams
-- **Module Documentation** - Per-component breakdowns with source traceability
-- **Data Flow Documentation** - How data moves through your system
-- **Getting Started Guides** - Onboarding documentation for new developers
-- **Glossary** - Key concepts and terminology
+```bash
+ted-mosby generate -r ./my-project --site
+```
+
+This creates:
+- **Architecture Overview** with Mermaid diagrams
+- **Module Documentation** with source traceability
+- **Data Flow Documentation**
+- **Getting Started Guides**
+- **Interactive static site** with search, keyboard nav, dark mode
+
+Every concept links directly to source code (`src/auth/jwt.ts:23-67`), so you can navigate from docs to implementation.
+
+### 2. Agentic Codebase Assistant
+
+Under the hood, Ted Mosby is a full agentic coding assistant powered by Claude. It doesn't just template docs—it:
+
+- **Explores your codebase** using filesystem tools
+- **Searches semantically** via RAG embeddings (FAISS + all-MiniLM-L6-v2)
+- **Reasons about architecture** to identify patterns and relationships
+- **Writes and verifies** documentation with automatic link checking
+
+```bash
+# The agent runs autonomously, reading files, searching code, writing docs
+ted-mosby generate -r ./my-project --verbose
+
+# Continue where you left off—agent resumes with cached context
+ted-mosby continue -r ./my-project --skip-index
+```
+
+The same RAG system that powers documentation generation gives the agent deep, semantic understanding of your codebase—like Claude Code, but with your entire project pre-indexed for instant retrieval.
 
 ---
 
