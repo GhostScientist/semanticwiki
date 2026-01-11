@@ -836,7 +836,8 @@ export function getClientScripts(features: Features): string {
     messages: [],
     abortController: null,
     runtime: null, // 'webgpu', 'wasm', or 'fallback'
-    modelSize: null
+    modelSize: null,
+    error: null // Track any critical errors
   };
 
   // Browser capability detection
@@ -955,13 +956,88 @@ export function getClientScripts(features: Features): string {
     if (!badge) return;
 
     const config = browserCapabilities.getRecommendedConfig();
-    if (chatState.runtime) {
+    if (chatState.error) {
+      badge.textContent = 'Unavailable';
+      badge.className = 'chat-model-badge runtime-error';
+    } else if (chatState.runtime) {
       badge.textContent = chatState.runtime === 'webgpu' ? 'SmolLM2 (WebGPU)' :
                           chatState.runtime === 'wasm' ? 'SmolLM2 (WASM)' : 'Search Mode';
       badge.className = 'chat-model-badge runtime-' + chatState.runtime;
     } else {
       badge.textContent = 'Detecting...';
     }
+  }
+
+  function showChatUnsupportedNotice(reason) {
+    const messagesContainer = document.querySelector('.chat-messages');
+    const welcomeEl = messagesContainer?.querySelector('.chat-welcome');
+    const inputArea = document.querySelector('.chat-input-area');
+
+    if (welcomeEl) {
+      welcomeEl.innerHTML = \`
+        <div class="chat-error-notice">
+          <div class="chat-error-icon">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+          </div>
+          <h4>Chat Not Available</h4>
+          <p class="chat-error-reason">\${reason}</p>
+          <div class="chat-error-alternatives">
+            <p>You can still:</p>
+            <ul>
+              <li><a href="#" class="use-search-link">Use the search feature</a> to find documentation</li>
+              <li>Browse the sidebar navigation</li>
+              <li>View the architecture diagrams</li>
+            </ul>
+          </div>
+        </div>
+      \`;
+
+      // Add click handler for search link
+      welcomeEl.querySelector('.use-search-link')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        document.querySelector('.chat-panel')?.classList.remove('open');
+        document.querySelector('.search-trigger')?.click();
+      });
+    }
+
+    if (inputArea) {
+      inputArea.style.display = 'none';
+    }
+  }
+
+  function detectBrowserIssues() {
+    const issues = [];
+
+    // Check for private/incognito mode (localStorage may be unavailable)
+    try {
+      localStorage.setItem('__test__', '1');
+      localStorage.removeItem('__test__');
+    } catch (e) {
+      issues.push('Private browsing mode detected - storage unavailable');
+    }
+
+    // Check for outdated browser
+    if (!window.fetch) {
+      issues.push('Your browser is outdated - fetch API not supported');
+    }
+
+    // Check for dynamic imports
+    try {
+      new Function('return import("")');
+    } catch (e) {
+      issues.push('Dynamic imports not supported');
+    }
+
+    // Check WebAssembly
+    if (!browserCapabilities.hasWasm) {
+      issues.push('WebAssembly not supported');
+    }
+
+    return issues;
   }
 
   async function loadEmbeddingsIndex() {
@@ -978,6 +1054,15 @@ export function getClientScripts(features: Features): string {
 
   async function loadAIModel() {
     if (chatState.isModelLoaded || chatState.isLoading) return;
+
+    // Check for critical browser issues first
+    const browserIssues = detectBrowserIssues();
+    if (browserIssues.length > 0) {
+      chatState.error = browserIssues.join('. ');
+      showChatUnsupportedNotice(chatState.error);
+      updateRuntimeBadge();
+      return;
+    }
 
     chatState.isLoading = true;
     const statusEl = document.querySelector('.chat-panel-status');
@@ -1067,18 +1152,53 @@ export function getClientScripts(features: Features): string {
     } catch (error) {
       console.error('Failed to load AI model:', error);
       chatState.isLoading = false;
-      chatState.runtime = 'fallback';
 
-      if (loadingText) loadingText.textContent = 'Using smart search mode (AI model unavailable)';
+      // Determine the type of error and respond appropriately
+      const errorMsg = error.message || String(error);
 
-      // Use fallback mode (keyword search only)
-      setTimeout(() => {
-        statusEl?.classList.remove('visible');
-        chatState.isModelLoaded = true; // Enable chat with fallback
+      if (errorMsg.includes('NetworkError') || errorMsg.includes('Failed to fetch')) {
+        // Network error - might work offline or with retry
+        chatState.runtime = 'fallback';
+        if (loadingText) loadingText.textContent = 'Network unavailable - using search mode';
+
+        setTimeout(() => {
+          statusEl?.classList.remove('visible');
+          chatState.isModelLoaded = true;
+          updateRuntimeBadge();
+          if (sendBtn) sendBtn.disabled = false;
+          showToast('Chat ready in offline mode', 'info');
+        }, 1500);
+      } else if (errorMsg.includes('out of memory') || errorMsg.includes('OOM')) {
+        // Memory error - show notice and disable
+        chatState.error = 'Not enough memory to load AI model. Try closing other tabs.';
+        showChatUnsupportedNotice(chatState.error);
         updateRuntimeBadge();
-        if (sendBtn) sendBtn.disabled = false;
-        showToast('Chat ready in search mode', 'info');
-      }, 1500);
+        statusEl?.classList.remove('visible');
+      } else if (errorMsg.includes('WebGPU') || errorMsg.includes('GPU')) {
+        // GPU error - fall back to WASM
+        chatState.runtime = 'fallback';
+        if (loadingText) loadingText.textContent = 'GPU unavailable - using smart search';
+
+        setTimeout(() => {
+          statusEl?.classList.remove('visible');
+          chatState.isModelLoaded = true;
+          updateRuntimeBadge();
+          if (sendBtn) sendBtn.disabled = false;
+          showToast('Chat ready in search mode', 'info');
+        }, 1500);
+      } else {
+        // Generic fallback
+        chatState.runtime = 'fallback';
+        if (loadingText) loadingText.textContent = 'Using smart search mode';
+
+        setTimeout(() => {
+          statusEl?.classList.remove('visible');
+          chatState.isModelLoaded = true;
+          updateRuntimeBadge();
+          if (sendBtn) sendBtn.disabled = false;
+          showToast('Chat ready in search mode', 'info');
+        }, 1500);
+      }
     }
   }
 
@@ -1200,10 +1320,25 @@ export function getClientScripts(features: Features): string {
       .map(p => '<p>' + p.replace(/\\n/g, '<br>') + '</p>')
       .join('');
 
-    // Code formatting
+    // Code formatting - handle mermaid diagrams specially
     formatted = formatted
-      .replace(/\`\`\`(\\w*)\\n([\\s\\S]*?)\`\`\`/g, '<pre><code class="language-$1">$2</code></pre>')
-      .replace(/\`([^\`]+)\`/g, '<code>$1</code>');
+      .replace(/\\\`\\\`\\\`mermaid\\n([\\s\\S]*?)\\\`\\\`\\\`/g, (match, diagram) => {
+        const diagramId = 'chat-diagram-' + Date.now();
+        // Schedule mermaid rendering after DOM update
+        setTimeout(() => {
+          const el = document.getElementById(diagramId);
+          if (el && window.mermaid) {
+            try {
+              window.mermaid.init(undefined, el);
+            } catch (e) {
+              console.warn('Mermaid render error:', e);
+            }
+          }
+        }, 100);
+        return '<div class="chat-diagram-container"><div class="mermaid" id="' + diagramId + '">' + diagram.trim() + '</div></div>';
+      })
+      .replace(/\\\`\\\`\\\`(\\w*)\\n([\\s\\S]*?)\\\`\\\`\\\`/g, '<pre><code class="language-$1">$2</code></pre>')
+      .replace(/\\\`([^\\\`]+)\\\`/g, '<code>$1</code>');
 
     // Bold and italic
     formatted = formatted
@@ -1322,8 +1457,98 @@ export function getClientScripts(features: Features): string {
     return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
   }
 
+  // Detect if question is asking for a flow/trace visualization
+  function isTraceQuestion(question) {
+    const tracePatterns = [
+      /how does .+ work/i,
+      /what happens when/i,
+      /trace .+ flow/i,
+      /show .+ flow/i,
+      /walk.* through/i,
+      /step.* by.* step/i,
+      /sequence of/i,
+      /data flow/i,
+      /call flow/i,
+      /explain the flow/i,
+      /show me how/i,
+      /visualize/i,
+      /diagram/i,
+      /architecture of/i,
+      /components.* interact/i
+    ];
+    return tracePatterns.some(p => p.test(question));
+  }
+
+  // Generate a mermaid flowchart from context
+  function generateCodemapDiagram(question, context) {
+    if (context.length < 2) return null;
+
+    // Build a simple flow diagram from the found context
+    const nodes = [];
+    const edges = [];
+    const nodeIds = new Map();
+
+    // Create nodes from each context item
+    context.forEach((item, i) => {
+      const nodeId = 'N' + i;
+      const shortTitle = item.title.length > 25 ? item.title.slice(0, 22) + '...' : item.title;
+      nodeIds.set(item.path, nodeId);
+      nodes.push({ id: nodeId, title: shortTitle, path: item.path, fullTitle: item.title });
+    });
+
+    // Create edges based on content relationships
+    // Look for mentions of other pages in each item's content
+    context.forEach((item, i) => {
+      const fromId = 'N' + i;
+      context.forEach((other, j) => {
+        if (i !== j) {
+          const toId = 'N' + j;
+          // Check if item mentions other's title
+          if (item.content.toLowerCase().includes(other.title.toLowerCase().split(' ')[0])) {
+            edges.push({ from: fromId, to: toId });
+          }
+        }
+      });
+    });
+
+    // If no edges found, create a sequential flow based on relevance order
+    if (edges.length === 0 && nodes.length >= 2) {
+      for (let i = 0; i < nodes.length - 1; i++) {
+        edges.push({ from: nodes[i].id, to: nodes[i + 1].id });
+      }
+    }
+
+    // Generate mermaid syntax
+    let diagram = 'flowchart TD\\n';
+
+    // Add nodes with click handlers
+    nodes.forEach(node => {
+      diagram += '    ' + node.id + '["' + node.title + '"]\\n';
+    });
+
+    // Add edges
+    edges.forEach(edge => {
+      diagram += '    ' + edge.from + ' --> ' + edge.to + '\\n';
+    });
+
+    // Add click handlers for navigation
+    nodes.forEach(node => {
+      diagram += '    click ' + node.id + ' "' + config.rootPath + node.path + '" "' + node.fullTitle + '"\\n';
+    });
+
+    return { diagram, nodes };
+  }
+
   async function generateResponse(question, context) {
     const sources = context.map(c => ({ path: c.path, title: c.title }));
+
+    // Check if this is a trace/flow question
+    const wantsVisualization = isTraceQuestion(question);
+    let codemapDiagram = null;
+
+    if (wantsVisualization && context.length >= 2) {
+      codemapDiagram = generateCodemapDiagram(question, context);
+    }
 
     // Build context string
     const contextText = context.map(c =>
@@ -1353,11 +1578,16 @@ Documentation Context:
 
         const generatedText = output[0].generated_text;
         // Extract the assistant's response (last message)
-        const assistantResponse = typeof generatedText === 'string'
+        let assistantResponse = typeof generatedText === 'string'
           ? generatedText
           : generatedText[generatedText.length - 1]?.content || 'I could not generate a response.';
 
-        return { answer: assistantResponse, sources };
+        // Add diagram if this was a trace question
+        if (codemapDiagram) {
+          assistantResponse += '\\n\\n**Visual Flow:**\\n\\n\`\`\`mermaid\\n' + codemapDiagram.diagram + '\`\`\`\\n\\n*Click on any box to navigate to that documentation page.*';
+        }
+
+        return { answer: assistantResponse, sources, diagram: codemapDiagram };
       } catch (e) {
         console.error('Generation error:', e);
         // Fall through to fallback
@@ -1383,14 +1613,20 @@ Documentation Context:
         answer += sentences.slice(0, 2).join('. ').trim() + '.';
       }
 
-      answer += '\\n\\nFor more details, check the linked sources above.';
+      // Add diagram if this was a trace question
+      if (codemapDiagram) {
+        answer += '\\n\\n**Visual Flow:**\\n\\n\`\`\`mermaid\\n' + codemapDiagram.diagram + '\`\`\`\\n\\n*Click on any box to navigate to that documentation page.*';
+      } else {
+        answer += '\\n\\nFor more details, check the linked sources above.';
+      }
 
-      return { answer, sources };
+      return { answer, sources, diagram: codemapDiagram };
     }
 
     return {
       answer: 'I couldn\\'t find specific information about that in the documentation. Try browsing the navigation menu or using the search feature to explore the available content.',
-      sources: []
+      sources: [],
+      diagram: null
     };
   }
   ` : ''}

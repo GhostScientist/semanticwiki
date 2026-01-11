@@ -184,6 +184,7 @@ export function getTemplates() {
       ${data.breadcrumbs}
 
       <article class="page-content">
+        <h1 class="page-title">${escapeHtml(data.title)}</h1>
         ${data.content}
       </article>
 
@@ -381,7 +382,7 @@ export function getTemplates() {
         <p>I'll search through the wiki and provide answers with links to relevant pages. Powered by SmolLM2 running locally in your browser.</p>
         <div class="chat-capabilities">
           <span class="capability"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg> Answer architecture questions</span>
-          <span class="capability"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg> Find relevant documentation</span>
+          <span class="capability"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg> Generate visual flow diagrams</span>
           <span class="capability"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg> Link to source pages</span>
         </div>
         <div class="chat-suggestions">
@@ -396,6 +397,10 @@ export function getTemplates() {
           <button class="chat-suggestion" data-question="What are the key concepts I should understand?">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
             What are the key concepts?
+          </button>
+          <button class="chat-suggestion" data-question="Show me how the main components work together">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M10 6.5h4M10 17.5h4M6.5 10v4M17.5 10v4"/></svg>
+            Show component flow diagram
           </button>
         </div>
       </div>

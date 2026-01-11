@@ -14,24 +14,24 @@ export function getStyles(): string {
    CSS Variables & Theme
    ======================================== */
 :root {
-  /* Colors - Light Theme */
-  --color-bg: #ffffff;
-  --color-bg-secondary: #f8fafc;
-  --color-bg-tertiary: #f1f5f9;
-  --color-text: #1e293b;
-  --color-text-secondary: #64748b;
-  --color-text-muted: #94a3b8;
-  --color-border: #e2e8f0;
-  --color-border-light: #f1f5f9;
+  /* Colors - Monochromatic Light Theme */
+  --color-bg: #fafafa;
+  --color-bg-secondary: #f5f5f5;
+  --color-bg-tertiary: #e5e5e5;
+  --color-text: #171717;
+  --color-text-secondary: #525252;
+  --color-text-muted: #a3a3a3;
+  --color-border: #d4d4d4;
+  --color-border-light: #e5e5e5;
 
-  --color-primary: #3b82f6;
-  --color-primary-hover: #2563eb;
-  --color-primary-light: #eff6ff;
+  --color-primary: #404040;
+  --color-primary-hover: #262626;
+  --color-primary-light: #f5f5f5;
 
-  --color-accent: #8b5cf6;
-  --color-success: #10b981;
-  --color-warning: #f59e0b;
-  --color-error: #ef4444;
+  --color-accent: #525252;
+  --color-success: #525252;
+  --color-warning: #737373;
+  --color-error: #525252;
 
   /* Shadows */
   --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
@@ -78,32 +78,36 @@ export function getStyles(): string {
   --radius-full: 9999px;
 }
 
-/* Dark Theme */
+/* Dark Theme - Monochromatic */
 [data-theme="dark"] {
-  --color-bg: #0f172a;
-  --color-bg-secondary: #1e293b;
-  --color-bg-tertiary: #334155;
-  --color-text: #f1f5f9;
-  --color-text-secondary: #94a3b8;
-  --color-text-muted: #64748b;
-  --color-border: #334155;
-  --color-border-light: #1e293b;
+  --color-bg: #0a0a0a;
+  --color-bg-secondary: #171717;
+  --color-bg-tertiary: #262626;
+  --color-text: #fafafa;
+  --color-text-secondary: #a3a3a3;
+  --color-text-muted: #737373;
+  --color-border: #404040;
+  --color-border-light: #262626;
 
-  --color-primary-light: #1e3a5f;
+  --color-primary: #d4d4d4;
+  --color-primary-hover: #fafafa;
+  --color-primary-light: #262626;
 }
 
-/* Auto theme (system preference) */
+/* Auto theme (system preference) - Monochromatic */
 @media (prefers-color-scheme: dark) {
   [data-theme="auto"] {
-    --color-bg: #0f172a;
-    --color-bg-secondary: #1e293b;
-    --color-bg-tertiary: #334155;
-    --color-text: #f1f5f9;
-    --color-text-secondary: #94a3b8;
-    --color-text-muted: #64748b;
-    --color-border: #334155;
-    --color-border-light: #1e293b;
-    --color-primary-light: #1e3a5f;
+    --color-bg: #0a0a0a;
+    --color-bg-secondary: #171717;
+    --color-bg-tertiary: #262626;
+    --color-text: #fafafa;
+    --color-text-secondary: #a3a3a3;
+    --color-text-muted: #737373;
+    --color-border: #404040;
+    --color-border-light: #262626;
+    --color-primary: #d4d4d4;
+    --color-primary-hover: #fafafa;
+    --color-primary-light: #262626;
   }
 }
 
@@ -364,7 +368,7 @@ body {
 
 .progress-fill {
   height: 100%;
-  background: linear-gradient(90deg, var(--color-primary), var(--color-accent));
+  background: linear-gradient(90deg, #404040, #737373);
   border-radius: var(--radius-full);
   width: 0%;
   transition: width var(--transition-slow);
@@ -463,6 +467,12 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 h1 { font-size: var(--text-4xl); margin-top: 0; }
+
+.page-title {
+  margin-bottom: var(--spacing-lg);
+  padding-bottom: var(--spacing-md);
+  border-bottom: 1px solid var(--color-border);
+}
 h2 { font-size: var(--text-2xl); }
 h3 { font-size: var(--text-xl); }
 h4 { font-size: var(--text-lg); }
@@ -673,40 +683,40 @@ li {
 }
 
 .callout-note {
-  background: #eff6ff;
-  border-color: #3b82f6;
+  background: var(--color-bg-secondary);
+  border-color: var(--color-text-muted);
 }
-.callout-note .callout-title { color: #1d4ed8; }
+.callout-note .callout-title { color: var(--color-text); }
 
 .callout-tip {
-  background: #f0fdf4;
-  border-color: #22c55e;
+  background: var(--color-bg-secondary);
+  border-color: var(--color-text-secondary);
 }
-.callout-tip .callout-title { color: #16a34a; }
+.callout-tip .callout-title { color: var(--color-text); }
 
 .callout-important {
-  background: #faf5ff;
-  border-color: #a855f7;
+  background: var(--color-bg-tertiary);
+  border-color: var(--color-text);
 }
-.callout-important .callout-title { color: #7c3aed; }
+.callout-important .callout-title { color: var(--color-text); }
 
 .callout-warning {
-  background: #fffbeb;
-  border-color: #f59e0b;
+  background: var(--color-bg-secondary);
+  border-color: var(--color-text-muted);
 }
-.callout-warning .callout-title { color: #d97706; }
+.callout-warning .callout-title { color: var(--color-text); }
 
 .callout-caution {
-  background: #fef2f2;
-  border-color: #ef4444;
+  background: var(--color-bg-tertiary);
+  border-color: var(--color-text);
 }
-.callout-caution .callout-title { color: #dc2626; }
+.callout-caution .callout-title { color: var(--color-text); }
 
-[data-theme="dark"] .callout-note { background: rgba(59, 130, 246, 0.1); }
-[data-theme="dark"] .callout-tip { background: rgba(34, 197, 94, 0.1); }
-[data-theme="dark"] .callout-important { background: rgba(168, 85, 247, 0.1); }
-[data-theme="dark"] .callout-warning { background: rgba(245, 158, 11, 0.1); }
-[data-theme="dark"] .callout-caution { background: rgba(239, 68, 68, 0.1); }
+[data-theme="dark"] .callout-note { background: var(--color-bg-secondary); }
+[data-theme="dark"] .callout-tip { background: var(--color-bg-secondary); }
+[data-theme="dark"] .callout-important { background: var(--color-bg-tertiary); }
+[data-theme="dark"] .callout-warning { background: var(--color-bg-secondary); }
+[data-theme="dark"] .callout-caution { background: var(--color-bg-tertiary); }
 
 /* ========================================
    Breadcrumbs
@@ -1639,7 +1649,7 @@ tr:hover {
 .chat-model-badge {
   font-size: var(--text-xs);
   padding: 2px 8px;
-  background: linear-gradient(135deg, var(--color-primary), var(--color-accent));
+  background: linear-gradient(135deg, #404040, #525252);
   color: white;
   border-radius: var(--radius-full);
   font-weight: 500;
@@ -1721,22 +1731,93 @@ tr:hover {
 .chat-progress-bar {
   height: 100%;
   width: 0;
-  background: linear-gradient(90deg, var(--color-primary), var(--color-accent));
+  background: linear-gradient(90deg, #404040, #737373);
   border-radius: 2px;
   transition: width 0.3s ease;
 }
 
-/* Runtime badge variants */
+/* Runtime badge variants - Monochromatic */
 .chat-model-badge.runtime-webgpu {
-  background: linear-gradient(135deg, #10b981, #059669);
+  background: linear-gradient(135deg, #171717, #262626);
 }
 
 .chat-model-badge.runtime-wasm {
-  background: linear-gradient(135deg, #3b82f6, #2563eb);
+  background: linear-gradient(135deg, #404040, #525252);
 }
 
 .chat-model-badge.runtime-fallback {
-  background: linear-gradient(135deg, #6b7280, #4b5563);
+  background: linear-gradient(135deg, #737373, #a3a3a3);
+}
+
+.chat-model-badge.runtime-error {
+  background: linear-gradient(135deg, #525252, #737373);
+}
+
+/* Chat error notice */
+.chat-error-notice {
+  text-align: center;
+  padding: var(--spacing-lg);
+}
+
+.chat-error-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  margin-bottom: var(--spacing-md);
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: 50%;
+  color: var(--color-error);
+}
+
+.chat-error-notice h4 {
+  margin: 0 0 var(--spacing-sm);
+  font-size: var(--text-lg);
+  color: var(--color-text);
+}
+
+.chat-error-reason {
+  margin: 0 0 var(--spacing-lg);
+  padding: var(--spacing-sm) var(--spacing-md);
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: var(--radius-md);
+  color: var(--color-error);
+  font-size: var(--text-sm);
+}
+
+.chat-error-alternatives {
+  text-align: left;
+  padding: var(--spacing-md);
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-md);
+}
+
+.chat-error-alternatives p {
+  margin: 0 0 var(--spacing-sm);
+  font-weight: 500;
+  color: var(--color-text);
+  font-size: var(--text-sm);
+}
+
+.chat-error-alternatives ul {
+  margin: 0;
+  padding-left: var(--spacing-lg);
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.chat-error-alternatives li {
+  margin-bottom: var(--spacing-xs);
+}
+
+.chat-error-alternatives a {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+.chat-error-alternatives a:hover {
+  text-decoration: underline;
 }
 
 .chat-messages {
@@ -1762,9 +1843,9 @@ tr:hover {
   width: 64px;
   height: 64px;
   margin-bottom: var(--spacing-md);
-  background: linear-gradient(135deg, var(--color-primary-light), var(--color-bg-secondary));
+  background: linear-gradient(135deg, #e5e5e5, #f5f5f5);
   border-radius: 50%;
-  color: var(--color-primary);
+  color: #404040;
 }
 
 .chat-welcome h4 {
@@ -1870,7 +1951,7 @@ tr:hover {
 }
 
 .chat-message.assistant .chat-message-avatar {
-  background: linear-gradient(135deg, var(--color-primary), var(--color-accent));
+  background: linear-gradient(135deg, #404040, #525252);
   color: white;
 }
 
@@ -1997,6 +2078,53 @@ tr:hover {
   width: 10px;
   height: 10px;
   opacity: 0.7;
+}
+
+/* Chat diagram container for codemap visualizations */
+.chat-diagram-container {
+  margin: var(--spacing-md) 0;
+  padding: var(--spacing-md);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow-x: auto;
+}
+
+.chat-diagram-container .mermaid {
+  text-align: center;
+}
+
+.chat-diagram-container .mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Monochrome mermaid styling in chat */
+.chat-diagram-container .mermaid .node rect,
+.chat-diagram-container .mermaid .node polygon,
+.chat-diagram-container .mermaid .node circle {
+  fill: var(--color-bg-secondary) !important;
+  stroke: var(--color-text) !important;
+}
+
+.chat-diagram-container .mermaid .edgePath path {
+  stroke: var(--color-text-secondary) !important;
+}
+
+.chat-diagram-container .mermaid .arrowheadPath {
+  fill: var(--color-text-secondary) !important;
+}
+
+/* Clickable nodes styling */
+.chat-diagram-container .mermaid .node {
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.chat-diagram-container .mermaid .node:hover rect,
+.chat-diagram-container .mermaid .node:hover polygon {
+  fill: var(--color-bg-tertiary) !important;
+  stroke-width: 2px;
 }
 
 .chat-typing {

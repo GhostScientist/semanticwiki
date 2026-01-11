@@ -105,10 +105,13 @@ export class SiteGenerator {
   private mermaidPlaceholders: Map<string, string> = new Map();
 
   constructor(options: SiteGenerationOptions) {
+    // Extract codebase name from wiki directory or use provided title
+    const codebaseName = options.title || this.extractCodebaseName(options.wikiDir);
+
     this.options = {
       wikiDir: path.resolve(options.wikiDir),
       outputDir: path.resolve(options.outputDir),
-      title: options.title || 'Architecture Wiki',
+      title: `👻 ${codebaseName}`,
       description: options.description || 'Interactive architectural documentation',
       theme: options.theme || 'auto',
       features: {
@@ -125,6 +128,24 @@ export class SiteGenerator {
     };
 
     this.configureMarked();
+  }
+
+  /**
+   * Extract codebase name from wiki directory path
+   * Looks for parent directory name or uses wiki folder name
+   */
+  private extractCodebaseName(wikiDir: string): string {
+    const resolved = path.resolve(wikiDir);
+    const parts = resolved.split(path.sep);
+
+    // If wiki is in a 'wiki' or 'docs' folder, use parent name
+    const lastPart = parts[parts.length - 1];
+    if (lastPart.toLowerCase() === 'wiki' || lastPart.toLowerCase() === 'docs' || lastPart.toLowerCase() === '.wiki') {
+      return parts[parts.length - 2] || 'Architecture Wiki';
+    }
+
+    // Otherwise use the folder name
+    return lastPart || 'Architecture Wiki';
   }
 
   /**
@@ -309,17 +330,29 @@ export class SiteGenerator {
 
       const relativePath = path.relative(this.options.wikiDir, filePath);
 
-      // Extract headings
-      const headings = this.extractHeadings(markdownContent);
+      // Extract title from frontmatter or first H1
+      const extractedTitle = this.extractTitle(markdownContent);
+      const title = frontmatter.title || extractedTitle || path.basename(filePath, '.md');
+
+      // Remove the first H1 if it matches the title to prevent duplication
+      // The title will be displayed in the page header template
+      let contentWithoutTitle = markdownContent;
+      if (!frontmatter.title && extractedTitle) {
+        // Remove the first H1 line from content
+        contentWithoutTitle = markdownContent.replace(/^#\s+.+\n+/, '');
+      }
+
+      // Extract headings (after potentially removing title)
+      const headings = this.extractHeadings(contentWithoutTitle);
 
       // Extract code blocks
-      const codeBlocks = this.extractCodeBlocks(markdownContent);
+      const codeBlocks = this.extractCodeBlocks(contentWithoutTitle);
 
       // Extract mermaid diagrams
-      const mermaidDiagrams = this.extractMermaidDiagrams(markdownContent);
+      const mermaidDiagrams = this.extractMermaidDiagrams(contentWithoutTitle);
 
       // Process mermaid blocks before markdown conversion (replaces with placeholders)
-      const processedMarkdown = this.processMermaidBlocks(markdownContent);
+      const processedMarkdown = this.processMermaidBlocks(contentWithoutTitle);
 
       // Convert markdown to HTML
       const parsedHtml = await marked.parse(processedMarkdown);
@@ -330,9 +363,9 @@ export class SiteGenerator {
       return {
         path: filePath,
         relativePath,
-        title: frontmatter.title || this.extractTitle(markdownContent) || path.basename(filePath, '.md'),
+        title,
         description: frontmatter.description,
-        content: markdownContent,
+        content: contentWithoutTitle,
         htmlContent,
         frontmatter,
         sources: frontmatter.sources,
