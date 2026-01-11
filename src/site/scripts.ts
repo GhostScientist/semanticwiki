@@ -17,6 +17,7 @@ interface Features {
   search?: boolean;
   progressTracking?: boolean;
   keyboardNav?: boolean;
+  aiChat?: boolean;
 }
 
 export function getClientScripts(features: Features): string {
@@ -57,6 +58,7 @@ export function getClientScripts(features: Features): string {
     ${features.codeExplorer ? 'initCodeExplorer();' : ''}
     ${features.keyboardNav ? 'initKeyboardNav();' : ''}
     ${features.progressTracking ? 'initProgressTracking();' : ''}
+    ${features.aiChat ? 'initAIChat();' : ''}
 
     // Highlight code blocks
     if (window.Prism) {
@@ -818,6 +820,412 @@ export function getClientScripts(features: Features): string {
 
     if (fill) fill.style.width = percentage + '%';
     if (text) text.textContent = percentage + '% complete (' + readCount + '/' + totalPages + ')';
+  }
+  ` : ''}
+
+  // ========================================
+  // AI Chat (using SmolLM2 via transformers.js)
+  // ========================================
+  ${features.aiChat ? `
+  const chatState = {
+    isModelLoaded: false,
+    isLoading: false,
+    generator: null,
+    embedder: null,
+    embeddingsIndex: null,
+    messages: [],
+    abortController: null
+  };
+
+  function initAIChat() {
+    const panel = document.querySelector('.chat-panel');
+    const trigger = document.querySelector('.chat-trigger');
+    const closeBtn = panel?.querySelector('.chat-panel-close');
+    const input = panel?.querySelector('.chat-input');
+    const sendBtn = panel?.querySelector('.chat-send');
+    const messagesContainer = panel?.querySelector('.chat-messages');
+
+    if (!panel || !trigger) return;
+
+    // Open/close chat panel
+    trigger.addEventListener('click', () => {
+      panel.classList.toggle('open');
+      if (panel.classList.contains('open')) {
+        loadAIModel();
+        input?.focus();
+      }
+    });
+
+    closeBtn?.addEventListener('click', () => {
+      panel.classList.remove('open');
+    });
+
+    // Handle input
+    input?.addEventListener('input', () => {
+      sendBtn.disabled = !input.value.trim() || !chatState.isModelLoaded;
+      autoResizeTextarea(input);
+    });
+
+    input?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (!sendBtn.disabled) {
+          sendChatMessage();
+        }
+      }
+    });
+
+    sendBtn?.addEventListener('click', sendChatMessage);
+
+    // Handle suggestion buttons
+    panel.querySelectorAll('.chat-suggestion').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const question = btn.dataset.question;
+        if (question && chatState.isModelLoaded) {
+          input.value = question;
+          sendChatMessage();
+        } else if (!chatState.isModelLoaded) {
+          showToast('Please wait for the AI model to load', 'info');
+        }
+      });
+    });
+
+    // Load embeddings index
+    loadEmbeddingsIndex();
+  }
+
+  async function loadEmbeddingsIndex() {
+    try {
+      const response = await fetch(config.rootPath + 'embeddings-index.json');
+      if (response.ok) {
+        chatState.embeddingsIndex = await response.json();
+        console.log('Loaded embeddings index with', chatState.embeddingsIndex?.chunks?.length || 0, 'chunks');
+      }
+    } catch (e) {
+      console.warn('Embeddings index not available, falling back to keyword search');
+    }
+  }
+
+  async function loadAIModel() {
+    if (chatState.isModelLoaded || chatState.isLoading) return;
+
+    chatState.isLoading = true;
+    const statusEl = document.querySelector('.chat-panel-status');
+    const loadingText = statusEl?.querySelector('.chat-loading-text');
+    const sendBtn = document.querySelector('.chat-send');
+
+    statusEl?.classList.add('visible');
+
+    try {
+      // Dynamically import transformers.js from CDN
+      if (loadingText) loadingText.textContent = 'Loading AI library...';
+
+      // Import the transformers library from CDN
+      const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0');
+
+      // Configure for browser
+      env.allowLocalModels = false;
+      env.useBrowserCache = true;
+
+      if (loadingText) loadingText.textContent = 'Loading SmolLM2 model (this may take a moment)...';
+
+      // Load text generation pipeline with SmolLM2
+      // Using the smaller 135M version for faster loading
+      chatState.generator = await pipeline(
+        'text-generation',
+        'HuggingFaceTB/SmolLM2-135M-Instruct',
+        {
+          dtype: 'q4',
+          device: 'webgpu',
+          progress_callback: (progress) => {
+            if (progress.status === 'progress' && loadingText) {
+              const pct = Math.round((progress.loaded / progress.total) * 100);
+              loadingText.textContent = 'Downloading model: ' + pct + '%';
+            }
+          }
+        }
+      );
+
+      // Also load embedding model for semantic search
+      if (loadingText) loadingText.textContent = 'Loading embedding model...';
+      chatState.embedder = await pipeline(
+        'feature-extraction',
+        'Xenova/all-MiniLM-L6-v2',
+        {
+          dtype: 'q8',
+          progress_callback: (progress) => {
+            if (progress.status === 'progress' && loadingText) {
+              const pct = Math.round((progress.loaded / progress.total) * 100);
+              loadingText.textContent = 'Loading embeddings: ' + pct + '%';
+            }
+          }
+        }
+      );
+
+      chatState.isModelLoaded = true;
+      chatState.isLoading = false;
+
+      statusEl?.classList.remove('visible');
+      if (sendBtn) sendBtn.disabled = !document.querySelector('.chat-input')?.value?.trim();
+
+      showToast('AI assistant ready!', 'success');
+    } catch (error) {
+      console.error('Failed to load AI model:', error);
+      chatState.isLoading = false;
+
+      if (loadingText) loadingText.textContent = 'Failed to load model. Using fallback search.';
+
+      // Use fallback mode (keyword search only)
+      setTimeout(() => {
+        statusEl?.classList.remove('visible');
+        chatState.isModelLoaded = true; // Enable chat with fallback
+        if (sendBtn) sendBtn.disabled = false;
+      }, 2000);
+    }
+  }
+
+  function autoResizeTextarea(textarea) {
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+  }
+
+  async function sendChatMessage() {
+    const input = document.querySelector('.chat-input');
+    const sendBtn = document.querySelector('.chat-send');
+    const messagesContainer = document.querySelector('.chat-messages');
+    const welcomeEl = messagesContainer?.querySelector('.chat-welcome');
+
+    const question = input?.value?.trim();
+    if (!question) return;
+
+    // Hide welcome message
+    if (welcomeEl) welcomeEl.style.display = 'none';
+
+    // Add user message
+    addChatMessage('user', question);
+    input.value = '';
+    autoResizeTextarea(input);
+    sendBtn.disabled = true;
+
+    // Show typing indicator
+    const typingEl = document.createElement('div');
+    typingEl.className = 'chat-typing';
+    typingEl.innerHTML = '<div class="chat-typing-dot"></div><div class="chat-typing-dot"></div><div class="chat-typing-dot"></div>';
+    messagesContainer?.appendChild(typingEl);
+    messagesContainer?.scrollTo(0, messagesContainer.scrollHeight);
+
+    try {
+      // Find relevant context
+      const context = await findRelevantContext(question);
+
+      // Generate response
+      const response = await generateResponse(question, context);
+
+      // Remove typing indicator
+      typingEl.remove();
+
+      // Add assistant response
+      addChatMessage('assistant', response.answer, response.sources);
+
+      // Save to message history
+      chatState.messages.push({ role: 'user', content: question });
+      chatState.messages.push({ role: 'assistant', content: response.answer });
+
+    } catch (error) {
+      console.error('Chat error:', error);
+      typingEl.remove();
+      addChatMessage('assistant', 'Sorry, I encountered an error. Please try again.');
+    }
+
+    sendBtn.disabled = !chatState.isModelLoaded;
+  }
+
+  function addChatMessage(role, content, sources) {
+    const messagesContainer = document.querySelector('.chat-messages');
+    if (!messagesContainer) return;
+
+    const messageEl = document.createElement('div');
+    messageEl.className = 'chat-message ' + role;
+
+    const avatar = role === 'user' ? 'U' : 'AI';
+
+    let sourcesHtml = '';
+    if (sources && sources.length > 0) {
+      sourcesHtml = '<div class="chat-message-sources">Sources: ' +
+        sources.map(s => '<a href="' + config.rootPath + s.path + '">' + escapeHtml(s.title) + '</a>').join(', ') +
+        '</div>';
+    }
+
+    messageEl.innerHTML = \`
+      <div class="chat-message-avatar">\${avatar}</div>
+      <div class="chat-message-content">
+        \${formatChatContent(content)}
+        \${sourcesHtml}
+      </div>
+    \`;
+
+    messagesContainer.appendChild(messageEl);
+    messagesContainer.scrollTo(0, messagesContainer.scrollHeight);
+  }
+
+  function formatChatContent(content) {
+    // Simple markdown-like formatting
+    return content
+      .split('\\n\\n').map(p => '<p>' + p + '</p>').join('')
+      .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
+      .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
+      .replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
+  }
+
+  async function findRelevantContext(question) {
+    const results = [];
+    const questionLower = question.toLowerCase();
+
+    // First try semantic search if embeddings are available
+    if (chatState.embedder && chatState.embeddingsIndex?.chunks) {
+      try {
+        const queryEmb = await chatState.embedder(question, { pooling: 'mean', normalize: true });
+        const queryVector = Array.from(queryEmb.data);
+
+        // Calculate similarity with all chunks
+        const scored = chatState.embeddingsIndex.chunks.map(chunk => ({
+          ...chunk,
+          score: cosineSimilarity(queryVector, chunk.embedding)
+        }));
+
+        // Sort by score and take top results
+        scored.sort((a, b) => b.score - a.score);
+        const topChunks = scored.slice(0, 5);
+
+        for (const chunk of topChunks) {
+          if (chunk.score > 0.3) { // Relevance threshold
+            results.push({
+              path: chunk.path,
+              title: chunk.title,
+              content: chunk.content,
+              score: chunk.score
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('Semantic search failed, using keyword fallback:', e);
+      }
+    }
+
+    // Fallback or supplement with keyword search
+    if (results.length < 3 && state.searchIndex) {
+      const keywords = questionLower.split(/\\s+/).filter(w => w.length > 2);
+
+      for (const page of state.searchIndex) {
+        const contentLower = page.content.toLowerCase();
+        const titleLower = page.title.toLowerCase();
+
+        let score = 0;
+        for (const kw of keywords) {
+          if (titleLower.includes(kw)) score += 3;
+          if (contentLower.includes(kw)) score += 1;
+          if (page.headings.some(h => h.toLowerCase().includes(kw))) score += 2;
+        }
+
+        if (score > 0 && !results.some(r => r.path === page.path)) {
+          results.push({
+            path: page.path,
+            title: page.title,
+            content: page.content.slice(0, 1500),
+            score
+          });
+        }
+      }
+
+      // Sort by score
+      results.sort((a, b) => b.score - a.score);
+    }
+
+    return results.slice(0, 5);
+  }
+
+  function cosineSimilarity(a, b) {
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  async function generateResponse(question, context) {
+    const sources = context.map(c => ({ path: c.path, title: c.title }));
+
+    // Build context string
+    const contextText = context.map(c =>
+      '--- ' + c.title + ' ---\\n' + c.content
+    ).join('\\n\\n');
+
+    // If we have the model, use it
+    if (chatState.generator) {
+      try {
+        const systemPrompt = \`You are a helpful documentation assistant. Answer questions based on the provided documentation context. Be concise and accurate. If the context doesn't contain enough information to answer, say so.
+
+Documentation Context:
+\${contextText}\`;
+
+        const messages = [
+          { role: 'system', content: systemPrompt },
+          ...chatState.messages.slice(-4), // Include recent conversation for context
+          { role: 'user', content: question }
+        ];
+
+        const output = await chatState.generator(messages, {
+          max_new_tokens: 300,
+          temperature: 0.7,
+          do_sample: true,
+          top_p: 0.9
+        });
+
+        const generatedText = output[0].generated_text;
+        // Extract the assistant's response (last message)
+        const assistantResponse = typeof generatedText === 'string'
+          ? generatedText
+          : generatedText[generatedText.length - 1]?.content || 'I could not generate a response.';
+
+        return { answer: assistantResponse, sources };
+      } catch (e) {
+        console.error('Generation error:', e);
+        // Fall through to fallback
+      }
+    }
+
+    // Fallback: Generate a response based on found context
+    if (context.length > 0) {
+      const topResult = context[0];
+      let answer = 'Based on the documentation, here\\'s what I found:\\n\\n';
+
+      // Extract relevant sentences from the top result
+      const sentences = topResult.content.split(/[.!?]+/).filter(s => s.trim().length > 20);
+      const questionWords = question.toLowerCase().split(/\\s+/);
+
+      const relevantSentences = sentences.filter(s =>
+        questionWords.some(w => s.toLowerCase().includes(w))
+      ).slice(0, 3);
+
+      if (relevantSentences.length > 0) {
+        answer += relevantSentences.join('. ').trim() + '.';
+      } else {
+        answer += sentences.slice(0, 2).join('. ').trim() + '.';
+      }
+
+      answer += '\\n\\nFor more details, check the linked sources above.';
+
+      return { answer, sources };
+    }
+
+    return {
+      answer: 'I couldn\\'t find specific information about that in the documentation. Try browsing the navigation menu or using the search feature to explore the available content.',
+      sources: []
+    };
   }
   ` : ''}
 

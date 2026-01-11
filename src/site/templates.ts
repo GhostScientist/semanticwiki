@@ -31,6 +31,7 @@ interface PageTemplateData {
     search?: boolean;
     progressTracking?: boolean;
     keyboardNav?: boolean;
+    aiChat?: boolean;
   };
   theme: 'light' | 'dark' | 'auto';
 }
@@ -104,6 +105,16 @@ export function getTemplates() {
             <circle cx="12" cy="12" r="10"></circle>
             <path d="M12 16v-4"></path>
             <path d="M12 8h.01"></path>
+          </svg>
+        </button>
+        ` : ''}
+
+        ${data.features.aiChat ? `
+        <button class="chat-trigger" title="Ask AI about this documentation">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+            <path d="M12 7v2"></path>
+            <path d="M12 13h.01"></path>
           </svg>
         </button>
         ` : ''}
@@ -328,6 +339,59 @@ export function getTemplates() {
         </div>
       </div>
       <button class="keyboard-help-close">Got it</button>
+    </div>
+  </div>
+  ` : ''}
+
+  <!-- AI Chat Panel -->
+  ${data.features.aiChat ? `
+  <div class="chat-panel" role="dialog" aria-modal="true" aria-label="AI Chat Assistant">
+    <div class="chat-panel-header">
+      <div class="chat-panel-title">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        </svg>
+        <span>Ask AI</span>
+        <span class="chat-model-badge">SmolLM2</span>
+      </div>
+      <button class="chat-panel-close" aria-label="Close chat">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+    <div class="chat-panel-status">
+      <div class="chat-loading-indicator">
+        <div class="chat-loading-spinner"></div>
+        <span class="chat-loading-text">Loading AI model...</span>
+      </div>
+    </div>
+    <div class="chat-messages">
+      <div class="chat-welcome">
+        <div class="chat-welcome-icon">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z"></path>
+            <path d="M12 6v6l4 2"></path>
+          </svg>
+        </div>
+        <h4>Ask about this documentation</h4>
+        <p>I can help you find information and answer questions about the architecture and code in this wiki.</p>
+        <div class="chat-suggestions">
+          <button class="chat-suggestion" data-question="What is the overall architecture?">What is the overall architecture?</button>
+          <button class="chat-suggestion" data-question="How do the main components work together?">How do components work together?</button>
+          <button class="chat-suggestion" data-question="What are the key concepts I should understand?">What are the key concepts?</button>
+        </div>
+      </div>
+    </div>
+    <div class="chat-input-area">
+      <textarea class="chat-input" placeholder="Ask a question about this documentation..." rows="1"></textarea>
+      <button class="chat-send" title="Send message" disabled>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="22" y1="2" x2="11" y2="13"></line>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+        </svg>
+      </button>
     </div>
   </div>
   ` : ''}

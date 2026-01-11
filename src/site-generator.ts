@@ -12,6 +12,10 @@ import { marked } from 'marked';
 import { getTemplates } from './site/templates.js';
 import { getStyles } from './site/styles.js';
 import { getClientScripts } from './site/scripts.js';
+import { pipeline, env } from '@huggingface/transformers';
+
+// Configure transformers.js for embeddings generation
+env.cacheDir = './.ted-mosby-models';
 
 export interface SiteGenerationOptions {
   wikiDir: string;
@@ -25,6 +29,7 @@ export interface SiteGenerationOptions {
     search?: boolean;
     progressTracking?: boolean;
     keyboardNav?: boolean;
+    aiChat?: boolean;
   };
   repoUrl?: string;
   repoPath?: string;
@@ -112,6 +117,7 @@ export class SiteGenerator {
         search: true,
         progressTracking: true,
         keyboardNav: true,
+        aiChat: true,
         ...options.features
       },
       repoUrl: options.repoUrl || '',
@@ -237,6 +243,11 @@ export class SiteGenerator {
 
     // Step 7: Generate site manifest for client-side features
     await this.generateManifest();
+
+    // Step 8: Generate embeddings index for AI chat (if enabled)
+    if (this.options.features.aiChat) {
+      await this.generateEmbeddingsIndex();
+    }
 
     console.log(`✅ Static site generated at: ${this.options.outputDir}`);
   }
@@ -842,6 +853,105 @@ export class SiteGenerator {
     );
 
     console.log('  Generated site manifest');
+  }
+
+  /**
+   * Generate embeddings index for AI chat feature
+   * Creates pre-computed embeddings for faster semantic search in the browser
+   */
+  private async generateEmbeddingsIndex(): Promise<void> {
+    console.log('  Generating embeddings index for AI chat...');
+
+    try {
+      // Load embedding model
+      const embedder = await pipeline(
+        'feature-extraction',
+        'Xenova/all-MiniLM-L6-v2',
+        { dtype: 'fp32' }
+      );
+
+      // Chunk wiki content for embedding
+      const chunks: Array<{
+        path: string;
+        title: string;
+        content: string;
+        embedding: number[];
+      }> = [];
+
+      for (const page of this.pages) {
+        // Split content into smaller chunks (about 500 chars each for better retrieval)
+        const pageChunks = this.chunkContent(page.content, 500, 100);
+        const htmlPath = page.relativePath.replace(/\.md$/, '.html');
+
+        for (const chunkContent of pageChunks) {
+          // Generate embedding
+          const output = await embedder(chunkContent, { pooling: 'mean', normalize: true });
+          const embedding = Array.from(output.data as Float32Array);
+
+          chunks.push({
+            path: htmlPath,
+            title: page.title,
+            content: chunkContent,
+            embedding
+          });
+        }
+
+        // Progress indicator
+        const idx = this.pages.indexOf(page);
+        if ((idx + 1) % 5 === 0 || idx === this.pages.length - 1) {
+          console.log(`    Embedded ${idx + 1}/${this.pages.length} pages (${chunks.length} chunks)`);
+        }
+      }
+
+      // Save embeddings index
+      const embeddingsIndex = {
+        model: 'Xenova/all-MiniLM-L6-v2',
+        dimension: 384,
+        generated: new Date().toISOString(),
+        chunks
+      };
+
+      fs.writeFileSync(
+        path.join(this.options.outputDir, 'embeddings-index.json'),
+        JSON.stringify(embeddingsIndex)
+      );
+
+      console.log(`  Generated embeddings index with ${chunks.length} chunks`);
+    } catch (error) {
+      console.warn('  Warning: Could not generate embeddings index:', error);
+      console.log('  AI chat will use keyword search fallback');
+    }
+  }
+
+  /**
+   * Chunk content into smaller pieces for embedding
+   */
+  private chunkContent(content: string, chunkSize: number, overlap: number): string[] {
+    // Strip markdown formatting first
+    const stripped = this.stripMarkdown(content);
+    const chunks: string[] = [];
+
+    let start = 0;
+    while (start < stripped.length) {
+      let end = start + chunkSize;
+
+      // Try to end at sentence boundary
+      if (end < stripped.length) {
+        const sentenceEnd = stripped.slice(start, end + 100).lastIndexOf('. ');
+        if (sentenceEnd > chunkSize / 2) {
+          end = start + sentenceEnd + 1;
+        }
+      }
+
+      const chunk = stripped.slice(start, end).trim();
+      if (chunk.length > 50) { // Skip very small chunks
+        chunks.push(chunk);
+      }
+
+      start = end - overlap;
+    }
+
+    return chunks;
   }
 
   /**
