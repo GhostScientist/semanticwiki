@@ -837,7 +837,8 @@ export function getClientScripts(features: Features): string {
     abortController: null,
     runtime: null, // 'webgpu', 'wasm', or 'fallback'
     modelSize: null,
-    error: null // Track any critical errors
+    error: null, // Track any critical errors
+    mode: 'auto' // 'auto', 'chat', or 'codemap'
   };
 
   // Browser capability detection
@@ -946,6 +947,16 @@ export function getClientScripts(features: Features): string {
         }
       });
     });
+
+    // Handle mode selector dropdown
+    const modeDropdown = panel.querySelector('.chat-mode-dropdown');
+    if (modeDropdown) {
+      modeDropdown.addEventListener('change', (e) => {
+        chatState.mode = e.target.value;
+        const modeLabels = { auto: 'Auto-detect', chat: 'Chat Mode', codemap: 'Codemap Mode' };
+        showToast('Switched to ' + modeLabels[chatState.mode], 'info');
+      });
+    }
 
     // Load embeddings index
     loadEmbeddingsIndex();
@@ -1479,13 +1490,75 @@ export function getClientScripts(features: Features): string {
     return tracePatterns.some(p => p.test(question));
   }
 
+  // Detect diagram type from question and context
+  function detectDiagramType(question, context) {
+    const q = question.toLowerCase();
+
+    // Check for sequence/flow indicators
+    if (/sequence|step|order|process|workflow|when.+then|after.+before/i.test(q)) {
+      return 'sequence';
+    }
+
+    // Check for hierarchy/structure indicators
+    if (/hierarch|structure|organization|parent|child|inherit|extends/i.test(q)) {
+      return 'hierarchy';
+    }
+
+    // Check for data flow indicators
+    if (/data.+flow|transform|input.+output|pipeline/i.test(q)) {
+      return 'dataflow';
+    }
+
+    // Default to flowchart
+    return 'flowchart';
+  }
+
+  // Extract relationships from content
+  function extractRelationships(context) {
+    const relationships = [];
+    const keywords = ['uses', 'calls', 'depends', 'imports', 'extends', 'implements',
+                      'sends', 'receives', 'triggers', 'creates', 'returns', 'handles'];
+
+    context.forEach((item, i) => {
+      const contentLower = item.content.toLowerCase();
+      context.forEach((other, j) => {
+        if (i !== j) {
+          const otherTitleLower = other.title.toLowerCase();
+          const titleWords = otherTitleLower.split(/\\s+/).filter(w => w.length > 3);
+
+          // Check for direct title mentions
+          if (contentLower.includes(otherTitleLower) ||
+              titleWords.some(word => contentLower.includes(word))) {
+
+            // Try to detect relationship type from context
+            let relType = 'uses';
+            for (const kw of keywords) {
+              const pattern = new RegExp(kw + '.{0,30}' + titleWords[0], 'i');
+              if (pattern.test(contentLower)) {
+                relType = kw;
+                break;
+              }
+            }
+
+            relationships.push({
+              from: i,
+              to: j,
+              type: relType
+            });
+          }
+        }
+      });
+    });
+
+    return relationships;
+  }
+
   // Generate a mermaid flowchart from context
-  function generateCodemapDiagram(question, context) {
+  function generateCodemapDiagram(question, context, mode) {
     if (context.length < 2) return null;
 
-    // Build a simple flow diagram from the found context
+    const diagramType = detectDiagramType(question, context);
     const nodes = [];
-    const edges = [];
     const nodeIds = new Map();
 
     // Create nodes from each context item
@@ -1493,61 +1566,140 @@ export function getClientScripts(features: Features): string {
       const nodeId = 'N' + i;
       const shortTitle = item.title.length > 25 ? item.title.slice(0, 22) + '...' : item.title;
       nodeIds.set(item.path, nodeId);
-      nodes.push({ id: nodeId, title: shortTitle, path: item.path, fullTitle: item.title });
-    });
-
-    // Create edges based on content relationships
-    // Look for mentions of other pages in each item's content
-    context.forEach((item, i) => {
-      const fromId = 'N' + i;
-      context.forEach((other, j) => {
-        if (i !== j) {
-          const toId = 'N' + j;
-          // Check if item mentions other's title
-          if (item.content.toLowerCase().includes(other.title.toLowerCase().split(' ')[0])) {
-            edges.push({ from: fromId, to: toId });
-          }
-        }
+      nodes.push({
+        id: nodeId,
+        title: shortTitle,
+        path: item.path,
+        fullTitle: item.title,
+        score: item.score || 0
       });
     });
 
-    // If no edges found, create a sequential flow based on relevance order
+    // Extract relationships using content analysis
+    const relationships = extractRelationships(context);
+
+    // Build edges from relationships
+    const edges = [];
+    const seenEdges = new Set();
+
+    relationships.forEach(rel => {
+      const fromId = 'N' + rel.from;
+      const toId = 'N' + rel.to;
+      const edgeKey = fromId + '-' + toId;
+
+      if (!seenEdges.has(edgeKey)) {
+        seenEdges.add(edgeKey);
+        edges.push({ from: fromId, to: toId, label: rel.type });
+      }
+    });
+
+    // If no edges found, create a hub-spoke or sequential pattern
     if (edges.length === 0 && nodes.length >= 2) {
-      for (let i = 0; i < nodes.length - 1; i++) {
-        edges.push({ from: nodes[i].id, to: nodes[i + 1].id });
+      if (mode === 'codemap' && nodes.length > 3) {
+        // In codemap mode with many nodes, use hub-spoke (first node as hub)
+        for (let i = 1; i < nodes.length; i++) {
+          edges.push({ from: nodes[0].id, to: nodes[i].id, label: '' });
+        }
+      } else {
+        // Sequential flow based on relevance order
+        for (let i = 0; i < nodes.length - 1; i++) {
+          edges.push({ from: nodes[i].id, to: nodes[i + 1].id, label: '' });
+        }
       }
     }
 
-    // Generate mermaid syntax
-    let diagram = 'flowchart TD\\n';
+    // Generate mermaid syntax based on diagram type
+    let diagram = '';
 
-    // Add nodes with click handlers
-    nodes.forEach(node => {
-      diagram += '    ' + node.id + '["' + node.title + '"]\\n';
-    });
+    if (diagramType === 'sequence' && nodes.length <= 5) {
+      // Generate sequence diagram for process flows
+      diagram = 'sequenceDiagram\\n';
+      diagram += '    autonumber\\n';
 
-    // Add edges
-    edges.forEach(edge => {
-      diagram += '    ' + edge.from + ' --> ' + edge.to + '\\n';
-    });
+      // Create participants
+      nodes.forEach(node => {
+        diagram += '    participant ' + node.id + ' as ' + node.title + '\\n';
+      });
 
-    // Add click handlers for navigation
-    nodes.forEach(node => {
-      diagram += '    click ' + node.id + ' "' + config.rootPath + node.path + '" "' + node.fullTitle + '"\\n';
-    });
+      // Add interactions based on edges
+      edges.forEach(edge => {
+        const label = edge.label || 'interacts';
+        diagram += '    ' + edge.from + '->>' + edge.to + ': ' + label + '\\n';
+      });
+    } else {
+      // Default flowchart
+      diagram = 'flowchart TD\\n';
 
-    return { diagram, nodes };
+      // Add subgraph if we have many nodes to group by relevance
+      if (nodes.length > 4) {
+        const highRelevance = nodes.filter(n => n.score > 0.5);
+        const lowerRelevance = nodes.filter(n => n.score <= 0.5);
+
+        if (highRelevance.length > 0 && lowerRelevance.length > 0) {
+          diagram += '    subgraph Core["Core Components"]\\n';
+          highRelevance.forEach(node => {
+            diagram += '        ' + node.id + '["' + node.title + '"]\\n';
+          });
+          diagram += '    end\\n';
+
+          diagram += '    subgraph Related["Related"]\\n';
+          lowerRelevance.forEach(node => {
+            diagram += '        ' + node.id + '["' + node.title + '"]\\n';
+          });
+          diagram += '    end\\n';
+        } else {
+          // Just add all nodes
+          nodes.forEach(node => {
+            diagram += '    ' + node.id + '["' + node.title + '"]\\n';
+          });
+        }
+      } else {
+        // Add nodes directly
+        nodes.forEach(node => {
+          diagram += '    ' + node.id + '["' + node.title + '"]\\n';
+        });
+      }
+
+      // Add edges with labels where available
+      edges.forEach(edge => {
+        if (edge.label && edge.label !== 'uses') {
+          diagram += '    ' + edge.from + ' -->|' + edge.label + '| ' + edge.to + '\\n';
+        } else {
+          diagram += '    ' + edge.from + ' --> ' + edge.to + '\\n';
+        }
+      });
+
+      // Add click handlers for navigation (flowchart only)
+      nodes.forEach(node => {
+        diagram += '    click ' + node.id + ' "' + config.rootPath + node.path + '" "' + node.fullTitle + '"\\n';
+      });
+    }
+
+    return { diagram, nodes, type: diagramType };
   }
 
   async function generateResponse(question, context) {
     const sources = context.map(c => ({ path: c.path, title: c.title }));
 
-    // Check if this is a trace/flow question
-    const wantsVisualization = isTraceQuestion(question);
+    // Determine if we should show visualization based on mode and question type
+    const isTraceQ = isTraceQuestion(question);
+    let wantsVisualization = false;
+
+    if (chatState.mode === 'codemap') {
+      // Always show visualization in codemap mode
+      wantsVisualization = true;
+    } else if (chatState.mode === 'chat') {
+      // Never show visualization in chat mode
+      wantsVisualization = false;
+    } else {
+      // Auto mode: detect based on question
+      wantsVisualization = isTraceQ;
+    }
+
     let codemapDiagram = null;
 
     if (wantsVisualization && context.length >= 2) {
-      codemapDiagram = generateCodemapDiagram(question, context);
+      codemapDiagram = generateCodemapDiagram(question, context, chatState.mode);
     }
 
     // Build context string

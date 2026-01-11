@@ -353,6 +353,13 @@ export function getTemplates() {
           <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
         </svg>
         <span>Ask AI</span>
+        <div class="chat-mode-selector">
+          <select class="chat-mode-dropdown" title="Chat mode">
+            <option value="auto">Auto</option>
+            <option value="chat">Chat</option>
+            <option value="codemap">Codemap</option>
+          </select>
+        </div>
         <span class="chat-model-badge">SmolLM2</span>
       </div>
       <button class="chat-panel-close" aria-label="Close chat">
