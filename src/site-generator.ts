@@ -12,6 +12,10 @@ import { marked } from 'marked';
 import { getTemplates } from './site/templates.js';
 import { getStyles } from './site/styles.js';
 import { getClientScripts } from './site/scripts.js';
+import { pipeline, env } from '@huggingface/transformers';
+
+// Configure transformers.js for embeddings generation
+env.cacheDir = './.ted-mosby-models';
 
 export interface SiteGenerationOptions {
   wikiDir: string;
@@ -25,6 +29,7 @@ export interface SiteGenerationOptions {
     search?: boolean;
     progressTracking?: boolean;
     keyboardNav?: boolean;
+    aiChat?: boolean;
   };
   repoUrl?: string;
   repoPath?: string;
@@ -100,10 +105,13 @@ export class SiteGenerator {
   private mermaidPlaceholders: Map<string, string> = new Map();
 
   constructor(options: SiteGenerationOptions) {
+    // Extract codebase name from wiki directory or use provided title
+    const codebaseName = options.title || this.extractCodebaseName(options.wikiDir);
+
     this.options = {
       wikiDir: path.resolve(options.wikiDir),
       outputDir: path.resolve(options.outputDir),
-      title: options.title || 'Architecture Wiki',
+      title: `👻 ${codebaseName}`,
       description: options.description || 'Interactive architectural documentation',
       theme: options.theme || 'auto',
       features: {
@@ -112,6 +120,7 @@ export class SiteGenerator {
         search: true,
         progressTracking: true,
         keyboardNav: true,
+        aiChat: true,
         ...options.features
       },
       repoUrl: options.repoUrl || '',
@@ -119,6 +128,24 @@ export class SiteGenerator {
     };
 
     this.configureMarked();
+  }
+
+  /**
+   * Extract codebase name from wiki directory path
+   * Looks for parent directory name or uses wiki folder name
+   */
+  private extractCodebaseName(wikiDir: string): string {
+    const resolved = path.resolve(wikiDir);
+    const parts = resolved.split(path.sep);
+
+    // If wiki is in a 'wiki' or 'docs' folder, use parent name
+    const lastPart = parts[parts.length - 1];
+    if (lastPart.toLowerCase() === 'wiki' || lastPart.toLowerCase() === 'docs' || lastPart.toLowerCase() === '.wiki') {
+      return parts[parts.length - 2] || 'Architecture Wiki';
+    }
+
+    // Otherwise use the folder name
+    return lastPart || 'Architecture Wiki';
   }
 
   /**
@@ -238,6 +265,11 @@ export class SiteGenerator {
     // Step 7: Generate site manifest for client-side features
     await this.generateManifest();
 
+    // Step 8: Generate embeddings index for AI chat (if enabled)
+    if (this.options.features.aiChat) {
+      await this.generateEmbeddingsIndex();
+    }
+
     console.log(`✅ Static site generated at: ${this.options.outputDir}`);
   }
 
@@ -298,17 +330,29 @@ export class SiteGenerator {
 
       const relativePath = path.relative(this.options.wikiDir, filePath);
 
-      // Extract headings
-      const headings = this.extractHeadings(markdownContent);
+      // Extract title from frontmatter or first H1
+      const extractedTitle = this.extractTitle(markdownContent);
+      const title = frontmatter.title || extractedTitle || path.basename(filePath, '.md');
+
+      // Remove the first H1 if it matches the title to prevent duplication
+      // The title will be displayed in the page header template
+      let contentWithoutTitle = markdownContent;
+      if (!frontmatter.title && extractedTitle) {
+        // Remove the first H1 line from content
+        contentWithoutTitle = markdownContent.replace(/^#\s+.+\n+/, '');
+      }
+
+      // Extract headings (after potentially removing title)
+      const headings = this.extractHeadings(contentWithoutTitle);
 
       // Extract code blocks
-      const codeBlocks = this.extractCodeBlocks(markdownContent);
+      const codeBlocks = this.extractCodeBlocks(contentWithoutTitle);
 
       // Extract mermaid diagrams
-      const mermaidDiagrams = this.extractMermaidDiagrams(markdownContent);
+      const mermaidDiagrams = this.extractMermaidDiagrams(contentWithoutTitle);
 
       // Process mermaid blocks before markdown conversion (replaces with placeholders)
-      const processedMarkdown = this.processMermaidBlocks(markdownContent);
+      const processedMarkdown = this.processMermaidBlocks(contentWithoutTitle);
 
       // Convert markdown to HTML
       const parsedHtml = await marked.parse(processedMarkdown);
@@ -319,9 +363,9 @@ export class SiteGenerator {
       return {
         path: filePath,
         relativePath,
-        title: frontmatter.title || this.extractTitle(markdownContent) || path.basename(filePath, '.md'),
+        title,
         description: frontmatter.description,
-        content: markdownContent,
+        content: contentWithoutTitle,
         htmlContent,
         frontmatter,
         sources: frontmatter.sources,
@@ -842,6 +886,141 @@ export class SiteGenerator {
     );
 
     console.log('  Generated site manifest');
+  }
+
+  /**
+   * Generate embeddings index for AI chat feature
+   * Creates pre-computed embeddings for faster semantic search in the browser
+   */
+  private async generateEmbeddingsIndex(): Promise<void> {
+    console.log('  Generating embeddings index for AI chat...');
+
+    try {
+      // Load embedding model
+      const embedder = await pipeline(
+        'feature-extraction',
+        'Xenova/all-MiniLM-L6-v2',
+        { dtype: 'fp32' }
+      );
+
+      // Chunk wiki content for embedding
+      const chunks: Array<{
+        path: string;
+        title: string;
+        content: string;
+        embedding: number[];
+      }> = [];
+
+      for (const page of this.pages) {
+        // Split content into semantic chunks (800 chars for more context while staying focused)
+        const pageChunks = this.chunkContent(page.content, 800, 0);
+        const htmlPath = page.relativePath.replace(/\.md$/, '.html');
+
+        for (const chunkContent of pageChunks) {
+          // Generate embedding
+          const output = await embedder(chunkContent, { pooling: 'mean', normalize: true });
+          const embedding = Array.from(output.data as Float32Array);
+
+          chunks.push({
+            path: htmlPath,
+            title: page.title,
+            content: chunkContent,
+            embedding
+          });
+        }
+
+        // Progress indicator
+        const idx = this.pages.indexOf(page);
+        if ((idx + 1) % 5 === 0 || idx === this.pages.length - 1) {
+          console.log(`    Embedded ${idx + 1}/${this.pages.length} pages (${chunks.length} chunks)`);
+        }
+      }
+
+      // Save embeddings index
+      const embeddingsIndex = {
+        model: 'Xenova/all-MiniLM-L6-v2',
+        dimension: 384,
+        generated: new Date().toISOString(),
+        chunks
+      };
+
+      fs.writeFileSync(
+        path.join(this.options.outputDir, 'embeddings-index.json'),
+        JSON.stringify(embeddingsIndex)
+      );
+
+      console.log(`  Generated embeddings index with ${chunks.length} chunks`);
+    } catch (error) {
+      console.warn('  Warning: Could not generate embeddings index:', error);
+      console.log('  AI chat will use keyword search fallback');
+    }
+  }
+
+  /**
+   * Chunk content into semantic pieces for better embedding retrieval
+   * Uses paragraph and section boundaries instead of arbitrary character counts
+   */
+  private chunkContent(content: string, chunkSize: number, overlap: number): string[] {
+    const chunks: string[] = [];
+
+    // Split by headers first to preserve section context
+    const sections = content.split(/(?=^#{1,3}\s)/m);
+
+    for (const section of sections) {
+      if (!section.trim()) continue;
+
+      // Extract section header if present
+      const headerMatch = section.match(/^(#{1,3}\s+.+?)(?:\n|$)/);
+      const header = headerMatch ? headerMatch[1].replace(/^#+\s*/, '').trim() : '';
+      const sectionContent = headerMatch ? section.slice(headerMatch[0].length) : section;
+
+      // Split section into paragraphs
+      const paragraphs = sectionContent.split(/\n\n+/).filter(p => p.trim().length > 30);
+
+      let currentChunk = header ? `[${header}] ` : '';
+      let currentLength = currentChunk.length;
+
+      for (const para of paragraphs) {
+        const strippedPara = this.stripMarkdown(para).trim();
+
+        // If adding this paragraph would exceed chunk size, save current and start new
+        if (currentLength + strippedPara.length > chunkSize && currentChunk.length > 50) {
+          chunks.push(currentChunk.trim());
+          // Start new chunk with section context
+          currentChunk = header ? `[${header}] ` : '';
+          currentLength = currentChunk.length;
+        }
+
+        currentChunk += strippedPara + ' ';
+        currentLength += strippedPara.length + 1;
+      }
+
+      // Don't forget the last chunk
+      if (currentChunk.trim().length > 50) {
+        chunks.push(currentChunk.trim());
+      }
+    }
+
+    // If content had no clear sections, fall back to sentence-based chunking
+    if (chunks.length === 0) {
+      const stripped = this.stripMarkdown(content);
+      const sentences = stripped.split(/(?<=[.!?])\s+/);
+      let currentChunk = '';
+
+      for (const sentence of sentences) {
+        if (currentChunk.length + sentence.length > chunkSize && currentChunk.length > 50) {
+          chunks.push(currentChunk.trim());
+          currentChunk = '';
+        }
+        currentChunk += sentence + ' ';
+      }
+
+      if (currentChunk.trim().length > 50) {
+        chunks.push(currentChunk.trim());
+      }
+    }
+
+    return chunks;
   }
 
   /**
