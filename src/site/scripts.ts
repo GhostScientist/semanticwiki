@@ -1324,32 +1324,57 @@ export function getClientScripts(features: Features): string {
   }
 
   function formatChatContent(content, sources) {
-    // First, handle paragraphs
-    let formatted = content
+    // Extract and process mermaid diagrams BEFORE paragraph handling
+    const mermaidPlaceholders = [];
+    let processedContent = content.replace(/\`\`\`mermaid\\n([\\s\\S]*?)\`\`\`/g, (match, diagram) => {
+      const diagramId = 'chat-diagram-' + Date.now() + '-' + mermaidPlaceholders.length;
+      mermaidPlaceholders.push({ id: diagramId, diagram: diagram.trim() });
+      return '%%%MERMAID_' + (mermaidPlaceholders.length - 1) + '%%%';
+    });
+
+    // Extract other code blocks before paragraph handling
+    const codeBlocks = [];
+    processedContent = processedContent.replace(/\`\`\`(\\w*)\\n([\\s\\S]*?)\`\`\`/g, (match, lang, code) => {
+      codeBlocks.push({ lang, code });
+      return '%%%CODE_' + (codeBlocks.length - 1) + '%%%';
+    });
+
+    // Now handle paragraphs
+    let formatted = processedContent
       .split('\\n\\n')
       .filter(p => p.trim())
       .map(p => '<p>' + p.replace(/\\n/g, '<br>') + '</p>')
       .join('');
 
-    // Code formatting - handle mermaid diagrams specially
-    formatted = formatted
-      .replace(/\\\`\\\`\\\`mermaid\\n([\\s\\S]*?)\\\`\\\`\\\`/g, (match, diagram) => {
-        const diagramId = 'chat-diagram-' + Date.now();
-        // Schedule mermaid rendering after DOM update
-        setTimeout(() => {
-          const el = document.getElementById(diagramId);
-          if (el && window.mermaid) {
-            try {
-              window.mermaid.init(undefined, el);
-            } catch (e) {
+    // Restore mermaid diagrams with proper rendering
+    mermaidPlaceholders.forEach((item, idx) => {
+      // Schedule mermaid rendering after DOM update
+      setTimeout(() => {
+        const el = document.getElementById(item.id);
+        if (el && window.mermaid) {
+          try {
+            window.mermaid.render(item.id + '-svg', item.diagram).then(result => {
+              el.innerHTML = result.svg;
+            }).catch(e => {
               console.warn('Mermaid render error:', e);
-            }
+              el.innerHTML = '<pre>' + item.diagram + '</pre>';
+            });
+          } catch (e) {
+            console.warn('Mermaid render error:', e);
+            el.innerHTML = '<pre>' + item.diagram + '</pre>';
           }
-        }, 100);
-        return '<div class="chat-diagram-container"><div class="mermaid" id="' + diagramId + '">' + diagram.trim() + '</div></div>';
-      })
-      .replace(/\\\`\\\`\\\`(\\w*)\\n([\\s\\S]*?)\\\`\\\`\\\`/g, '<pre><code class="language-$1">$2</code></pre>')
-      .replace(/\\\`([^\\\`]+)\\\`/g, '<code>$1</code>');
+        }
+      }, 100);
+      formatted = formatted.replace('%%%MERMAID_' + idx + '%%%', '<div class="chat-diagram-container"><div class="mermaid" id="' + item.id + '">' + item.diagram + '</div></div>');
+    });
+
+    // Restore code blocks
+    codeBlocks.forEach((item, idx) => {
+      formatted = formatted.replace('%%%CODE_' + idx + '%%%', '<pre><code class="language-' + item.lang + '">' + item.code + '</code></pre>');
+    });
+
+    // Inline code
+    formatted = formatted.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
 
     // Bold and italic
     formatted = formatted

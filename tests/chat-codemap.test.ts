@@ -359,11 +359,13 @@ describe('Mermaid Rendering in Chat', () => {
 
   it('should create unique diagram IDs', () => {
     expect(scripts).toContain("diagramId = 'chat-diagram-' + Date.now()");
+    // Also includes index for multiple diagrams in one message
+    expect(scripts).toContain('mermaidPlaceholders.length');
   });
 
   it('should schedule mermaid initialization after DOM update', () => {
     expect(scripts).toContain('setTimeout(() => {');
-    expect(scripts).toContain('window.mermaid.init');
+    expect(scripts).toContain('window.mermaid.render');
   });
 
   it('should handle mermaid rendering errors', () => {
