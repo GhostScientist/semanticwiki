@@ -341,6 +341,7 @@ export function getTemplates() {
   <!-- AI Chat Side Panel -->
   ${data.features.aiChat ? `
   <aside class="chat-panel" role="complementary" aria-label="AI Chat Assistant">
+    <div class="chat-resize-handle" title="Drag to resize"></div>
     <div class="chat-panel-header">
       <div class="chat-panel-title">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

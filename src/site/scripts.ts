@@ -901,6 +901,57 @@ export function getClientScripts(features: Features): string {
     toggleBtn.addEventListener('click', toggleChatPanel);
     collapseBtn?.addEventListener('click', toggleChatPanel);
 
+    // Resize handle functionality
+    const resizeHandle = panel.querySelector('.chat-resize-handle');
+    if (resizeHandle) {
+      let isResizing = false;
+      let startX = 0;
+      let startWidth = 0;
+
+      resizeHandle.addEventListener('mousedown', (e) => {
+        isResizing = true;
+        startX = e.clientX;
+        startWidth = panel.offsetWidth;
+        document.body.classList.add('chat-resizing');
+        resizeHandle.classList.add('dragging');
+        e.preventDefault();
+      });
+
+      document.addEventListener('mousemove', (e) => {
+        if (!isResizing) return;
+
+        const deltaX = startX - e.clientX;
+        const newWidth = Math.min(
+          Math.max(startWidth + deltaX, 300), // min 300px
+          window.innerWidth * 0.5 // max 50% viewport
+        );
+
+        panel.style.width = newWidth + 'px';
+        document.documentElement.style.setProperty('--chat-panel-width', newWidth + 'px');
+      });
+
+      document.addEventListener('mouseup', () => {
+        if (isResizing) {
+          isResizing = false;
+          document.body.classList.remove('chat-resizing');
+          resizeHandle.classList.remove('dragging');
+          // Save width preference
+          try {
+            localStorage.setItem('chat-panel-width', panel.style.width);
+          } catch (e) {}
+        }
+      });
+
+      // Restore saved width
+      try {
+        const savedWidth = localStorage.getItem('chat-panel-width');
+        if (savedWidth) {
+          panel.style.width = savedWidth;
+          document.documentElement.style.setProperty('--chat-panel-width', savedWidth);
+        }
+      } catch (e) {}
+    }
+
     // Close on escape key
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && document.body.classList.contains('chat-open')) {
@@ -908,12 +959,20 @@ export function getClientScripts(features: Features): string {
       }
     });
 
-    // SPA navigation for links in chat
+    // SPA navigation for links in chat (including source links)
     messagesContainer?.addEventListener('click', (e) => {
       const link = e.target.closest('a[href]');
-      if (link && link.href && !link.href.startsWith('http') && !link.classList.contains('source-link')) {
-        e.preventDefault();
-        navigateWithSPA(link.href, link);
+      if (link && link.href) {
+        // Check if it's an internal link (same origin)
+        const linkUrl = new URL(link.href, window.location.origin);
+        const isInternal = linkUrl.origin === window.location.origin;
+        const isExternal = link.href.startsWith('http') && !isInternal;
+
+        if (isInternal && !isExternal) {
+          e.preventDefault();
+          e.stopPropagation();
+          navigateWithSPA(link.href, link);
+        }
       }
     });
 
