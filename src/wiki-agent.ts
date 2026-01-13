@@ -1185,7 +1185,7 @@ Create all ${missingPages.length} missing pages now.`;
       console.log(`\n[Local] ─── Page ${pagesGenerated + 1}/${pagesToGenerate.length}: ${pageSpec.title} ───`);
 
       try {
-        const content = await this.generateSinglePage(provider, pageSpec, options);
+        const content = await this.generateSinglePage(provider, pageSpec, pagesToGenerate, options);
 
         if (content) {
           // Write the page
@@ -1340,7 +1340,7 @@ Create all ${missingPages.length} missing pages now.`;
   }
 
   /**
-   * Generate a single wiki page
+   * Generate a single wiki page using RAG for semantic context
    */
   private async generateSinglePage(
     provider: LLMProvider,
@@ -1351,65 +1351,146 @@ Create all ${missingPages.length} missing pages now.`;
       context: string;
       sourceFiles: string[];
     },
+    allPages: Array<{ title: string; filename: string; type: string }>,
     options: WikiGenerationOptions
   ): Promise<string | null> {
-    // Gather context from source files
-    let sourceContext = '';
-    for (const file of pageSpec.sourceFiles.slice(0, 10)) {
-      try {
-        const fullPath = path.join(this.repoPath, file);
-        if (fs.existsSync(fullPath)) {
-          const content = fs.readFileSync(fullPath, 'utf-8');
-          const preview = content.slice(0, 2000);
-          sourceContext += `\n### File: ${file}\n\`\`\`\n${preview}\n${content.length > 2000 ? '\n... (truncated)' : ''}\n\`\`\`\n`;
+    console.log(`[Local] generateSinglePage: ${pageSpec.title}`);
+
+    // Build cross-reference info for the model
+    const otherPages = allPages
+      .filter(p => p.filename !== pageSpec.filename)
+      .map(p => `- [${p.title}](./${p.filename})`)
+      .join('\n');
+
+    // Use RAG to get semantically relevant code chunks
+    let ragContext = '';
+    if (this.ragSystem && this.ragSystem.getDocumentCount() > 0) {
+      console.log(`[Local]   Using RAG system (${this.ragSystem.getDocumentCount()} chunks indexed)`);
+
+      // Search for content relevant to this page's topic
+      const searchQueries = [
+        pageSpec.title,
+        pageSpec.context,
+        ...pageSpec.sourceFiles.slice(0, 3).map(f => path.basename(f, path.extname(f)))
+      ];
+
+      const seenChunks = new Set<string>();
+      for (const query of searchQueries) {
+        try {
+          const results = await this.ragSystem.search(query, { maxResults: 5 });
+          for (const result of results) {
+            const chunkKey = `${result.filePath}:${result.startLine}`;
+            if (seenChunks.has(chunkKey)) continue;
+            seenChunks.add(chunkKey);
+
+            // Include rich metadata from AST chunking
+            const chunkHeader = result.name
+              ? `### ${result.chunkType || 'Code'}: ${result.name} (${result.filePath}:${result.startLine})`
+              : `### ${result.filePath}:${result.startLine}-${result.endLine}`;
+
+            const docComment = result.documentation
+              ? `\n**Documentation:** ${result.documentation.slice(0, 200)}...\n`
+              : '';
+
+            const signature = result.signature ? `\n**Signature:** \`${result.signature}\`\n` : '';
+
+            ragContext += `\n${chunkHeader}${docComment}${signature}\n\`\`\`${result.language || ''}\n${result.content.slice(0, 1500)}\n\`\`\`\n`;
+
+            if (ragContext.length > 8000) break; // Context budget
+          }
+        } catch (err) {
+          console.log(`[Local]   RAG search error for "${query}": ${(err as Error).message}`);
         }
-      } catch {
-        // Skip files we can't read
+        if (ragContext.length > 8000) break;
+      }
+      console.log(`[Local]   RAG context: ${ragContext.length} chars from ${seenChunks.size} chunks`);
+    }
+
+    // Fallback: read source files directly if RAG didn't provide enough context
+    if (ragContext.length < 500) {
+      console.log(`[Local]   Using file fallback (RAG context insufficient)`);
+      for (const file of pageSpec.sourceFiles.slice(0, 5)) {
+        try {
+          const fullPath = path.join(this.repoPath, file);
+          if (fs.existsSync(fullPath)) {
+            const content = fs.readFileSync(fullPath, 'utf-8');
+            const preview = content.slice(0, 1500);
+            ragContext += `\n### File: ${file}\n\`\`\`\n${preview}\n${content.length > 1500 ? '\n... (truncated)' : ''}\n\`\`\`\n`;
+          }
+        } catch {
+          // Skip unreadable files
+        }
       }
     }
 
-    const prompt = `Generate a wiki documentation page for: "${pageSpec.title}"
+    const prompt = `Generate a detailed wiki documentation page for: "${pageSpec.title}"
 
-Page Type: ${pageSpec.type}
-Context: ${pageSpec.context}
+## Page Type
+${pageSpec.type}
 
-Source Files for Reference:
-${sourceContext || 'No source files available'}
+## Purpose
+${pageSpec.context}
 
-Requirements:
-1. Write in clear, professional Markdown
-2. Include a descriptive title as an H1 heading
-3. Add a brief overview section
-4. Document the key functionality with code examples where appropriate
-5. IMPORTANT: Include source file references like \`See: path/to/file.ts:123\` for traceability
-6. Add cross-references to related documentation using relative links like \`[Related Topic](./related.md)\`
-7. Keep the page focused and concise (aim for 300-800 words)
+## Relevant Source Code (from semantic search)
+${ragContext || 'No source code context available'}
 
-Generate the complete Markdown content for this wiki page:`;
+## Other Wiki Pages (for cross-references)
+${otherPages || 'No other pages available'}
+
+## Requirements
+Write comprehensive technical documentation that:
+1. Starts with an H1 title and a 2-3 sentence overview explaining WHAT this is and WHY it matters
+2. Explains the architecture/design with details about HOW things work
+3. Documents key functions, classes, or components with their purposes
+4. Includes code snippets from the source with traceability links like \`See: path/to/file.ts:123\`
+5. Links to related wiki pages using \`[Page Title](./filename.md)\` format
+6. Provides practical examples or usage patterns where applicable
+7. Uses clear headings (##, ###) to organize content
+
+IMPORTANT:
+- Reference specific source files and line numbers for traceability
+- Include cross-links to at least 2-3 other relevant wiki pages
+- Explain the "why" behind design decisions, not just the "what"
+- Target 400-600 words of substantive content
+
+Generate the complete Markdown content now:`;
 
     const messages: LLMMessage[] = [
       { role: 'user', content: prompt }
     ];
 
-    const systemPrompt = `You are a technical documentation expert. Generate clear, accurate wiki documentation based on source code analysis. Always include source file references for traceability. Use professional Markdown formatting.`;
+    const systemPrompt = `You are a senior software architect creating internal technical documentation. Your documentation is known for being detailed, practical, and well-cross-referenced. You always explain WHY things are designed a certain way, not just WHAT they do. You include source code references for traceability.`;
 
-    try {
-      const response = await provider.chat(messages, [], {
-        maxTokens: 4096,
-        systemPrompt,
-        temperature: 0.7,
-      });
+    // Try up to 2 times
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(`[Local]   Attempt ${attempt}: calling provider.chat()...`);
 
-      if (response.content && response.content.length > 100) {
-        return response.content;
+        const response = await provider.chat(messages, [], {
+          maxTokens: 4096,
+          systemPrompt,
+          temperature: attempt === 1 ? 0.7 : 0.5, // Lower temperature on retry
+        });
+
+        console.log(`[Local]   Response: ${response.content?.length || 0} chars, stopReason: ${response.stopReason}`);
+
+        if (response.content && response.content.length > 200) {
+          return response.content;
+        }
+
+        if (attempt === 1) {
+          console.log(`[Local]   Content too short (${response.content?.length || 0} chars), retrying...`);
+        }
+      } catch (error) {
+        console.error(`[Local]   Attempt ${attempt} error: ${(error as Error).message}`);
+        if (options.verbose) {
+          console.error(`[Local]   Stack: ${(error as Error).stack}`);
+        }
       }
-      return null;
-    } catch (error) {
-      if (options.verbose) {
-        console.error(`[Local] Error generating page: ${(error as Error).message}`);
-      }
-      return null;
     }
+
+    console.log(`[Local]   Failed to generate content after 2 attempts`);
+    return null;
   }
 
   /**
