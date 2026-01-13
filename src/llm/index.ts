@@ -7,10 +7,10 @@
  * - OllamaProvider: External Ollama server for power users
  */
 
-import { AnthropicProvider } from './anthropic-provider';
-import { LocalLlamaProvider } from './local-llama-provider';
-import { OllamaProvider } from './ollama-provider';
-import type { LLMProvider, CreateProviderOptions } from './types';
+import { AnthropicProvider } from './anthropic-provider.js';
+import { LocalLlamaProvider } from './local-llama-provider.js';
+import { OllamaProvider } from './ollama-provider.js';
+import type { LLMProvider, CreateProviderOptions } from './types.js';
 
 /**
  * Create an LLM provider based on the given options
@@ -78,10 +78,10 @@ export async function createLLMProvider(options: CreateProviderOptions = {}): Pr
 export async function isLocalModeAvailable(): Promise<{
   available: boolean;
   reason?: string;
-  hardware?: import('./types').HardwareProfile;
+  hardware?: import('./types.js').HardwareProfile;
 }> {
   try {
-    const { ModelManager } = await import('./model-manager');
+    const { ModelManager } = await import('./model-manager.js');
     const manager = new ModelManager();
     const hardware = await manager.detectHardware();
 
@@ -107,11 +107,11 @@ export async function isLocalModeAvailable(): Promise<{
  * Get recommended model for the current hardware
  */
 export async function getRecommendedModel(): Promise<{
-  model: import('./types').ModelRecommendation;
-  hardware: import('./types').HardwareProfile;
+  model: import('./types.js').ModelRecommendation;
+  hardware: import('./types.js').HardwareProfile;
 } | null> {
   try {
-    const { ModelManager } = await import('./model-manager');
+    const { ModelManager } = await import('./model-manager.js');
     const manager = new ModelManager();
     const hardware = await manager.detectHardware();
     const model = manager.recommendModel(hardware);
@@ -126,13 +126,13 @@ export async function getRecommendedModel(): Promise<{
  */
 export async function listDownloadedModels(): Promise<
   Array<{
-    model: import('./types').ModelRecommendation;
+    model: import('./types.js').ModelRecommendation;
     path: string;
     sizeBytes: number;
   }>
 > {
   try {
-    const { ModelManager } = await import('./model-manager');
+    const { ModelManager } = await import('./model-manager.js');
     const manager = new ModelManager();
     return manager.listDownloadedModels();
   } catch {
@@ -141,8 +141,8 @@ export async function listDownloadedModels(): Promise<
 }
 
 // Re-export types and providers
-export * from './types';
-export { AnthropicProvider } from './anthropic-provider';
-export { LocalLlamaProvider } from './local-llama-provider';
-export { OllamaProvider } from './ollama-provider';
-export { ModelManager } from './model-manager';
+export * from './types.js';
+export { AnthropicProvider } from './anthropic-provider.js';
+export { LocalLlamaProvider } from './local-llama-provider.js';
+export { OllamaProvider } from './ollama-provider.js';
+export { ModelManager } from './model-manager.js';

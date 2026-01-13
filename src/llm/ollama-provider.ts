@@ -15,7 +15,7 @@ import type {
   ModelInfo,
   ProgressCallback,
   ContentBlock,
-} from './types';
+} from './types.js';
 
 // Ollama client types (dynamic import)
 type OllamaClient = import('ollama').Ollama;

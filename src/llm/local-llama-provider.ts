@@ -6,7 +6,7 @@
  */
 
 import * as path from 'path';
-import { ModelManager } from './model-manager';
+import { ModelManager } from './model-manager.js';
 import type {
   LLMProvider,
   LLMMessage,
@@ -17,7 +17,7 @@ import type {
   ModelInfo,
   ProgressCallback,
   HardwareProfile,
-} from './types';
+} from './types.js';
 
 // Dynamic imports for node-llama-cpp types
 type LlamaModule = typeof import('node-llama-cpp');

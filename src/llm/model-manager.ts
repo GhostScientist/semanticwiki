@@ -12,7 +12,7 @@ import { createWriteStream } from 'fs';
 import { mkdir } from 'fs/promises';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
-import type { HardwareProfile, ModelRecommendation, ProgressCallback } from './types';
+import type { HardwareProfile, ModelRecommendation, ProgressCallback } from './types.js';
 
 /**
  * Registry of available models with their hardware requirements

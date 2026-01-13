@@ -16,7 +16,7 @@ import type {
   ModelInfo,
   ProgressCallback,
   ContentBlock,
-} from './types';
+} from './types.js';
 
 /**
  * Options for the AnthropicProvider
