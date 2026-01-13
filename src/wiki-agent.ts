@@ -1423,43 +1423,38 @@ Create all ${missingPages.length} missing pages now.`;
       }
     }
 
-    const prompt = `Generate a detailed wiki documentation page for: "${pageSpec.title}"
+    // Build a simpler, more grounded prompt that reduces hallucination
+    // Small models need explicit instructions to use ONLY the provided context
+    const relatedLinks = otherPages ? otherPages.split('\n').slice(0, 3).join(', ') : 'none';
 
-## Page Type
-${pageSpec.type}
+    const prompt = `# Task: Write documentation for "${pageSpec.title}"
 
-## Purpose
-${pageSpec.context}
+## ACTUAL SOURCE CODE FROM THIS PROJECT:
+${ragContext || 'No source code available'}
 
-## Relevant Source Code (from semantic search)
-${ragContext || 'No source code context available'}
+## Instructions:
+Write a Markdown documentation page based ONLY on the source code shown above.
 
-## Other Wiki Pages (for cross-references)
-${otherPages || 'No other pages available'}
+1. Start with: # ${pageSpec.title}
+2. Write 2-3 sentences describing what this code does (based on the actual code above)
+3. List the key files, functions, or components you see in the code
+4. For each important item, explain what it does with a reference like "See: filename.ts:123"
+5. Add links to related pages: ${relatedLinks}
 
-## Requirements
-Write comprehensive technical documentation that:
-1. Starts with an H1 title and a 2-3 sentence overview explaining WHAT this is and WHY it matters
-2. Explains the architecture/design with details about HOW things work
-3. Documents key functions, classes, or components with their purposes
-4. Includes code snippets from the source with traceability links like \`See: path/to/file.ts:123\`
-5. Links to related wiki pages using \`[Page Title](./filename.md)\` format
-6. Provides practical examples or usage patterns where applicable
-7. Uses clear headings (##, ###) to organize content
+CRITICAL RULES:
+- ONLY describe code that appears in the "ACTUAL SOURCE CODE" section above
+- Do NOT invent components, features, or files that are not shown
+- If the code shows React components, describe React components
+- If the code shows API routes, describe API routes
+- Keep descriptions factual and based on what you can see
 
-IMPORTANT:
-- Reference specific source files and line numbers for traceability
-- Include cross-links to at least 2-3 other relevant wiki pages
-- Explain the "why" behind design decisions, not just the "what"
-- Target 400-600 words of substantive content
-
-Generate the complete Markdown content now:`;
+Write the documentation now:`;
 
     const messages: LLMMessage[] = [
       { role: 'user', content: prompt }
     ];
 
-    const systemPrompt = `You are a senior software architect creating internal technical documentation. Your documentation is known for being detailed, practical, and well-cross-referenced. You always explain WHY things are designed a certain way, not just WHAT they do. You include source code references for traceability.`;
+    const systemPrompt = `You are a documentation writer. You ONLY write about code that is explicitly shown to you. You never make up or invent features. You describe exactly what you see in the provided source code, nothing more.`;
 
     // Try up to 2 times
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -1469,7 +1464,7 @@ Generate the complete Markdown content now:`;
         const response = await provider.chat(messages, [], {
           maxTokens: 4096,
           systemPrompt,
-          temperature: attempt === 1 ? 0.7 : 0.5, // Lower temperature on retry
+          temperature: attempt === 1 ? 0.3 : 0.1, // Low temperature to reduce hallucination
         });
 
         console.log(`[Local]   Response: ${response.content?.length || 0} chars, stopReason: ${response.stopReason}`);

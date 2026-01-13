@@ -439,6 +439,14 @@ IMPORTANT RULES:
         stopReason: 'error',
         usage: { inputTokens: 0, outputTokens: 0 },
       };
+    } finally {
+      // CRITICAL: Dispose session to release sequence back to pool
+      // Without this, subsequent chat() calls fail with "No sequences left"
+      try {
+        await session.dispose?.();
+      } catch {
+        // Ignore disposal errors
+      }
     }
   }
 
