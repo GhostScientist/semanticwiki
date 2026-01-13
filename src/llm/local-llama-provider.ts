@@ -141,10 +141,12 @@ export class LocalLlamaProvider implements LLMProvider {
         gpuLayers: this.options.gpuLayers ?? -1, // Auto-detect
       });
 
-      // Create context
+      // Create context with multiple sequences for concurrent/sequential page generation
+      // Each page generation needs its own sequence, so we allocate enough for a full wiki
       this.context = await this.model.createContext({
         contextSize: Math.min(this.options.contextSize || contextLength, contextLength),
         threads: this.options.threads,
+        sequences: 20, // Allow up to 20 sequential page generations
       });
 
       this.modelInfo = {

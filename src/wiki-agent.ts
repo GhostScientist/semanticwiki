@@ -1405,12 +1405,12 @@ Create all ${missingPages.length} missing pages now.`;
 
             ragContext += `\n${chunkHeader}${docComment}${signature}\n\`\`\`${result.language || ''}\n${result.content.slice(0, 1500)}\n\`\`\`\n`;
 
-            if (ragContext.length > 8000) break; // Context budget
+            if (ragContext.length > 12000) break; // Context budget - 21B model can handle more
           }
         } catch (err) {
           console.log(`[Local]   RAG search error for "${query}": ${(err as Error).message}`);
         }
-        if (ragContext.length > 8000) break;
+        if (ragContext.length > 12000) break;
       }
       console.log(`[Local]   RAG context: ${ragContext.length} chars from ${seenChunks.size} chunks`);
       console.log(`[Local]   Files in context: ${[...new Set(chunkFiles)].join(', ')}`);
@@ -1433,38 +1433,53 @@ Create all ${missingPages.length} missing pages now.`;
       }
     }
 
-    // Build a simpler, more grounded prompt that reduces hallucination
-    // Small models need explicit instructions to use ONLY the provided context
-    const relatedLinks = otherPages ? otherPages.split('\n').slice(0, 3).join(', ') : 'none';
+    // Build a detailed prompt that produces high-quality documentation
+    const relatedLinks = otherPages ? otherPages.split('\n').slice(0, 5).join('\n') : 'none';
 
-    const prompt = `# Task: Write documentation for "${pageSpec.title}"
+    const prompt = `# Documentation Task: "${pageSpec.title}"
 
-## ACTUAL SOURCE CODE FROM THIS PROJECT:
+You are documenting a ${pageSpec.type} for a software project. Based on the source code below, write comprehensive technical documentation.
+
+## Source Code Context
 ${ragContext || 'No source code available'}
 
-## Instructions:
-Write a Markdown documentation page based ONLY on the source code shown above.
+## Documentation Requirements
 
-1. Start with: # ${pageSpec.title}
-2. Write 2-3 sentences describing what this code does (based on the actual code above)
-3. List the key files, functions, or components you see in the code
-4. For each important item, explain what it does with a reference like "See: filename.ts:123"
-5. Add links to related pages: ${relatedLinks}
+Write a well-structured Markdown page with the following sections:
 
-CRITICAL RULES:
-- ONLY describe code that appears in the "ACTUAL SOURCE CODE" section above
-- Do NOT invent components, features, or files that are not shown
-- If the code shows React components, describe React components
-- If the code shows API routes, describe API routes
-- Keep descriptions factual and based on what you can see
+### 1. Overview (required)
+- Start with \`# ${pageSpec.title}\`
+- Write 3-4 sentences explaining what this ${pageSpec.type} does and why it exists
+- Mention the key technologies used (React, TypeScript, etc.)
 
-Write the documentation now:`;
+### 2. Key Components (required)
+For each important file, function, or class you see in the code:
+- Explain its purpose and responsibility
+- Describe how it works at a high level
+- Add source reference: \`See: filename.ts:line\`
+
+### 3. How It Works (required)
+- Explain the data flow or control flow
+- Describe any patterns used (e.g., hooks, state management)
+- Include code snippets where helpful
+
+### 4. Related Documentation
+Link to these related pages:
+${relatedLinks}
+
+## Important Rules
+- Base ALL content on the actual source code shown above
+- Include specific file paths and line numbers as references
+- Do not invent features or files not shown in the code
+- Write for developers who need to understand and work with this code
+
+Generate the documentation now:`;
 
     const messages: LLMMessage[] = [
       { role: 'user', content: prompt }
     ];
 
-    const systemPrompt = `You are a documentation writer. You ONLY write about code that is explicitly shown to you. You never make up or invent features. You describe exactly what you see in the provided source code, nothing more.`;
+    const systemPrompt = `You are a senior technical writer creating internal documentation for a software development team. Your documentation is thorough, accurate, and always grounded in the actual source code. You explain not just WHAT the code does, but HOW it works and WHY it's designed that way. You include source file references for every major point.`;
 
     // Debug: show prompt stats
     console.log(`[Local]   ─────────────────────────────────────────────────────`);
