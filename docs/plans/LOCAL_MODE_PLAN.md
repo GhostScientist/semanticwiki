@@ -2,7 +2,18 @@
 
 ## Overview
 
-This document outlines the implementation plan for adding a `--full-local` flag to the `ted-mosby generate` command, enabling complete offline operation using local language models.
+This document outlines the implementation plan for adding a `--full-local` flag to the `ted-mosby generate` command, enabling complete offline operation using local language models with **zero external dependencies**.
+
+## Design Philosophy: Zero-Friction Local Mode
+
+**Goal:** Users should be able to run `ted-mosby generate --full-local` without installing anything else. The CLI handles everything: model download, GPU detection, and inference.
+
+```bash
+# This should "just work" - no Ollama, no setup
+ted-mosby generate ./my-project --full-local
+```
+
+---
 
 ## Current Architecture Analysis
 
@@ -30,64 +41,170 @@ This document outlines the implementation plan for adding a `--full-local` flag 
 
 ## Proposed Solution
 
+### Technology Choice: `node-llama-cpp` (Self-Contained)
+
+**Why `node-llama-cpp`?**
+
+| Feature | Benefit |
+|---------|---------|
+| **In-process inference** | No external server needed |
+| **Automatic GPU detection** | CUDA, Metal, Vulkan auto-detected |
+| **Model management** | Download models on-demand |
+| **Native tool calling** | Built-in function calling support |
+| **Cross-platform** | macOS, Linux, Windows |
+| **Active development** | Regular updates, good documentation |
+
+**Alternative: Ollama (Power Users)**
+
+For users who already have Ollama installed and prefer managing models separately, we'll provide `--use-ollama` as an alternative backend.
+
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         ted-mosby CLI                            │
-│                                                                  │
-│   --full-local flag → LocalLLMProvider                          │
-│   (default)         → AnthropicProvider                         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      LLM Provider Interface                      │
-│                                                                  │
-│   interface LLMProvider {                                        │
-│     chat(messages, tools, options): Promise<LLMResponse>        │
-│     getModelInfo(): ModelInfo                                   │
-│   }                                                              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-┌─────────────────────────┐     ┌─────────────────────────┐
-│   AnthropicProvider     │     │    OllamaProvider       │
-│                         │     │                         │
-│ - client.messages.create│     │ - ollama.chat()         │
-│ - Tool use support      │     │ - Tool use support      │
-│ - Streaming optional    │     │ - Streaming optional    │
-└─────────────────────────┘     └─────────────────────────┘
-                                          │
-                                          ▼
-                              ┌─────────────────────────┐
-                              │   Local Model Options   │
-                              │                         │
-                              │ - Llama 3.1 70B/405B    │
-                              │ - Qwen 2.5 72B Coder    │
-                              │ - DeepSeek Coder V2     │
-                              │ - Mistral Large         │
-                              │ - Codestral             │
-                              └─────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                           ted-mosby CLI                              │
+│                                                                      │
+│   --full-local           → LocalLlamaProvider (default, bundled)    │
+│   --full-local --use-ollama → OllamaProvider (external server)      │
+│   (no flag)              → AnthropicProvider (cloud)                │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        LLM Provider Interface                        │
+│                                                                      │
+│   interface LLMProvider {                                            │
+│     initialize(): Promise<void>                                      │
+│     chat(messages, tools, options): Promise<LLMResponse>            │
+│     shutdown(): Promise<void>                                        │
+│   }                                                                  │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+         ┌──────────────────────────┼──────────────────────────┐
+         ▼                          ▼                          ▼
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│ AnthropicProvider│      │LocalLlamaProvider│      │  OllamaProvider │
+│                 │      │                 │      │                 │
+│ Cloud API       │      │ node-llama-cpp  │      │ External server │
+│ Default mode    │      │ Self-contained  │      │ Power users     │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │   Model Management  │
+                         │                     │
+                         │ ~/.ted-mosby/models │
+                         │ Auto-download GGUF  │
+                         │ Hardware detection  │
+                         └─────────────────────┘
 ```
 
-### Technology Choice: Ollama
+---
 
-**Why Ollama?**
-1. **Easy Setup** - Single binary, no Python dependencies
-2. **OpenAI-Compatible API** - Well-documented, easy to integrate
-3. **Tool/Function Calling** - Native support in recent versions
-4. **Model Management** - Pull models with simple commands
-5. **Cross-Platform** - macOS, Linux, Windows
-6. **Active Development** - Strong community, frequent updates
-7. **Resource Management** - Automatic GPU detection, memory management
+## User Experience
 
-**Alternative Providers (Future Extension):**
-- `llama.cpp` server - Lower level, maximum performance
-- `vLLM` - Production-grade, high throughput
-- `LocalAI` - OpenAI API drop-in replacement
-- `LM Studio` - GUI-based, beginner friendly
+### First-Time User Flow
+
+```bash
+$ ted-mosby generate ./my-project --full-local
+
+🏠 Local Mode Activated
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔍 Detecting hardware...
+   ├─ GPU: NVIDIA RTX 4090 (24 GB VRAM)
+   ├─ RAM: 64 GB available
+   └─ Recommended model: qwen2.5-coder-14b-instruct-q5_k_m
+
+📦 Model not found locally. Downloading...
+   └─ qwen2.5-coder-14b-instruct-q5_k_m.gguf (9.8 GB)
+
+   [████████████████████████░░░░░░░░░░░░░░░░] 62%  |  6.1 GB  |  45 MB/s  |  ETA 1:23
+
+   This is a one-time download. Models are cached in ~/.ted-mosby/models
+
+✅ Model ready!
+
+🔍 Indexing repository...
+   ├─ Parsed 245 files
+   ├─ Generated 1,247 chunks
+   └─ Created embeddings (local)
+
+📝 Generating wiki...
+   ├─ Phase 1: Discovery    [████████████████████] 100%
+   ├─ Phase 2: Planning     [████████████░░░░░░░░]  60%
+   ├─ Phase 3: Generation   [░░░░░░░░░░░░░░░░░░░░]   0%
+   └─ Phase 4: Verification [░░░░░░░░░░░░░░░░░░░░]   0%
+
+⚡ Inference: 28.4 tokens/sec  |  📊 VRAM: 12.3 GB  |  🧠 Context: 16K/32K
+```
+
+### Subsequent Runs (Model Cached)
+
+```bash
+$ ted-mosby generate ./another-project --full-local
+
+🏠 Local Mode Activated
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔍 Detecting hardware...
+   └─ GPU: NVIDIA RTX 4090 (24 GB VRAM)
+
+✅ Using cached model: qwen2.5-coder-14b-instruct-q5_k_m
+
+🔍 Indexing repository...
+   ...
+```
+
+### Power User: Ollama Backend
+
+```bash
+# Use existing Ollama installation
+$ ted-mosby generate ./project --full-local --use-ollama
+
+# With custom Ollama host
+$ ted-mosby generate ./project --full-local --use-ollama --ollama-host http://192.168.1.50:11434
+
+# With specific Ollama model
+$ ted-mosby generate ./project --full-local --use-ollama --local-model codestral:22b
+```
+
+### Power User: Custom Model
+
+```bash
+# Use a specific GGUF file
+$ ted-mosby generate ./project --full-local --model-path ~/models/my-custom-model.gguf
+
+# Use a specific HuggingFace model (auto-downloads)
+$ ted-mosby generate ./project --full-local --local-model Qwen/Qwen2.5-Coder-32B-Instruct-GGUF
+```
+
+---
+
+## CLI Options
+
+```typescript
+program
+  .command('generate')
+  .description('Generate architecture wiki')
+
+  // Local mode flags
+  .option('--full-local', 'Run entirely locally without cloud APIs')
+  .option('--local-model <model>', 'Model to use (default: auto-selected based on hardware)')
+  .option('--model-path <path>', 'Path to a local GGUF model file')
+
+  // Ollama backend (alternative)
+  .option('--use-ollama', 'Use Ollama server instead of bundled inference')
+  .option('--ollama-host <url>', 'Ollama server URL (default: http://localhost:11434)')
+
+  // Performance tuning
+  .option('--gpu-layers <n>', 'Number of layers to offload to GPU (default: auto)')
+  .option('--context-size <n>', 'Context window size (default: 32768)')
+  .option('--threads <n>', 'CPU threads for inference (default: auto)')
+
+  // Existing options...
+  .option('-m, --model <model>', 'Claude model (when not using --full-local)')
+```
 
 ---
 
@@ -100,11 +217,13 @@ This document outlines the implementation plan for adding a `--full-local` flag 
 **New Files:**
 ```
 src/llm/
-├── index.ts              # Exports and factory function
-├── types.ts              # Shared types and interfaces
-├── anthropic-provider.ts # Existing Claude integration
-├── ollama-provider.ts    # New Ollama integration
-└── prompt-adapter.ts     # Model-specific prompt formatting
+├── index.ts                  # Exports and factory function
+├── types.ts                  # Shared types and interfaces
+├── anthropic-provider.ts     # Existing Claude integration (extracted)
+├── local-llama-provider.ts   # NEW: node-llama-cpp integration
+├── ollama-provider.ts        # NEW: Ollama client integration
+├── model-manager.ts          # NEW: Download, cache, hardware detection
+└── prompt-adapter.ts         # Model-specific prompt formatting
 ```
 
 **Core Interface:**
@@ -115,7 +234,7 @@ src/llm/
 export interface LLMMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | ContentBlock[];
-  tool_call_id?: string;
+  toolCallId?: string;
   name?: string;
 }
 
@@ -142,41 +261,227 @@ export interface LLMResponse {
 }
 
 export interface LLMProviderOptions {
-  model: string;
   maxTokens: number;
   temperature?: number;
   systemPrompt?: string;
 }
 
 export interface LLMProvider {
+  /** Initialize the provider (load model, connect to server, etc.) */
+  initialize(): Promise<void>;
+
+  /** Send a chat completion request */
   chat(
     messages: LLMMessage[],
     tools: LLMTool[],
     options: LLMProviderOptions
   ): Promise<LLMResponse>;
 
+  /** Stream a chat completion (optional) */
   stream?(
     messages: LLMMessage[],
     tools: LLMTool[],
     options: LLMProviderOptions
   ): AsyncIterable<LLMStreamChunk>;
 
+  /** Clean up resources */
+  shutdown(): Promise<void>;
+
+  /** Get model information */
   getModelInfo(): {
     name: string;
     contextLength: number;
     supportsTools: boolean;
     supportsStreaming: boolean;
+    isLocal: boolean;
   };
 }
 ```
 
-### Phase 2: Ollama Provider Implementation
+### Phase 2: Model Management System
+
+**Goal:** Automatic hardware detection, model selection, and download management
+
+```typescript
+// src/llm/model-manager.ts
+
+import { getLlama, LlamaModel } from 'node-llama-cpp';
+import { createWriteStream } from 'fs';
+import { pipeline } from 'stream/promises';
+
+export interface HardwareProfile {
+  gpuVendor: 'nvidia' | 'amd' | 'apple' | 'intel' | 'none';
+  gpuVram: number;        // In GB
+  systemRam: number;      // In GB
+  cpuCores: number;
+}
+
+export interface ModelRecommendation {
+  modelId: string;
+  ggufFile: string;
+  downloadUrl: string;
+  fileSizeBytes: number;
+  minVram: number;
+  minRam: number;
+  contextLength: number;
+  quality: 'excellent' | 'good' | 'acceptable';
+}
+
+// Model registry with hardware requirements
+const MODEL_REGISTRY: ModelRecommendation[] = [
+  {
+    modelId: 'qwen2.5-coder-32b-q4',
+    ggufFile: 'qwen2.5-coder-32b-instruct-q4_k_m.gguf',
+    downloadUrl: 'https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct-GGUF/resolve/main/qwen2.5-coder-32b-instruct-q4_k_m.gguf',
+    fileSizeBytes: 19_500_000_000,  // ~19.5 GB
+    minVram: 20,
+    minRam: 24,
+    contextLength: 131072,
+    quality: 'excellent',
+  },
+  {
+    modelId: 'qwen2.5-coder-14b-q5',
+    ggufFile: 'qwen2.5-coder-14b-instruct-q5_k_m.gguf',
+    downloadUrl: 'https://huggingface.co/Qwen/Qwen2.5-Coder-14B-Instruct-GGUF/resolve/main/qwen2.5-coder-14b-instruct-q5_k_m.gguf',
+    fileSizeBytes: 10_200_000_000,  // ~10.2 GB
+    minVram: 12,
+    minRam: 16,
+    contextLength: 131072,
+    quality: 'excellent',
+  },
+  {
+    modelId: 'qwen2.5-coder-7b-q5',
+    ggufFile: 'qwen2.5-coder-7b-instruct-q5_k_m.gguf',
+    downloadUrl: 'https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/qwen2.5-coder-7b-instruct-q5_k_m.gguf',
+    fileSizeBytes: 5_500_000_000,   // ~5.5 GB
+    minVram: 6,
+    minRam: 8,
+    contextLength: 131072,
+    quality: 'good',
+  },
+  {
+    modelId: 'qwen2.5-coder-3b-q8',
+    ggufFile: 'qwen2.5-coder-3b-instruct-q8_0.gguf',
+    downloadUrl: 'https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q8_0.gguf',
+    fileSizeBytes: 3_400_000_000,   // ~3.4 GB
+    minVram: 4,
+    minRam: 6,
+    contextLength: 32768,
+    quality: 'acceptable',
+  },
+];
+
+export class ModelManager {
+  private modelsDir: string;
+
+  constructor() {
+    this.modelsDir = path.join(os.homedir(), '.ted-mosby', 'models');
+  }
+
+  async detectHardware(): Promise<HardwareProfile> {
+    const llama = await getLlama();
+    const gpuInfo = await llama.getGpuDeviceInfo();
+
+    return {
+      gpuVendor: this.detectGpuVendor(gpuInfo),
+      gpuVram: this.getVramGb(gpuInfo),
+      systemRam: os.totalmem() / (1024 ** 3),
+      cpuCores: os.cpus().length,
+    };
+  }
+
+  recommendModel(hardware: HardwareProfile): ModelRecommendation {
+    // Find the best model that fits the hardware
+    const candidates = MODEL_REGISTRY
+      .filter(m => {
+        if (hardware.gpuVram >= m.minVram) return true;
+        if (hardware.systemRam >= m.minRam) return true;
+        return false;
+      })
+      .sort((a, b) => {
+        // Prefer higher quality, then larger context
+        if (a.quality !== b.quality) {
+          const qualityOrder = { excellent: 0, good: 1, acceptable: 2 };
+          return qualityOrder[a.quality] - qualityOrder[b.quality];
+        }
+        return b.contextLength - a.contextLength;
+      });
+
+    if (candidates.length === 0) {
+      throw new Error(
+        `Insufficient hardware for local mode.\n` +
+        `Minimum requirements: 4GB VRAM or 6GB RAM.\n` +
+        `Detected: ${hardware.gpuVram}GB VRAM, ${hardware.systemRam.toFixed(1)}GB RAM`
+      );
+    }
+
+    return candidates[0];
+  }
+
+  async ensureModel(recommendation: ModelRecommendation): Promise<string> {
+    const modelPath = path.join(this.modelsDir, recommendation.ggufFile);
+
+    if (existsSync(modelPath)) {
+      return modelPath;
+    }
+
+    await this.downloadModel(recommendation, modelPath);
+    return modelPath;
+  }
+
+  private async downloadModel(model: ModelRecommendation, destPath: string): Promise<void> {
+    console.log(`\n📦 Downloading model: ${model.modelId}`);
+    console.log(`   Size: ${(model.fileSizeBytes / 1e9).toFixed(1)} GB`);
+    console.log(`   Destination: ${destPath}\n`);
+
+    await mkdir(path.dirname(destPath), { recursive: true });
+
+    const response = await fetch(model.downloadUrl);
+    if (!response.ok) {
+      throw new Error(`Failed to download model: ${response.statusText}`);
+    }
+
+    const totalBytes = model.fileSizeBytes;
+    let downloadedBytes = 0;
+
+    const progressStream = new Transform({
+      transform(chunk, encoding, callback) {
+        downloadedBytes += chunk.length;
+        const percent = ((downloadedBytes / totalBytes) * 100).toFixed(1);
+        const downloaded = (downloadedBytes / 1e9).toFixed(1);
+        const total = (totalBytes / 1e9).toFixed(1);
+
+        process.stdout.write(
+          `\r   [${this.progressBar(percent)}] ${percent}%  |  ${downloaded}/${total} GB`
+        );
+
+        callback(null, chunk);
+      },
+      progressBar(percent: number): string {
+        const width = 40;
+        const filled = Math.round((percent / 100) * width);
+        return '█'.repeat(filled) + '░'.repeat(width - filled);
+      }
+    });
+
+    await pipeline(
+      response.body,
+      progressStream,
+      createWriteStream(destPath)
+    );
+
+    console.log('\n\n✅ Download complete!\n');
+  }
+}
+```
+
+### Phase 3: LocalLlamaProvider Implementation
 
 **Dependency:**
 ```json
 {
   "dependencies": {
-    "ollama": "^0.5.0"
+    "node-llama-cpp": "^3.0.0"
   }
 }
 ```
@@ -184,21 +489,71 @@ export interface LLMProvider {
 **Implementation:**
 
 ```typescript
-// src/llm/ollama-provider.ts
+// src/llm/local-llama-provider.ts
 
-import { Ollama } from 'ollama';
+import {
+  getLlama,
+  LlamaChatSession,
+  LlamaModel,
+  LlamaContext,
+  defineChatSessionFunction,
+} from 'node-llama-cpp';
+import { ModelManager } from './model-manager';
 import type { LLMProvider, LLMMessage, LLMTool, LLMResponse, LLMProviderOptions } from './types';
 
-export class OllamaProvider implements LLMProvider {
-  private client: Ollama;
-  private modelName: string;
+export interface LocalLlamaProviderOptions {
+  modelPath?: string;           // Explicit path to GGUF file
+  modelId?: string;             // Model ID from registry
+  gpuLayers?: number;           // GPU offload layers (default: auto)
+  contextSize?: number;         // Context window size
+  threads?: number;             // CPU threads
+}
 
-  constructor(options: {
-    host?: string;  // Default: http://localhost:11434
-    model: string;
-  }) {
-    this.client = new Ollama({ host: options.host });
-    this.modelName = options.model;
+export class LocalLlamaProvider implements LLMProvider {
+  private options: LocalLlamaProviderOptions;
+  private modelManager: ModelManager;
+  private model: LlamaModel | null = null;
+  private context: LlamaContext | null = null;
+  private modelPath: string = '';
+
+  constructor(options: LocalLlamaProviderOptions = {}) {
+    this.options = options;
+    this.modelManager = new ModelManager();
+  }
+
+  async initialize(): Promise<void> {
+    console.log('🔍 Detecting hardware...');
+    const hardware = await this.modelManager.detectHardware();
+
+    console.log(`   ├─ GPU: ${this.formatGpuInfo(hardware)}`);
+    console.log(`   ├─ RAM: ${hardware.systemRam.toFixed(0)} GB available`);
+
+    // Determine which model to use
+    if (this.options.modelPath) {
+      // Explicit path provided
+      this.modelPath = this.options.modelPath;
+      console.log(`   └─ Using specified model: ${this.modelPath}`);
+    } else {
+      // Auto-select and ensure model is downloaded
+      const recommendation = this.modelManager.recommendModel(hardware);
+      console.log(`   └─ Recommended model: ${recommendation.modelId}`);
+      this.modelPath = await this.modelManager.ensureModel(recommendation);
+    }
+
+    // Load the model
+    console.log('\n⏳ Loading model...');
+    const llama = await getLlama();
+
+    this.model = await llama.loadModel({
+      modelPath: this.modelPath,
+      gpuLayers: this.options.gpuLayers,  // undefined = auto
+    });
+
+    this.context = await this.model.createContext({
+      contextSize: this.options.contextSize ?? 32768,
+    });
+
+    console.log('✅ Model ready!\n');
   }
 
   async chat(
@@ -206,11 +561,192 @@ export class OllamaProvider implements LLMProvider {
     tools: LLMTool[],
     options: LLMProviderOptions
   ): Promise<LLMResponse> {
-    const ollamaMessages = this.convertMessages(messages);
+    if (!this.context || !this.model) {
+      throw new Error('Provider not initialized. Call initialize() first.');
+    }
+
+    // Convert tools to node-llama-cpp format
+    const functions = this.convertToolsToFunctions(tools);
+
+    // Create chat session with tools
+    const session = new LlamaChatSession({
+      context: this.context,
+      systemPrompt: options.systemPrompt,
+    });
+
+    // Convert messages to session format
+    for (const msg of messages) {
+      if (msg.role === 'user') {
+        // User messages will be sent via prompt()
+      } else if (msg.role === 'assistant' && typeof msg.content === 'string') {
+        // Previous assistant responses
+      }
+      // Tool results are handled within the function calling flow
+    }
+
+    // Get the last user message
+    const lastUserMessage = messages
+      .filter(m => m.role === 'user')
+      .pop();
+
+    if (!lastUserMessage) {
+      throw new Error('No user message found');
+    }
+
+    const userContent = typeof lastUserMessage.content === 'string'
+      ? lastUserMessage.content
+      : lastUserMessage.content.map(c => c.type === 'text' ? c.text : '').join('');
+
+    // Prompt with function calling
+    let responseText = '';
+    const toolCalls: LLMToolCall[] = [];
+
+    const response = await session.prompt(userContent, {
+      maxTokens: options.maxTokens,
+      temperature: options.temperature ?? 0.7,
+      functions,
+      onFunctionCall: async (call) => {
+        // Collect tool calls for execution by the caller
+        toolCalls.push({
+          id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+          name: call.functionName,
+          arguments: call.params,
+        });
+
+        // Return placeholder - actual execution happens in the main loop
+        return { pending: true };
+      },
+    });
+
+    responseText = response;
+
+    return {
+      content: responseText,
+      toolCalls,
+      stopReason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+      usage: {
+        inputTokens: 0,  // node-llama-cpp doesn't expose this easily
+        outputTokens: 0,
+      },
+    };
+  }
+
+  private convertToolsToFunctions(tools: LLMTool[]): Record<string, any> {
+    const functions: Record<string, any> = {};
+
+    for (const tool of tools) {
+      functions[tool.name] = defineChatSessionFunction({
+        description: tool.description,
+        params: tool.parameters,
+        handler: async (params) => {
+          // This handler is called during inference
+          // We'll intercept via onFunctionCall instead
+          return { pending: true };
+        },
+      });
+    }
+
+    return functions;
+  }
+
+  async shutdown(): Promise<void> {
+    if (this.context) {
+      await this.context.dispose();
+      this.context = null;
+    }
+    if (this.model) {
+      await this.model.dispose();
+      this.model = null;
+    }
+  }
+
+  getModelInfo() {
+    return {
+      name: path.basename(this.modelPath, '.gguf'),
+      contextLength: this.options.contextSize ?? 32768,
+      supportsTools: true,
+      supportsStreaming: true,
+      isLocal: true,
+    };
+  }
+
+  private formatGpuInfo(hardware: HardwareProfile): string {
+    if (hardware.gpuVendor === 'none') {
+      return 'None (CPU-only mode)';
+    }
+    const vendor = hardware.gpuVendor.charAt(0).toUpperCase() + hardware.gpuVendor.slice(1);
+    return `${vendor} (${hardware.gpuVram} GB VRAM)`;
+  }
+}
+```
+
+### Phase 4: Ollama Provider (Alternative Backend)
+
+For power users who prefer Ollama:
+
+```typescript
+// src/llm/ollama-provider.ts
+
+import { Ollama } from 'ollama';
+import type { LLMProvider, LLMMessage, LLMTool, LLMResponse, LLMProviderOptions } from './types';
+
+export interface OllamaProviderOptions {
+  host?: string;  // Default: http://localhost:11434
+  model: string;
+}
+
+export class OllamaProvider implements LLMProvider {
+  private client: Ollama;
+  private modelName: string;
+  private host: string;
+
+  constructor(options: OllamaProviderOptions) {
+    this.host = options.host || 'http://localhost:11434';
+    this.client = new Ollama({ host: this.host });
+    this.modelName = options.model;
+  }
+
+  async initialize(): Promise<void> {
+    console.log(`🔌 Connecting to Ollama at ${this.host}...`);
+
+    try {
+      // Check connection
+      const models = await this.client.list();
+      const hasModel = models.models.some(m => m.name.startsWith(this.modelName));
+
+      if (!hasModel) {
+        console.log(`\n⚠️  Model '${this.modelName}' not found in Ollama.`);
+        console.log(`   Available models:`);
+        models.models.forEach(m => console.log(`     - ${m.name}`));
+        console.log(`\n   Pull it with: ollama pull ${this.modelName}\n`);
+        throw new Error(`Model '${this.modelName}' not available`);
+      }
+
+      console.log(`✅ Connected! Using model: ${this.modelName}\n`);
+    } catch (error) {
+      if (error.code === 'ECONNREFUSED') {
+        throw new Error(
+          `Cannot connect to Ollama at ${this.host}\n\n` +
+          `  To use --use-ollama, ensure Ollama is running:\n` +
+          `    $ ollama serve\n\n` +
+          `  Or use the bundled local mode without --use-ollama:\n` +
+          `    $ ted-mosby generate ./project --full-local`
+        );
+      }
+      throw error;
+    }
+  }
+
+  async chat(
+    messages: LLMMessage[],
+    tools: LLMTool[],
+    options: LLMProviderOptions
+  ): Promise<LLMResponse> {
+    const ollamaMessages = this.convertMessages(messages, options.systemPrompt);
     const ollamaTools = this.convertTools(tools);
 
     const response = await this.client.chat({
-      model: options.model || this.modelName,
+      model: this.modelName,
       messages: ollamaMessages,
       tools: ollamaTools,
       options: {
@@ -219,475 +755,357 @@ export class OllamaProvider implements LLMProvider {
       },
     });
 
-    return this.convertResponse(response);
+    return this.parseResponse(response);
   }
 
-  private convertMessages(messages: LLMMessage[]): OllamaMessage[] {
-    // Convert from our format to Ollama format
-    // Handle tool results, multimodal content, etc.
+  private convertMessages(messages: LLMMessage[], systemPrompt?: string): any[] {
+    const result: any[] = [];
+
+    if (systemPrompt) {
+      result.push({ role: 'system', content: systemPrompt });
+    }
+
+    for (const msg of messages) {
+      if (msg.role === 'tool') {
+        result.push({
+          role: 'tool',
+          content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content),
+        });
+      } else {
+        result.push({
+          role: msg.role,
+          content: typeof msg.content === 'string' ? msg.content :
+            msg.content.map(c => c.type === 'text' ? c.text : '').join(''),
+        });
+      }
+    }
+
+    return result;
   }
 
-  private convertTools(tools: LLMTool[]): OllamaTool[] {
-    // Convert tool definitions to Ollama format
-    // Ollama uses OpenAI-compatible function calling
+  private convertTools(tools: LLMTool[]): any[] {
+    return tools.map(tool => ({
+      type: 'function',
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      },
+    }));
   }
 
-  private convertResponse(response: OllamaResponse): LLMResponse {
-    // Extract tool calls, content, usage stats
+  private parseResponse(response: any): LLMResponse {
+    const toolCalls: LLMToolCall[] = [];
+
+    if (response.message.tool_calls) {
+      for (const call of response.message.tool_calls) {
+        toolCalls.push({
+          id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+          name: call.function.name,
+          arguments: typeof call.function.arguments === 'string'
+            ? JSON.parse(call.function.arguments)
+            : call.function.arguments,
+        });
+      }
+    }
+
+    return {
+      content: response.message.content || '',
+      toolCalls,
+      stopReason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+      usage: {
+        inputTokens: response.prompt_eval_count || 0,
+        outputTokens: response.eval_count || 0,
+      },
+    };
+  }
+
+  async shutdown(): Promise<void> {
+    // Ollama client doesn't need cleanup
   }
 
   getModelInfo() {
     return {
       name: this.modelName,
-      contextLength: 128000, // Varies by model
+      contextLength: 32768,
       supportsTools: true,
       supportsStreaming: true,
+      isLocal: true,
     };
   }
 }
 ```
 
-### Phase 3: CLI Integration
-
-**Modified Files:**
-- `src/cli.ts` - Add `--full-local` flag and related options
-- `src/wiki-agent.ts` - Use LLM provider abstraction
-
-**New CLI Options:**
+### Phase 5: Provider Factory & CLI Integration
 
 ```typescript
-// src/cli.ts additions
+// src/llm/index.ts
 
-program
-  .command('generate')
-  .description('Generate architecture wiki')
-  .option('--full-local', 'Use local models for all operations (requires Ollama)')
-  .option('--local-model <model>', 'Local model to use (default: qwen2.5-coder:32b)', 'qwen2.5-coder:32b')
-  .option('--ollama-host <url>', 'Ollama server URL (default: http://localhost:11434)', 'http://localhost:11434')
-  .option('--local-context-size <size>', 'Context window size for local model', '32768')
-  // ... existing options
-```
-
-**Environment Variables:**
-
-```bash
-# .env support
-OLLAMA_HOST=http://localhost:11434
-LOCAL_MODEL=qwen2.5-coder:32b
-LOCAL_CONTEXT_SIZE=32768
-```
-
-### Phase 4: Prompt Adaptation
-
-**Challenge:** Local models may need different prompting strategies than Claude.
-
-**Solution:** Create a prompt adapter that adjusts system prompts and instructions based on the model.
-
-```typescript
-// src/llm/prompt-adapter.ts
-
-export interface PromptAdapter {
-  adaptSystemPrompt(basePrompt: string): string;
-  adaptToolDescription(tool: LLMTool): LLMTool;
-  getModelSpecificInstructions(): string;
-}
-
-export class OllamaPromptAdapter implements PromptAdapter {
-  constructor(private modelFamily: 'llama' | 'qwen' | 'mistral' | 'deepseek') {}
-
-  adaptSystemPrompt(basePrompt: string): string {
-    // Add model-specific instructions
-    // Simplify complex instructions for smaller models
-    // Add explicit tool-use formatting guidance
-
-    const additions = `
-## Tool Use Guidelines
-
-When you need to use a tool, respond with a tool call in the following format:
-- Call tools one at a time when possible
-- Wait for tool results before proceeding
-- Always verify your work using the verification tools
-
-## Response Guidelines
-
-- Be concise but thorough
-- Include source file references for all claims
-- Generate Mermaid diagrams for architecture visualization
-`;
-
-    return basePrompt + additions;
-  }
-}
-```
-
-### Phase 5: Local Model Recommendations
-
-**Recommended Models by Hardware:**
-
-| Hardware | Recommended Model | Context | Notes |
-|----------|------------------|---------|-------|
-| **64GB+ RAM, GPU 24GB+** | `qwen2.5-coder:32b` | 128K | Best quality |
-| **32GB RAM, GPU 16GB** | `qwen2.5-coder:14b` | 128K | Good balance |
-| **16GB RAM, GPU 8GB** | `qwen2.5-coder:7b` | 32K | Minimum viable |
-| **Apple M1/M2/M3 Max** | `qwen2.5-coder:32b` | 128K | Unified memory |
-| **Apple M1/M2/M3 Pro** | `qwen2.5-coder:14b` | 64K | Good performance |
-
-**Why Qwen 2.5 Coder?**
-1. Excellent code understanding
-2. Strong instruction following
-3. Native tool/function calling support
-4. Large context windows (128K)
-5. Permissive license (Apache 2.0)
-6. Active maintenance by Alibaba
-
-**Alternative Models:**
-- `deepseek-coder-v2:16b` - Strong code reasoning
-- `codestral:22b` - Mistral's code model
-- `llama3.1:70b` - General purpose, very capable
-- `mistral-large:123b` - If you have the hardware
-
----
-
-## Detailed File Changes
-
-### 1. New File: `src/llm/types.ts`
-
-Complete type definitions for the LLM abstraction layer.
-
-### 2. New File: `src/llm/index.ts`
-
-```typescript
 import { AnthropicProvider } from './anthropic-provider';
+import { LocalLlamaProvider } from './local-llama-provider';
 import { OllamaProvider } from './ollama-provider';
 import type { LLMProvider } from './types';
 
 export interface CreateProviderOptions {
-  type: 'anthropic' | 'ollama';
-  model: string;
-  apiKey?: string;      // For Anthropic
-  host?: string;        // For Ollama
+  // Mode selection
+  fullLocal?: boolean;
+  useOllama?: boolean;
+
+  // Anthropic options
+  apiKey?: string;
+  model?: string;
+
+  // Local options
+  modelPath?: string;
+  localModel?: string;
+  gpuLayers?: number;
+  contextSize?: number;
+  threads?: number;
+
+  // Ollama options
+  ollamaHost?: string;
 }
 
-export function createLLMProvider(options: CreateProviderOptions): LLMProvider {
-  switch (options.type) {
-    case 'anthropic':
-      return new AnthropicProvider({
-        apiKey: options.apiKey || process.env.ANTHROPIC_API_KEY!,
-        model: options.model,
+export async function createLLMProvider(options: CreateProviderOptions): Promise<LLMProvider> {
+  let provider: LLMProvider;
+
+  if (options.fullLocal) {
+    if (options.useOllama) {
+      // Use external Ollama server
+      provider = new OllamaProvider({
+        host: options.ollamaHost,
+        model: options.localModel || 'qwen2.5-coder:14b',
       });
-    case 'ollama':
-      return new OllamaProvider({
-        host: options.host || 'http://localhost:11434',
-        model: options.model,
+    } else {
+      // Use bundled node-llama-cpp (default for --full-local)
+      provider = new LocalLlamaProvider({
+        modelPath: options.modelPath,
+        modelId: options.localModel,
+        gpuLayers: options.gpuLayers,
+        contextSize: options.contextSize,
+        threads: options.threads,
       });
-    default:
-      throw new Error(`Unknown provider type: ${options.type}`);
+    }
+  } else {
+    // Use cloud Anthropic API
+    provider = new AnthropicProvider({
+      apiKey: options.apiKey || process.env.ANTHROPIC_API_KEY!,
+      model: options.model || 'claude-sonnet-4-20250514',
+    });
   }
+
+  await provider.initialize();
+  return provider;
 }
 
 export * from './types';
 export { AnthropicProvider } from './anthropic-provider';
+export { LocalLlamaProvider } from './local-llama-provider';
 export { OllamaProvider } from './ollama-provider';
 ```
 
-### 3. Modified: `src/wiki-agent.ts`
-
-**Key Changes:**
+**CLI Integration:**
 
 ```typescript
-// Before (line ~700)
-const client = new Anthropic();
-const response = await client.messages.create({...});
+// src/cli.ts (additions to generate command)
 
-// After
-const provider = createLLMProvider({
-  type: this.options.fullLocal ? 'ollama' : 'anthropic',
-  model: this.options.fullLocal ? this.options.localModel : this.options.model,
-  host: this.options.ollamaHost,
-  apiKey: this.options.apiKey,
-});
-
-const response = await provider.chat(messages, tools, {
-  model: this.options.model,
-  maxTokens: 8192,
-  systemPrompt: WIKI_SYSTEM_PROMPT,
-});
+.option('--full-local', 'Run entirely locally without cloud APIs')
+.option('--local-model <model>', 'Local model to use (auto-selected if not specified)')
+.option('--model-path <path>', 'Path to a local GGUF model file')
+.option('--use-ollama', 'Use Ollama server instead of bundled inference')
+.option('--ollama-host <url>', 'Ollama server URL', 'http://localhost:11434')
+.option('--gpu-layers <n>', 'GPU layers to offload (default: auto)', parseInt)
+.option('--context-size <n>', 'Context window size', parseInt, 32768)
+.option('--threads <n>', 'CPU threads for inference', parseInt)
 ```
 
-### 4. Modified: `src/cli.ts`
+---
 
-Add new options to the generate command and pass them through to WikiAgent.
+## Model Recommendations by Hardware
+
+| Hardware Profile | Recommended Model | Download Size | Quality |
+|-----------------|-------------------|---------------|---------|
+| **High-end GPU (24GB+ VRAM)** | qwen2.5-coder-32b-q4 | 19.5 GB | Excellent |
+| **Mid-range GPU (12-16GB VRAM)** | qwen2.5-coder-14b-q5 | 10.2 GB | Excellent |
+| **Entry GPU (6-8GB VRAM)** | qwen2.5-coder-7b-q5 | 5.5 GB | Good |
+| **Apple Silicon (M1/M2/M3)** | qwen2.5-coder-14b-q5 | 10.2 GB | Excellent |
+| **CPU-only (16GB+ RAM)** | qwen2.5-coder-7b-q5 | 5.5 GB | Good |
+| **Low-end (8GB RAM)** | qwen2.5-coder-3b-q8 | 3.4 GB | Acceptable |
+
+**Why Qwen 2.5 Coder?**
+1. State-of-the-art code understanding
+2. Native tool/function calling support
+3. 128K context window (plenty for large codebases)
+4. Apache 2.0 license (permissive)
+5. Excellent GGUF quantizations available
+6. Active development by Alibaba
+
+---
+
+## Performance Expectations
+
+| Metric | Claude API | Local 14B (GPU) | Local 7B (GPU) | Local 7B (CPU) |
+|--------|------------|-----------------|----------------|----------------|
+| Tokens/sec | ~80 | ~25-40 | ~50-80 | ~5-15 |
+| Small repo wiki | ~5 min | ~12-18 min | ~8-12 min | ~30-60 min |
+| Large repo wiki | ~30 min | ~1.5-2.5 hrs | ~1-1.5 hrs | ~3-6 hrs |
+| Quality | Excellent | Very Good | Good | Good |
+| Cost | API charges | Free | Free | Free |
+| Privacy | Cloud | 100% Local | 100% Local | 100% Local |
 
 ---
 
 ## Configuration
 
-### New Config File: `~/.ted-mosby/local-config.json`
+### Model Cache Location
 
-```json
-{
-  "ollama": {
-    "host": "http://localhost:11434",
-    "defaultModel": "qwen2.5-coder:32b",
-    "contextSize": 32768
-  },
-  "localMode": {
-    "autoDetect": true,
-    "fallbackToCloud": false,
-    "maxRetries": 3
-  },
-  "performance": {
-    "batchSize": 50,
-    "parallelChunks": 4
-  }
-}
+```
+~/.ted-mosby/
+├── models/
+│   ├── qwen2.5-coder-14b-instruct-q5_k_m.gguf
+│   └── qwen2.5-coder-7b-instruct-q5_k_m.gguf
+├── config.json
+└── local-config.json
 ```
 
 ### Environment Variables
 
 ```bash
-# Local mode configuration
-FULL_LOCAL=true
+# Force local mode
+TED_MOSBY_FULL_LOCAL=true
+
+# Custom model path
+TED_MOSBY_MODEL_PATH=/path/to/model.gguf
+
+# Performance tuning
+TED_MOSBY_GPU_LAYERS=40
+TED_MOSBY_CONTEXT_SIZE=32768
+TED_MOSBY_THREADS=8
+
+# Ollama (if using --use-ollama)
 OLLAMA_HOST=http://localhost:11434
-LOCAL_MODEL=qwen2.5-coder:32b
-LOCAL_CONTEXT_SIZE=32768
-
-# Disable cloud fallback
-NO_CLOUD_FALLBACK=true
 ```
 
 ---
 
-## User Experience
+## Error Handling
 
-### Setup Flow
-
-```bash
-# 1. Install Ollama (one-time)
-curl -fsSL https://ollama.com/install.sh | sh
-
-# 2. Pull recommended model
-ollama pull qwen2.5-coder:32b
-
-# 3. Run ted-mosby in local mode
-ted-mosby generate ./my-project --full-local
-
-# Or with specific model
-ted-mosby generate ./my-project --full-local --local-model codestral:22b
-```
-
-### Progress Output
+### Insufficient Hardware
 
 ```
-🏠 Running in full local mode
-📦 Model: qwen2.5-coder:32b via Ollama
-🔍 Indexing repository...
-  ├─ Parsed 245 files
-  ├─ Generated 1,247 chunks
-  └─ Created embeddings (local)
-
-📝 Generating wiki...
-  ├─ Phase 1: Discovery [████████░░] 80%
-  │   └─ Analyzing architecture patterns...
-  ├─ Phase 2: Planning [░░░░░░░░░░] 0%
-  ├─ Phase 3: Content Generation [░░░░░░░░░░] 0%
-  └─ Phase 4: Verification [░░░░░░░░░░] 0%
-
-⚡ Local inference: ~2.3 tokens/sec
-📊 Memory usage: 18.4 GB
-```
-
-### Error Handling
-
-```bash
-# If Ollama not running
 $ ted-mosby generate ./project --full-local
-Error: Cannot connect to Ollama at http://localhost:11434
 
-  To use --full-local mode, ensure Ollama is running:
-    $ ollama serve
+❌ Error: Insufficient hardware for local mode.
 
-  Or specify a different host:
-    $ ted-mosby generate ./project --full-local --ollama-host http://192.168.1.100:11434
+   Minimum requirements: 4GB VRAM or 6GB RAM
+   Detected: 2GB VRAM, 4GB RAM
 
-# If model not available
-$ ted-mosby generate ./project --full-local --local-model llama3.1:405b
-Error: Model 'llama3.1:405b' not found in Ollama
-
-  Available models:
-    - qwen2.5-coder:32b
-    - codestral:22b
-
-  Pull the model first:
-    $ ollama pull llama3.1:405b
+   Options:
+   1. Use cloud mode (remove --full-local flag)
+   2. Add more RAM or use a machine with a GPU
+   3. Use a smaller model: --local-model qwen2.5-coder-1.5b
 ```
 
----
+### Model Download Failed
 
-## Performance Considerations
+```
+$ ted-mosby generate ./project --full-local
 
-### Expected Performance
+❌ Error: Failed to download model
 
-| Metric | Claude API | Local (32B) | Local (14B) | Local (7B) |
-|--------|------------|-------------|-------------|------------|
-| Tokens/sec | ~80 | ~15-25 | ~30-50 | ~60-100 |
-| Wiki gen time (small repo) | ~5 min | ~15-20 min | ~10-15 min | ~8-12 min |
-| Wiki gen time (large repo) | ~30 min | ~2-3 hours | ~1-2 hours | ~45-90 min |
-| Quality | Excellent | Very Good | Good | Acceptable |
+   URL: https://huggingface.co/...
+   Reason: Network timeout
 
-### Optimization Strategies
+   Retry with:
+   $ ted-mosby generate ./project --full-local
 
-1. **Batch Processing** - Process multiple small requests together
-2. **Caching** - Cache intermediate LLM responses
-3. **Streaming** - Show progress during generation
-4. **Chunked Generation** - Break large wikis into smaller pieces
-5. **Model Quantization** - Use Q4_K_M or Q5_K_M for better speed
-
----
-
-## Testing Plan
-
-### Unit Tests
-
-```typescript
-// tests/llm/ollama-provider.test.ts
-describe('OllamaProvider', () => {
-  it('should convert messages to Ollama format');
-  it('should handle tool calls correctly');
-  it('should parse tool results');
-  it('should handle streaming responses');
-  it('should report usage statistics');
-});
+   Or download manually:
+   $ wget -O ~/.ted-mosby/models/qwen2.5-coder-14b-instruct-q5_k_m.gguf \
+       "https://huggingface.co/..."
 ```
 
-### Integration Tests
+### Out of Memory
 
-```typescript
-// tests/integration/local-mode.test.ts
-describe('Local Mode Integration', () => {
-  it('should generate wiki for small repo');
-  it('should handle tool calling loop');
-  it('should recover from model errors');
-  it('should respect context limits');
-});
 ```
+$ ted-mosby generate ./project --full-local
 
-### Manual Testing
+❌ Error: Out of memory during inference
 
-1. Test with various repository sizes
-2. Test different local models
-3. Test on different hardware configurations
-4. Compare output quality with Claude baseline
+   The model requires more memory than available.
+
+   Try:
+   1. Reduce context size: --context-size 16384
+   2. Use fewer GPU layers: --gpu-layers 20
+   3. Use a smaller model: --local-model qwen2.5-coder-7b
+```
 
 ---
 
 ## Implementation Checklist
 
-### Phase 1: Foundation (Week 1)
+### Phase 1: Foundation
 - [ ] Create `src/llm/` directory structure
-- [ ] Define `LLMProvider` interface and types
-- [ ] Implement `AnthropicProvider` (extract from existing code)
+- [ ] Define `LLMProvider` interface and types in `types.ts`
+- [ ] Extract existing Anthropic code to `anthropic-provider.ts`
 - [ ] Add unit tests for provider interface
 
-### Phase 2: Ollama Integration (Week 2)
+### Phase 2: Model Management
+- [ ] Implement `ModelManager` class
+- [ ] Add hardware detection (GPU, VRAM, RAM)
+- [ ] Create model registry with download URLs
+- [ ] Implement download with progress bar
+- [ ] Add model caching and verification
+
+### Phase 3: Local Provider
+- [ ] Add `node-llama-cpp` dependency
+- [ ] Implement `LocalLlamaProvider` class
+- [ ] Handle tool/function calling conversion
+- [ ] Add GPU layer auto-detection
+- [ ] Test with various model sizes
+
+### Phase 4: Ollama Backend
 - [ ] Add `ollama` package dependency
 - [ ] Implement `OllamaProvider` class
-- [ ] Handle tool/function calling conversion
-- [ ] Add streaming support
-- [ ] Test with Qwen 2.5 Coder models
+- [ ] Add connection testing and error messages
+- [ ] Document Ollama setup for power users
 
-### Phase 3: CLI Integration (Week 3)
-- [ ] Add `--full-local` flag to CLI
-- [ ] Add `--local-model` and `--ollama-host` options
-- [ ] Update WikiAgent to use provider abstraction
-- [ ] Add connection testing and error handling
-- [ ] Update help text and documentation
+### Phase 5: CLI Integration
+- [ ] Add `--full-local` flag
+- [ ] Add `--local-model`, `--model-path`, `--use-ollama` options
+- [ ] Add performance tuning options
+- [ ] Update WikiAgent to use provider factory
+- [ ] Add progress indicators and status output
 
-### Phase 4: Prompt Optimization (Week 4)
-- [ ] Create `PromptAdapter` for model-specific prompts
-- [ ] Test and tune prompts for Qwen models
-- [ ] Add fallback strategies for smaller models
-- [ ] Document model-specific behaviors
-
-### Phase 5: Polish & Documentation (Week 5)
-- [ ] Add progress indicators for local mode
-- [ ] Create setup documentation
-- [ ] Add troubleshooting guide
+### Phase 6: Testing & Polish
+- [ ] Integration tests with small repos
+- [ ] Test on various hardware configs
 - [ ] Performance benchmarking
-- [ ] Update README with local mode instructions
+- [ ] Documentation and README updates
+- [ ] Error message refinement
 
 ---
 
 ## Future Enhancements
 
-1. **Multiple Provider Support** - Add vLLM, LocalAI, LM Studio backends
-2. **Hybrid Mode** - Use local for embeddings, cloud for generation
-3. **Model Auto-Selection** - Detect hardware and recommend model
-4. **Distributed Inference** - Support multiple Ollama instances
-5. **Fine-Tuning Support** - Allow custom LoRA adapters
-6. **Quantization Options** - Support different quantization levels
-
----
-
-## Appendix: Message Format Conversion
-
-### Anthropic → Ollama Tool Calling
-
-```typescript
-// Anthropic format
-{
-  role: 'assistant',
-  content: [
-    { type: 'text', text: 'Let me search...' },
-    { type: 'tool_use', id: 'toolu_123', name: 'search_codebase', input: { query: 'auth' } }
-  ]
-}
-
-// Ollama format
-{
-  role: 'assistant',
-  content: 'Let me search...',
-  tool_calls: [
-    {
-      function: {
-        name: 'search_codebase',
-        arguments: '{"query":"auth"}'
-      }
-    }
-  ]
-}
-```
-
-### Tool Results
-
-```typescript
-// Anthropic format
-{
-  role: 'user',
-  content: [
-    { type: 'tool_result', tool_use_id: 'toolu_123', content: 'Found 5 results...' }
-  ]
-}
-
-// Ollama format
-{
-  role: 'tool',
-  content: 'Found 5 results...'
-}
-```
+1. **Speculative Decoding** - Use smaller draft model for 2-3x speedup
+2. **Quantization Selection** - Let users choose Q4/Q5/Q8 based on quality/speed preference
+3. **Distributed Inference** - Split model across multiple GPUs/machines
+4. **LoRA Support** - Allow fine-tuned adapters for specific codebases
+5. **Model Comparison** - A/B test local vs cloud for quality assessment
+6. **Offline Documentation** - Bundle docs for fully air-gapped usage
 
 ---
 
 ## Summary
 
-The local mode implementation is **highly feasible** because:
+The self-contained local mode approach provides:
 
-1. **80% of the work is already done** - Embeddings, vector search, chunking, and all tools are local
-2. **Clean architecture** - The `--direct-api` mode provides a perfect foundation
-3. **Mature tooling** - Ollama provides reliable local model serving
-4. **Quality models available** - Qwen 2.5 Coder offers excellent code understanding
+| Aspect | Benefit |
+|--------|---------|
+| **Zero Dependencies** | Just `npm install` and go |
+| **Automatic Setup** | Hardware detection, model selection, download |
+| **Great UX** | Progress bars, clear errors, smart defaults |
+| **Flexibility** | Power users can use Ollama or custom models |
+| **Privacy** | 100% offline operation, no data leaves the machine |
 
-The main trade-off is **speed vs. privacy/cost**:
-- Local mode will be 3-5x slower than Claude API
-- Local mode requires no API costs and works fully offline
-- Quality with 32B+ models approaches Claude quality for most tasks
+The main trade-off is the initial model download (~5-20GB depending on hardware), but this is a one-time cost that enables unlimited free usage afterward.
