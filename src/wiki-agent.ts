@@ -1165,10 +1165,10 @@ Create all ${missingPages.length} missing pages now.`;
     console.log('[Local] Output:', this.outputDir);
     console.log('='.repeat(60) + '\n');
 
-    // Phase 4: Analyze codebase structure to determine pages to generate
-    yield { type: 'phase', message: 'Analyzing codebase structure', progress: 20 };
+    // Phase 4: Use LLM to analyze project and determine pages to generate
+    yield { type: 'phase', message: 'Analyzing project with LLM', progress: 20 };
 
-    const pagesToGenerate = await this.analyzeCodebaseForPages(options);
+    const pagesToGenerate = await this.analyzeProjectWithLLM(provider, options);
     console.log(`[Local] Identified ${pagesToGenerate.length} pages to generate\n`);
 
     // Phase 5: Generate each page one at a time
@@ -1333,8 +1333,267 @@ Create all ${missingPages.length} missing pages now.`;
   }
 
   /**
+   * Use LLM to intelligently analyze project files and determine what pages to generate.
+   * This is project-agnostic and doesn't rely on hardcoded patterns.
+   */
+  private async analyzeProjectWithLLM(
+    provider: LLMProvider,
+    options: WikiGenerationOptions
+  ): Promise<Array<{
+    title: string;
+    filename: string;
+    type: 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config';
+    context: string;
+    sourceFiles: string[];
+  }>> {
+    // 1. Gather all files with metadata
+    const allFiles = await this.gatherProjectFiles(this.repoPath);
+    console.log(`[Local] Gathered ${allFiles.length} project files for LLM analysis`);
+
+    // 2. Build a compact representation for the LLM
+    const fileList = allFiles.map(f => {
+      const sizeLabel = f.size < 1000 ? 'small' : f.size < 10000 ? 'medium' : 'large';
+      return `${f.relativePath} (${f.extension}, ${sizeLabel})`;
+    }).join('\n');
+
+    // 3. Ask LLM to analyze and categorize files
+    const analysisPrompt = `You are analyzing a software project to create architectural documentation.
+
+## Project Files
+${fileList}
+
+## Task
+Analyze these files and return a JSON object that identifies:
+1. Which files are architecturally important (core application logic, not content/data)
+2. How to group them into documentation pages
+
+Return ONLY valid JSON in this exact format:
+{
+  "projectType": "brief description of project type",
+  "pages": [
+    {
+      "title": "Page Title",
+      "filename": "page-slug.md",
+      "type": "overview|component|api|guide|module|config",
+      "context": "What this page documents and why it's important",
+      "files": ["path/to/file1.ts", "path/to/file2.ts"]
+    }
+  ],
+  "excludedPatterns": ["paths or patterns that are content/data, not architecture"]
+}
+
+## Guidelines
+- Focus on SOURCE CODE that defines the application's architecture
+- EXCLUDE: blog posts, markdown content, static assets, test fixtures, generated files
+- INCLUDE: components, services, utilities, configuration, API routes, state management
+- Create 5-15 pages depending on project complexity
+- Each page should have 2-10 related files
+- Always include an "Architecture Overview" page first
+- Group related functionality together (e.g., all auth files in one page)
+
+Return only the JSON, no markdown code blocks or explanation.`;
+
+    const messages: LLMMessage[] = [{ role: 'user', content: analysisPrompt }];
+
+    console.log(`[Local] Asking LLM to analyze project structure...`);
+
+    try {
+      const response = await provider.chat(messages, [], {
+        maxTokens: 4096,
+        systemPrompt: 'You are a software architect analyzing codebases. Return only valid JSON.',
+        temperature: 0.2, // Low temperature for structured output
+      });
+
+      if (!response.content) {
+        console.log(`[Local] LLM returned empty response, falling back to pattern-based analysis`);
+        return this.analyzeCodebaseForPages(options);
+      }
+
+      // Parse the JSON response
+      let analysis: {
+        projectType: string;
+        pages: Array<{
+          title: string;
+          filename: string;
+          type: string;
+          context: string;
+          files: string[];
+        }>;
+        excludedPatterns: string[];
+      };
+
+      try {
+        // Clean up response - remove markdown code blocks if present
+        let jsonStr = response.content.trim();
+        if (jsonStr.startsWith('```')) {
+          jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+        }
+        analysis = JSON.parse(jsonStr);
+      } catch (parseErr) {
+        console.log(`[Local] Failed to parse LLM response as JSON: ${(parseErr as Error).message}`);
+        console.log(`[Local] Response was: ${response.content.slice(0, 500)}...`);
+        return this.analyzeCodebaseForPages(options);
+      }
+
+      console.log(`[Local] LLM identified project as: ${analysis.projectType}`);
+      console.log(`[Local] LLM suggested ${analysis.pages.length} documentation pages`);
+
+      // Validate and filter the files (ensure they exist)
+      const existingFiles = new Set(allFiles.map(f => f.relativePath));
+      const validatedPages: Array<{
+        title: string;
+        filename: string;
+        type: 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config';
+        context: string;
+        sourceFiles: string[];
+      }> = [];
+
+      for (const page of analysis.pages) {
+        const validFiles = (page.files || []).filter(f => existingFiles.has(f));
+
+        // Only include pages that have at least one valid file
+        if (validFiles.length > 0 || page.type === 'overview') {
+          validatedPages.push({
+            title: page.title,
+            filename: page.filename.endsWith('.md') ? page.filename : `${page.filename}.md`,
+            type: this.normalizePageType(page.type),
+            context: page.context,
+            sourceFiles: validFiles,
+          });
+        }
+      }
+
+      // Ensure we have an architecture overview
+      if (!validatedPages.some(p => p.type === 'overview')) {
+        const entryPoints = allFiles
+          .filter(f => this.isEntryPoint(f.relativePath))
+          .map(f => f.relativePath);
+
+        validatedPages.unshift({
+          title: 'Architecture Overview',
+          filename: 'architecture.md',
+          type: 'overview',
+          context: `High-level architecture of this ${analysis.projectType} project.`,
+          sourceFiles: entryPoints.slice(0, 10),
+        });
+      }
+
+      // Always add Getting Started
+      if (!validatedPages.some(p => p.title.toLowerCase().includes('getting started'))) {
+        validatedPages.push({
+          title: 'Getting Started',
+          filename: 'getting-started.md',
+          type: 'guide',
+          context: 'Installation, setup, and development workflow',
+          sourceFiles: allFiles
+            .filter(f => f.relativePath.includes('package.json') || f.relativePath.includes('README'))
+            .map(f => f.relativePath),
+        });
+      }
+
+      console.log(`[Local] Validated ${validatedPages.length} pages with existing files`);
+      return validatedPages;
+
+    } catch (error) {
+      console.error(`[Local] LLM analysis failed: ${(error as Error).message}`);
+      console.log(`[Local] Falling back to pattern-based analysis`);
+      return this.analyzeCodebaseForPages(options);
+    }
+  }
+
+  /**
+   * Gather all project files with metadata for LLM analysis
+   */
+  private async gatherProjectFiles(repoPath: string): Promise<Array<{
+    relativePath: string;
+    extension: string;
+    size: number;
+  }>> {
+    const files: Array<{ relativePath: string; extension: string; size: number }> = [];
+
+    const ignoreDirs = [
+      'node_modules', '.git', 'dist', 'build', '.next', 'coverage',
+      '__pycache__', 'venv', '.venv', 'vendor', '.cache', '.turbo'
+    ];
+
+    const scan = (dir: string, relativePath: string = '') => {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const fullPath = path.join(dir, entry.name);
+          const relPath = path.join(relativePath, entry.name);
+
+          if (entry.isDirectory()) {
+            if (!ignoreDirs.includes(entry.name) && !entry.name.startsWith('.')) {
+              scan(fullPath, relPath);
+            }
+          } else if (entry.isFile()) {
+            const ext = path.extname(entry.name).toLowerCase();
+            // Include source files and some config files
+            const includeExts = [
+              '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+              '.py', '.go', '.rs', '.java', '.rb', '.php',
+              '.vue', '.svelte', '.json', '.yaml', '.yml', '.toml',
+              '.md', '.mdx', '.css', '.scss', '.less'
+            ];
+
+            if (includeExts.includes(ext)) {
+              try {
+                const stats = fs.statSync(fullPath);
+                files.push({
+                  relativePath: relPath,
+                  extension: ext,
+                  size: stats.size,
+                });
+              } catch {
+                // Skip files we can't stat
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignore directories we can't read
+      }
+    };
+
+    scan(repoPath);
+    return files;
+  }
+
+  /**
+   * Check if a file is likely an entry point
+   */
+  private isEntryPoint(filePath: string): boolean {
+    const patterns = [
+      /^src\/index\.[tj]sx?$/,
+      /^src\/main\.[tj]sx?$/,
+      /^src\/app\.[tj]sx?$/,
+      /^src\/App\.[tj]sx?$/,
+      /^index\.[tj]sx?$/,
+      /^main\.[tj]sx?$/,
+      /package\.json$/,
+      /vite\.config\.[tj]s$/,
+      /next\.config\.[tj]s$/,
+    ];
+    return patterns.some(p => p.test(filePath));
+  }
+
+  /**
+   * Normalize page type to valid enum value
+   */
+  private normalizePageType(type: string): 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config' {
+    const normalized = type.toLowerCase();
+    if (normalized === 'overview') return 'overview';
+    if (normalized === 'component' || normalized === 'components') return 'component';
+    if (normalized === 'api' || normalized === 'endpoint' || normalized === 'routes') return 'api';
+    if (normalized === 'guide' || normalized === 'tutorial' || normalized === 'getting-started') return 'guide';
+    if (normalized === 'config' || normalized === 'configuration') return 'config';
+    return 'module'; // Default fallback
+  }
+
+  /**
    * Analyze codebase to determine which pages to generate dynamically.
-   * This analyzes the actual project structure rather than using hardcoded page types.
+   * This is the fallback method using pattern-based analysis.
    */
   private async analyzeCodebaseForPages(options: WikiGenerationOptions): Promise<Array<{
     title: string;
