@@ -538,6 +538,472 @@ program
     }
   });
 
+// Update-embeddings command - update index based on changed files
+program
+  .command('update-embeddings')
+  .description('Update embeddings index based on files changed since last index')
+  .requiredOption('-r, --repo <path>', 'Repository path (local)')
+  .option('-o, --output <dir>', 'Output directory for wiki (where .ted-mosby-cache lives)', './wiki')
+  .option('-v, --verbose', 'Verbose output')
+  .option('--full', 'Force full re-index instead of incremental update')
+  .action(async (options) => {
+    try {
+      const wikiDir = path.resolve(options.output);
+      const cacheDir = path.join(wikiDir, '.ted-mosby-cache');
+      const indexStatePath = path.join(cacheDir, 'index-state.json');
+
+      // Check if we have an existing index
+      if (!fs.existsSync(indexStatePath)) {
+        console.log(chalk.yellow('⚠️  No existing index found.'));
+        console.log(chalk.gray('Run `ted-mosby generate` first to create the initial index.'));
+        process.exit(1);
+      }
+
+      const indexState = JSON.parse(fs.readFileSync(indexStatePath, 'utf-8'));
+      console.log(chalk.cyan.bold('\n🔄 Update Embeddings Index\n'));
+      console.log(chalk.white('Repository:'), chalk.green(path.resolve(options.repo)));
+      console.log(chalk.white('Last indexed commit:'), chalk.green(indexState.commitHash.slice(0, 7)));
+      console.log(chalk.white('Indexed at:'), chalk.green(new Date(indexState.indexedAt).toLocaleString()));
+      console.log(chalk.white('Indexed chunks:'), chalk.green(indexState.chunkCount.toString()));
+      console.log();
+
+      // Import RAGSystem and git
+      const { RAGSystem } = await import('./rag/index.js');
+      const git = (await import('simple-git')).simpleGit(options.repo);
+
+      // Get current commit
+      const currentLog = await git.log({ maxCount: 1 });
+      const currentCommit = currentLog.latest?.hash || 'unknown';
+
+      if (currentCommit === indexState.commitHash && !options.full) {
+        console.log(chalk.green('✓ Index is up to date. No changes since last index.'));
+        return;
+      }
+
+      // Get changed files
+      const diffResult = await git.diff(['--name-only', indexState.commitHash, 'HEAD']);
+      const changedFiles = diffResult.split('\n').filter(f => f.trim().length > 0);
+
+      // Filter to only indexable files
+      const indexableExts = [
+        '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+        '.py', '.pyx', '.go', '.rs', '.java', '.kt', '.scala',
+        '.rb', '.php', '.c', '.cpp', '.h', '.hpp', '.cs', '.swift',
+        '.vue', '.svelte', '.json', '.yaml', '.yml', '.toml', '.md', '.mdx',
+        '.cbl', '.cob', '.cobol', '.cpy', '.copy', '.jcl', '.pli', '.pl1',
+        '.asm', '.s', '.sql', '.bms', '.prc', '.proc'
+      ];
+
+      const relevantFiles = changedFiles.filter(f =>
+        indexableExts.some(ext => f.endsWith(ext))
+      );
+
+      if (relevantFiles.length === 0 && !options.full) {
+        console.log(chalk.green('✓ No relevant source files changed.'));
+
+        // Update index state to current commit anyway
+        const updatedState = {
+          ...indexState,
+          commitHash: currentCommit,
+          indexedAt: new Date().toISOString()
+        };
+        fs.writeFileSync(indexStatePath, JSON.stringify(updatedState, null, 2), 'utf-8');
+        console.log(chalk.gray(`Updated index state to commit ${currentCommit.slice(0, 7)}`));
+        return;
+      }
+
+      console.log(chalk.white('Current commit:'), chalk.green(currentCommit.slice(0, 7)));
+      console.log(chalk.white('Changed source files:'), chalk.yellow(relevantFiles.length.toString()));
+      console.log();
+
+      // Show changed files
+      if (relevantFiles.length > 0) {
+        console.log(chalk.white.bold('Files to update:'));
+        for (const file of relevantFiles.slice(0, 15)) {
+          console.log(chalk.gray(`  • ${file}`));
+        }
+        if (relevantFiles.length > 15) {
+          console.log(chalk.gray(`  ... and ${relevantFiles.length - 15} more`));
+        }
+        console.log();
+      }
+
+      // Prompt for confirmation
+      const { confirm } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'confirm',
+        message: options.full
+          ? 'Perform full re-index?'
+          : `Update embeddings for ${relevantFiles.length} changed files?`,
+        default: true
+      }]);
+
+      if (!confirm) {
+        console.log(chalk.yellow('\nUpdate cancelled.'));
+        return;
+      }
+
+      const spinner = ora('Updating embeddings...').start();
+
+      // Create RAG system
+      const ragSystem = new RAGSystem({
+        storePath: cacheDir,
+        repoPath: path.resolve(options.repo)
+      });
+
+      try {
+        if (options.full) {
+          // Full re-index
+          spinner.text = 'Performing full re-index...';
+          await ragSystem.indexRepository();
+          spinner.succeed(chalk.green('Full re-index complete!'));
+        } else {
+          // Incremental update
+          spinner.text = `Updating ${relevantFiles.length} files...`;
+          const result = await ragSystem.updateIndex(relevantFiles);
+
+          spinner.succeed(chalk.green('Embeddings updated!'));
+          console.log();
+          console.log(chalk.white('Update summary:'));
+          console.log(chalk.gray(`  Files processed: ${result.filesUpdated}`));
+          console.log(chalk.gray(`  Chunks removed: ${result.chunksRemoved}`));
+          console.log(chalk.gray(`  Chunks added: ${result.chunksAdded}`));
+          console.log(chalk.gray(`  New commit: ${result.newCommitHash.slice(0, 7)}`));
+        }
+
+        console.log();
+        console.log(chalk.cyan('✓ Index updated successfully.'));
+        console.log(chalk.gray('Run `ted-mosby update-wiki` to update affected documentation.'));
+        console.log();
+      } catch (error) {
+        spinner.fail('Update failed');
+        throw error;
+      }
+    } catch (error) {
+      console.error(chalk.red('\nError:'), error instanceof Error ? error.message : String(error));
+      if (options.verbose && error instanceof Error && error.stack) {
+        console.error(chalk.gray(error.stack));
+      }
+      process.exit(1);
+    }
+  });
+
+// Update-wiki command - update documentation based on changed files
+program
+  .command('update-wiki')
+  .description('Update wiki documentation based on code changes (handles both modifications and new additions)')
+  .requiredOption('-r, --repo <path>', 'Repository path (local)')
+  .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
+  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-v, --verbose', 'Verbose output')
+  .option('--direct-api', 'Use Anthropic API directly (bypasses Claude Code billing)')
+  .option('--dry-run', 'Show what would be updated without making changes')
+  .action(async (options) => {
+    try {
+      const configManager = new ConfigManager();
+      const config = await configManager.load();
+
+      if (!configManager.hasApiKey()) {
+        console.log(chalk.red('❌ No API key found.'));
+        console.log(chalk.yellow('\nSet your Anthropic API key:'));
+        console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
+        process.exit(1);
+      }
+
+      const wikiDir = path.resolve(options.output);
+      const cacheDir = path.join(wikiDir, '.ted-mosby-cache');
+      const indexStatePath = path.join(cacheDir, 'index-state.json');
+
+      // Check if we have an existing index
+      if (!fs.existsSync(indexStatePath)) {
+        console.log(chalk.yellow('⚠️  No existing index found.'));
+        console.log(chalk.gray('Run `ted-mosby generate` first to create the initial documentation.'));
+        process.exit(1);
+      }
+
+      const indexState = JSON.parse(fs.readFileSync(indexStatePath, 'utf-8'));
+      console.log(chalk.cyan.bold('\n📝 Update Wiki Documentation\n'));
+      console.log(chalk.white('Repository:'), chalk.green(path.resolve(options.repo)));
+      console.log(chalk.white('Wiki directory:'), chalk.green(wikiDir));
+      console.log(chalk.white('Last indexed commit:'), chalk.green(indexState.commitHash.slice(0, 7)));
+      console.log();
+
+      // Get changed files since last index
+      const git = (await import('simple-git')).simpleGit(options.repo);
+      const currentLog = await git.log({ maxCount: 1 });
+      const currentCommit = currentLog.latest?.hash || 'unknown';
+
+      if (currentCommit === indexState.commitHash) {
+        console.log(chalk.green('✓ Wiki is up to date. No changes since last index.'));
+        console.log(chalk.gray('Tip: Run `ted-mosby update-embeddings` first if you have new commits.'));
+        return;
+      }
+
+      // Get diff with status to know which files are new vs modified
+      const diffResult = await git.diff(['--name-status', indexState.commitHash, 'HEAD']);
+      const diffLines = diffResult.split('\n').filter(l => l.trim().length > 0);
+
+      // Parse diff results
+      const changes: { status: string; file: string }[] = [];
+      for (const line of diffLines) {
+        const [status, ...pathParts] = line.split('\t');
+        const file = pathParts.join('\t'); // Handle files with tabs in names
+        if (file) {
+          changes.push({ status: status.charAt(0), file });
+        }
+      }
+
+      // Filter to relevant source files
+      const relevantExts = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.kt', '.rb', '.php', '.c', '.cpp', '.cs', '.swift'];
+      const relevantChanges = changes.filter(c =>
+        relevantExts.some(ext => c.file.endsWith(ext))
+      );
+
+      if (relevantChanges.length === 0) {
+        console.log(chalk.green('✓ No relevant source code changes detected.'));
+        return;
+      }
+
+      // Categorize changes
+      const newFiles = relevantChanges.filter(c => c.status === 'A').map(c => c.file);
+      const modifiedFiles = relevantChanges.filter(c => c.status === 'M').map(c => c.file);
+      const deletedFiles = relevantChanges.filter(c => c.status === 'D').map(c => c.file);
+      const renamedFiles = relevantChanges.filter(c => c.status === 'R').map(c => c.file);
+
+      console.log(chalk.white.bold('Changes detected:'));
+      if (newFiles.length > 0) {
+        console.log(chalk.green(`  + ${newFiles.length} new files (will generate new docs)`));
+        for (const f of newFiles.slice(0, 5)) console.log(chalk.gray(`    ${f}`));
+        if (newFiles.length > 5) console.log(chalk.gray(`    ... and ${newFiles.length - 5} more`));
+      }
+      if (modifiedFiles.length > 0) {
+        console.log(chalk.yellow(`  ~ ${modifiedFiles.length} modified files (will update existing docs)`));
+        for (const f of modifiedFiles.slice(0, 5)) console.log(chalk.gray(`    ${f}`));
+        if (modifiedFiles.length > 5) console.log(chalk.gray(`    ... and ${modifiedFiles.length - 5} more`));
+      }
+      if (deletedFiles.length > 0) {
+        console.log(chalk.red(`  - ${deletedFiles.length} deleted files (will update references)`));
+      }
+      if (renamedFiles.length > 0) {
+        console.log(chalk.blue(`  → ${renamedFiles.length} renamed files`));
+      }
+      console.log();
+
+      // Find affected wiki pages
+      const affectedPages = await findAffectedWikiPages(wikiDir, [...newFiles, ...modifiedFiles, ...deletedFiles]);
+
+      if (affectedPages.length > 0) {
+        console.log(chalk.white.bold('Wiki pages to update:'));
+        for (const page of affectedPages.slice(0, 10)) {
+          console.log(chalk.gray(`  • ${page}`));
+        }
+        if (affectedPages.length > 10) {
+          console.log(chalk.gray(`  ... and ${affectedPages.length - 10} more`));
+        }
+        console.log();
+      }
+
+      // Determine what pages need to be created for new files
+      const pagesToCreate: string[] = [];
+      for (const file of newFiles) {
+        // Check if there's already a wiki page for this file's directory/module
+        const dirName = path.dirname(file);
+        const moduleName = dirName.split('/').pop() || path.basename(file, path.extname(file));
+        const potentialPages = [
+          `${moduleName}.md`,
+          `${dirName.replace(/\//g, '-')}.md`,
+          `modules/${moduleName}.md`
+        ];
+
+        let hasPage = false;
+        for (const pageName of potentialPages) {
+          if (fs.existsSync(path.join(wikiDir, pageName))) {
+            hasPage = true;
+            if (!affectedPages.includes(pageName)) {
+              affectedPages.push(pageName);
+            }
+            break;
+          }
+        }
+
+        if (!hasPage) {
+          // This is a genuinely new module - will need new docs
+          const suggestedPage = `${moduleName}.md`;
+          if (!pagesToCreate.includes(suggestedPage)) {
+            pagesToCreate.push(suggestedPage);
+          }
+        }
+      }
+
+      if (pagesToCreate.length > 0) {
+        console.log(chalk.white.bold('New wiki pages to generate:'));
+        for (const page of pagesToCreate) {
+          console.log(chalk.green(`  + ${page}`));
+        }
+        console.log();
+      }
+
+      if (options.dryRun) {
+        console.log(chalk.yellow('Dry run - no changes made.'));
+        console.log(chalk.gray('\nSummary:'));
+        console.log(chalk.gray(`  Pages to update: ${affectedPages.length}`));
+        console.log(chalk.gray(`  New pages to create: ${pagesToCreate.length}`));
+        return;
+      }
+
+      // Prompt for confirmation
+      const totalWork = affectedPages.length + pagesToCreate.length;
+      if (totalWork === 0) {
+        console.log(chalk.green('✓ No wiki updates needed.'));
+        return;
+      }
+
+      const { confirm } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'confirm',
+        message: `Update ${affectedPages.length} pages and create ${pagesToCreate.length} new pages?`,
+        default: true
+      }]);
+
+      if (!confirm) {
+        console.log(chalk.yellow('\nUpdate cancelled.'));
+        return;
+      }
+
+      const spinner = ora('Updating wiki documentation...').start();
+
+      const permissionManager = new PermissionManager({ policy: 'permissive' });
+      const agent = new ArchitecturalWikiAgent({
+        verbose: options.verbose,
+        apiKey: config.apiKey,
+        permissionManager
+      });
+
+      try {
+        // Build targeted generation options
+        const generationOptions = {
+          repoUrl: options.repo,
+          outputDir: options.output,
+          model: options.model,
+          verbose: options.verbose,
+          directApi: options.directApi,
+          // Pass the surgical update context
+          updateContext: {
+            newFiles,
+            modifiedFiles,
+            deletedFiles,
+            affectedPages,
+            pagesToCreate
+          }
+        };
+
+        // Use direct API mode for surgical updates to the specific pages
+        let generator;
+        if (options.directApi) {
+          generator = agent.generateWikiDirectApi(generationOptions);
+        } else {
+          generator = agent.generateWiki(generationOptions);
+        }
+
+        // Stream the generation
+        for await (const event of generator) {
+          if ((event as ProgressEvent).type === 'phase') {
+            spinner.text = (event as ProgressEvent).message;
+          } else if ((event as ProgressEvent).type === 'step') {
+            if (options.verbose) {
+              spinner.info((event as ProgressEvent).message);
+              spinner.start();
+            }
+          } else if ((event as ProgressEvent).type === 'complete') {
+            spinner.succeed(chalk.green('Wiki updated!'));
+          } else if ((event as ProgressEvent).type === 'error') {
+            spinner.fail(chalk.red((event as ProgressEvent).message));
+          }
+        }
+
+        console.log();
+        console.log(chalk.cyan('✓ Wiki documentation updated.'));
+        console.log(chalk.gray('Tip: Run `ted-mosby verify` to check for any broken links.'));
+        console.log();
+      } catch (error) {
+        spinner.fail('Update failed');
+        throw error;
+      }
+    } catch (error) {
+      console.error(chalk.red('\nError:'), error instanceof Error ? error.message : String(error));
+      if (options.verbose && error instanceof Error && error.stack) {
+        console.error(chalk.gray(error.stack));
+      }
+      process.exit(1);
+    }
+  });
+
+/**
+ * Find wiki pages that reference the given source files
+ */
+async function findAffectedWikiPages(wikiDir: string, changedFiles: string[]): Promise<string[]> {
+  const affectedPages = new Set<string>();
+
+  // Get all markdown files in wiki
+  const glob = (await import('glob')).glob;
+  const wikiFiles = await glob('**/*.md', {
+    cwd: wikiDir,
+    ignore: ['node_modules/**', '.ted-mosby-cache/**']
+  });
+
+  // Normalize changed file paths for matching
+  const normalizedChangedFiles = changedFiles.map(f => {
+    // Extract meaningful parts for matching: filename, directory name, module name
+    const parts = f.split('/');
+    const filename = parts.pop() || '';
+    const dirname = parts.pop() || '';
+    const basename = filename.replace(/\.[^.]+$/, ''); // Remove extension
+    return { full: f, filename, dirname, basename };
+  });
+
+  // Check each wiki file for references to changed files
+  for (const wikiFile of wikiFiles) {
+    try {
+      const content = fs.readFileSync(path.join(wikiDir, wikiFile), 'utf-8');
+
+      // Check if this wiki file references any of the changed files
+      for (const changed of normalizedChangedFiles) {
+        // Look for various patterns that might reference the file
+        const patterns = [
+          changed.full,                    // Full path reference
+          changed.filename,                // Filename reference
+          changed.basename,                // Name without extension
+          changed.dirname + '/' + changed.filename,  // Partial path
+        ];
+
+        for (const pattern of patterns) {
+          if (pattern && content.includes(pattern)) {
+            affectedPages.add(wikiFile);
+            break;
+          }
+        }
+
+        // Also check for code block references with the file path
+        const codeBlockRegex = new RegExp(`\`\`\`[^\\n]*\\n[\\s\\S]*?${escapeRegex(changed.basename)}[\\s\\S]*?\`\`\``, 'g');
+        if (codeBlockRegex.test(content)) {
+          affectedPages.add(wikiFile);
+        }
+      }
+    } catch (err) {
+      // Skip files that can't be read
+    }
+  }
+
+  return Array.from(affectedPages);
+}
+
+/**
+ * Escape special regex characters in a string
+ */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Continue-generation command - complete missing wiki pages
 program
   .command('continue')

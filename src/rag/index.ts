@@ -1011,6 +1011,252 @@ export class RAGSystem {
   }
 
   /**
+   * Update the index incrementally based on changed files.
+   * This is more efficient than full re-indexing when only a few files change.
+   *
+   * @param changedFiles - List of file paths that have changed (relative to repo root)
+   * @returns Object with update statistics
+   */
+  async updateIndex(changedFiles: string[]): Promise<{
+    filesUpdated: number;
+    chunksRemoved: number;
+    chunksAdded: number;
+    newCommitHash: string;
+  }> {
+    const cachedIndexPath = path.join(this.config.storePath, 'index.faiss');
+    const cachedMetaPath = path.join(this.config.storePath, 'metadata.json');
+    const indexStatePath = path.join(this.config.storePath, 'index-state.json');
+
+    // Load existing metadata
+    if (!fs.existsSync(cachedMetaPath)) {
+      throw new Error('No existing index found. Run full indexing first.');
+    }
+
+    const existingMeta = JSON.parse(fs.readFileSync(cachedMetaPath, 'utf-8'));
+    this.metadata = new Map(Object.entries(existingMeta).map(([k, v]) => [parseInt(k), v as StoredMetadata]));
+
+    // Normalize changed file paths (remove leading ./ if present)
+    const normalizedChangedFiles = new Set(
+      changedFiles.map(f => f.replace(/^\.\//, ''))
+    );
+
+    console.log(`  Updating index for ${normalizedChangedFiles.size} changed files...`);
+
+    // Find chunks to remove (from changed files)
+    const chunksToRemove = new Set<number>();
+    const unchangedChunks: Array<{ index: number; meta: StoredMetadata }> = [];
+
+    for (const [index, meta] of this.metadata) {
+      const normalizedPath = meta.filePath.replace(/^\.\//, '');
+      if (normalizedChangedFiles.has(normalizedPath)) {
+        chunksToRemove.add(index);
+      } else {
+        unchangedChunks.push({ index, meta });
+      }
+    }
+
+    console.log(`  Found ${chunksToRemove.size} chunks to update from changed files`);
+
+    // Re-chunk the changed files
+    const newChunks: CodeChunk[] = [];
+    let filesProcessed = 0;
+
+    for (const filePath of normalizedChangedFiles) {
+      const fullPath = path.join(this.config.repoPath, filePath);
+
+      // Skip files that no longer exist (deleted files)
+      if (!fs.existsSync(fullPath)) {
+        console.log(`    Skipping deleted file: ${filePath}`);
+        continue;
+      }
+
+      try {
+        const fileChunks = await this.chunkFile(filePath);
+        newChunks.push(...fileChunks);
+        filesProcessed++;
+        console.log(`    Chunked ${filePath}: ${fileChunks.length} chunks`);
+      } catch (err) {
+        console.warn(`    Failed to chunk ${filePath}: ${err}`);
+      }
+    }
+
+    console.log(`  Generated ${newChunks.length} new chunks from ${filesProcessed} files`);
+
+    // Combine unchanged chunks with new chunks
+    const allChunks: CodeChunk[] = [
+      // Convert unchanged metadata back to CodeChunk format
+      ...unchangedChunks.map(({ meta }) => ({
+        id: meta.id,
+        filePath: meta.filePath,
+        startLine: meta.startLine,
+        endLine: meta.endLine,
+        content: meta.content,
+        language: meta.language,
+        chunkType: meta.chunkType,
+        name: meta.name,
+        parentName: meta.parentName,
+        documentation: meta.documentation,
+        domainCategories: meta.domainCategories,
+        domainContext: meta.domainContext,
+        isPublicApi: meta.isPublicApi,
+        signature: meta.signature
+      } as CodeChunk)),
+      // Add new chunks from changed files
+      ...newChunks
+    ];
+
+    if (allChunks.length === 0) {
+      console.warn('No chunks to index after update');
+      return {
+        filesUpdated: filesProcessed,
+        chunksRemoved: chunksToRemove.size,
+        chunksAdded: 0,
+        newCommitHash: await this.getCurrentCommitHash()
+      };
+    }
+
+    // Generate embeddings for ALL chunks (we need to rebuild the FAISS index)
+    // This is because FAISS doesn't support in-place updates
+    console.log(`  Regenerating embeddings for ${allChunks.length} total chunks...`);
+    const embeddings = await this.generateEmbeddings(allChunks);
+
+    // Rebuild FAISS index
+    console.log(`  Rebuilding search index...`);
+    if (faiss && embeddings.length > 0) {
+      const actualDimension = embeddings[0].length;
+      if (actualDimension !== this.embeddingDimension) {
+        this.embeddingDimension = actualDimension;
+      }
+
+      this.index = new faiss.IndexFlatIP(this.embeddingDimension);
+
+      // Build new metadata map
+      this.metadata = new Map();
+      const normalizedEmbeddings: number[][] = [];
+
+      for (let i = 0; i < embeddings.length; i++) {
+        const normalized = this.normalizeVector(embeddings[i]);
+        normalizedEmbeddings.push(normalized);
+
+        const chunk = allChunks[i];
+        this.metadata.set(i, {
+          id: chunk.id,
+          filePath: chunk.filePath,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          content: chunk.content,
+          language: chunk.language,
+          chunkType: chunk.chunkType,
+          name: chunk.name,
+          parentName: chunk.parentName,
+          documentation: chunk.documentation,
+          domainCategories: chunk.domainCategories,
+          domainContext: chunk.domainContext,
+          isPublicApi: chunk.isPublicApi,
+          signature: chunk.signature
+        });
+      }
+
+      try {
+        const flatEmbeddings = normalizedEmbeddings.flat();
+        this.index.add(flatEmbeddings);
+
+        // Save updated index and metadata
+        this.index.write(cachedIndexPath);
+        fs.writeFileSync(
+          cachedMetaPath,
+          JSON.stringify(Object.fromEntries(this.metadata)),
+          'utf-8'
+        );
+
+        // Update index state
+        const currentCommit = await this.getCurrentCommitHash();
+        const uniqueFiles = new Set(allChunks.map(c => c.filePath));
+
+        this.indexState = {
+          commitHash: currentCommit,
+          indexedAt: new Date().toISOString(),
+          fileCount: uniqueFiles.size,
+          chunkCount: allChunks.length
+        };
+        fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
+
+        this.documentCount = allChunks.length;
+        console.log(`  ✓ Updated index: ${this.documentCount} chunks (commit ${currentCommit.slice(0, 7)})`);
+
+        return {
+          filesUpdated: filesProcessed,
+          chunksRemoved: chunksToRemove.size,
+          chunksAdded: newChunks.length,
+          newCommitHash: currentCommit
+        };
+      } catch (faissError) {
+        console.warn(`  FAISS update failed: ${faissError}`);
+        throw new Error(`Failed to update FAISS index: ${faissError}`);
+      }
+    }
+
+    // Fallback: keyword search mode
+    this.metadata = new Map();
+    allChunks.forEach((chunk, i) => {
+      this.metadata.set(i, {
+        id: chunk.id,
+        filePath: chunk.filePath,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        content: chunk.content,
+        language: chunk.language,
+        chunkType: chunk.chunkType,
+        name: chunk.name,
+        parentName: chunk.parentName,
+        documentation: chunk.documentation,
+        domainCategories: chunk.domainCategories,
+        domainContext: chunk.domainContext,
+        isPublicApi: chunk.isPublicApi,
+        signature: chunk.signature
+      });
+    });
+
+    fs.writeFileSync(
+      cachedMetaPath,
+      JSON.stringify(Object.fromEntries(this.metadata)),
+      'utf-8'
+    );
+
+    const currentCommit = await this.getCurrentCommitHash();
+    const uniqueFiles = new Set(allChunks.map(c => c.filePath));
+
+    this.indexState = {
+      commitHash: currentCommit,
+      indexedAt: new Date().toISOString(),
+      fileCount: uniqueFiles.size,
+      chunkCount: allChunks.length
+    };
+    fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
+
+    this.documentCount = allChunks.length;
+    console.log(`  ✓ Updated index: ${this.documentCount} chunks (keyword mode, commit ${currentCommit.slice(0, 7)})`);
+
+    return {
+      filesUpdated: filesProcessed,
+      chunksRemoved: chunksToRemove.size,
+      chunksAdded: newChunks.length,
+      newCommitHash: currentCommit
+    };
+  }
+
+  /**
+   * Get list of files in the current index
+   */
+  getIndexedFiles(): string[] {
+    const files = new Set<string>();
+    for (const [, meta] of this.metadata) {
+      files.add(meta.filePath);
+    }
+    return Array.from(files);
+  }
+
+  /**
    * Prioritize chunks for indexing when maxChunks limit is set.
    * Prioritizes:
    * 1. Core source directories (src/, lib/, app/)

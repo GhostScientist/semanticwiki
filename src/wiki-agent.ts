@@ -89,6 +89,24 @@ export interface WikiGenerationOptions {
    * CPU threads for local inference (default: auto).
    */
   threads?: number;
+
+  /**
+   * Update context for surgical wiki updates based on code changes.
+   * When provided, the agent will focus on updating specific pages
+   * rather than regenerating the entire wiki.
+   */
+  updateContext?: {
+    /** New files added since last index */
+    newFiles: string[];
+    /** Files modified since last index */
+    modifiedFiles: string[];
+    /** Files deleted since last index */
+    deletedFiles: string[];
+    /** Existing wiki pages that reference changed files */
+    affectedPages: string[];
+    /** New wiki pages that should be created */
+    pagesToCreate: string[];
+  };
 }
 
 export interface WikiAgentConfig {
@@ -2966,6 +2984,71 @@ Generate the complete Markdown content for the index page:`;
     const configNote = options.configPath && fs.existsSync(options.configPath)
       ? `\n\nConfiguration file provided at: ${options.configPath}\nPlease read it first to understand the wiki structure requirements.`
       : '';
+
+    // Surgical update mode - update specific pages based on code changes
+    if (options.updateContext) {
+      const ctx = options.updateContext;
+      const newFilesList = ctx.newFiles.length > 0
+        ? `### New Files (need new documentation)\n${ctx.newFiles.map(f => `- \`${f}\``).join('\n')}\n`
+        : '';
+      const modifiedFilesList = ctx.modifiedFiles.length > 0
+        ? `### Modified Files (update existing docs)\n${ctx.modifiedFiles.map(f => `- \`${f}\``).join('\n')}\n`
+        : '';
+      const deletedFilesList = ctx.deletedFiles.length > 0
+        ? `### Deleted Files (remove references)\n${ctx.deletedFiles.map(f => `- \`${f}\``).join('\n')}\n`
+        : '';
+      const affectedPagesList = ctx.affectedPages.length > 0
+        ? `### Wiki Pages to Update\n${ctx.affectedPages.map(p => `- ${p}`).join('\n')}\n`
+        : '';
+      const pagesToCreateList = ctx.pagesToCreate.length > 0
+        ? `### New Wiki Pages to Create\n${ctx.pagesToCreate.map(p => `- ${p}`).join('\n')}\n`
+        : '';
+
+      return `You are performing a SURGICAL UPDATE to the architectural documentation wiki based on recent code changes.
+
+**Repository:** ${options.repoUrl}
+**Output Directory:** ${this.outputDir}
+
+## Code Changes Since Last Update
+
+${newFilesList}
+${modifiedFilesList}
+${deletedFilesList}
+
+## Documentation Updates Required
+
+${affectedPagesList}
+${pagesToCreateList}
+
+## Instructions for Surgical Update
+
+**For Modified Files:**
+1. Use \`mcp__tedmosby__search_codebase\` to understand what changed in the modified files
+2. Read the affected wiki pages with \`mcp__filesystem__read_file\`
+3. Update the specific sections that reference the changed code
+4. Preserve all other content - only change what's necessary
+5. Update any outdated code snippets, line numbers, or function references
+
+**For New Files:**
+1. Analyze the new files to understand their purpose
+2. If they belong to an existing module, update that module's documentation
+3. If they represent a new module/feature, create a new wiki page
+4. Add appropriate cross-references to related existing pages
+
+**For Deleted Files:**
+1. Find all references to deleted files in wiki pages
+2. Either remove the references or mark them as deprecated
+3. Update any architectural diagrams that showed the deleted components
+
+**IMPORTANT Guidelines:**
+- Make MINIMAL changes - only update what's directly affected by the code changes
+- Preserve existing formatting, structure, and cross-references
+- Update line numbers in source references (file:line format) to match the new code
+- After all updates, use \`mcp__tedmosby__verify_wiki_completeness\` to check for broken links
+- Do NOT regenerate entire pages unless absolutely necessary
+
+Remember: Every architectural concept MUST include accurate file:line references to the source code.`;
+    }
 
     // Continuation mode - only generate missing pages
     if (options.missingPages && options.missingPages.length > 0) {
