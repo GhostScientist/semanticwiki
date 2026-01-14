@@ -1209,7 +1209,105 @@ Create all ${missingPages.length} missing pages now.`;
       }
     }
 
-    // Phase 6: Generate index page
+    // Phase 6: Verification loop - generate missing pages until all cross-links resolve
+    yield { type: 'phase', message: 'Verifying cross-links', progress: 85 };
+
+    const maxVerificationAttempts = 5;
+    let verificationAttempts = 0;
+    const generatedFilenames = new Set(pagesToGenerate.map(p => p.filename));
+
+    while (verificationAttempts < maxVerificationAttempts) {
+      verificationAttempts++;
+      const verification = await this.verifyWikiCompleteness(this.outputDir);
+
+      console.log(`[Local] Verification #${verificationAttempts}: ${verification.totalPages} pages, ${verification.brokenLinks.length} broken links`);
+
+      if (verification.isComplete) {
+        console.log('[Local] ✓ Wiki is complete! All cross-links are valid.');
+        yield { type: 'step', message: 'All cross-links verified', progress: 90 };
+        break;
+      }
+
+      // Get unique missing pages we haven't generated yet
+      const missingPages = [...new Set(verification.brokenLinks.map(l => l.resolvedTarget))]
+        .filter(target => !generatedFilenames.has(target));
+
+      if (missingPages.length === 0) {
+        console.log('[Local] No new pages to generate, but some links remain broken');
+        break;
+      }
+
+      yield {
+        type: 'step',
+        message: `Found ${missingPages.length} missing pages, generating...`,
+        progress: 85 + verificationAttempts
+      };
+
+      // Generate missing pages
+      for (const missingFile of missingPages.slice(0, 5)) { // Limit to 5 per iteration
+        const pageName = path.basename(missingFile, '.md');
+        const pageTitle = this.formatDirectoryName(pageName);
+
+        console.log(`[Local] ─── Generating missing page: ${pageTitle} ───`);
+
+        // Find broken links that reference this page to get context
+        const referencingLinks = verification.brokenLinks.filter(l => l.resolvedTarget === missingFile);
+        const linkContexts = referencingLinks.map(l => l.linkText).join(', ');
+
+        const missingPageSpec = {
+          title: pageTitle,
+          filename: missingFile,
+          type: 'module' as const,
+          context: `Documentation for ${pageTitle}. Referenced from: ${linkContexts || 'other pages'}`,
+          sourceFiles: [] as string[],
+        };
+
+        // Try to find relevant source files for this page
+        const sourceFiles = await this.scanSourceFiles(this.repoPath);
+        const relevantFiles = sourceFiles.filter(f =>
+          f.toLowerCase().includes(pageName.toLowerCase()) ||
+          path.basename(f, path.extname(f)).toLowerCase() === pageName.toLowerCase()
+        );
+        missingPageSpec.sourceFiles = relevantFiles.slice(0, 10);
+
+        try {
+          const content = await this.generateSinglePage(
+            provider,
+            missingPageSpec,
+            [...pagesToGenerate, missingPageSpec],
+            options
+          );
+
+          if (content) {
+            const pagePath = path.join(this.outputDir, missingFile);
+            const pageDir = path.dirname(pagePath);
+            if (!fs.existsSync(pageDir)) {
+              fs.mkdirSync(pageDir, { recursive: true });
+            }
+            fs.writeFileSync(pagePath, content, 'utf-8');
+
+            console.log(`[Local] ✓ Generated missing page: ${missingFile}`);
+            pagesGenerated++;
+            generatedFilenames.add(missingFile);
+            pagesToGenerate.push(missingPageSpec);
+            yield { type: 'file', message: missingFile, detail: pageTitle };
+          }
+        } catch (error) {
+          console.error(`[Local] ✗ Failed to generate missing page: ${missingFile}`);
+          pagesFailed++;
+        }
+      }
+    }
+
+    if (verificationAttempts >= maxVerificationAttempts) {
+      const finalCheck = await this.verifyWikiCompleteness(this.outputDir);
+      if (!finalCheck.isComplete) {
+        console.log(`[Local] ⚠ Max verification attempts reached. ${finalCheck.brokenLinks.length} broken links remain.`);
+        yield { type: 'step', message: `Warning: ${finalCheck.brokenLinks.length} broken links remain`, progress: 90 };
+      }
+    }
+
+    // Phase 7: Generate index page
     yield { type: 'phase', message: 'Generating index page', progress: 95 };
 
     try {
@@ -1235,95 +1333,396 @@ Create all ${missingPages.length} missing pages now.`;
   }
 
   /**
-   * Analyze codebase to determine which pages to generate
+   * Analyze codebase to determine which pages to generate dynamically.
+   * This analyzes the actual project structure rather than using hardcoded page types.
    */
   private async analyzeCodebaseForPages(options: WikiGenerationOptions): Promise<Array<{
     title: string;
     filename: string;
-    type: 'overview' | 'component' | 'api' | 'guide';
+    type: 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config';
     context: string;
     sourceFiles: string[];
   }>> {
     const pages: Array<{
       title: string;
       filename: string;
-      type: 'overview' | 'component' | 'api' | 'guide';
+      type: 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config';
       context: string;
       sourceFiles: string[];
     }> = [];
 
     // Get all source files by scanning the repository
     const sourceFiles = await this.scanSourceFiles(this.repoPath);
+    console.log(`[Local] Found ${sourceFiles.length} source files to analyze`);
 
-    // 1. Architecture Overview
+    // Detect project type from package.json or other indicators
+    const projectType = await this.detectProjectType();
+    console.log(`[Local] Detected project type: ${projectType.type} (${projectType.framework || 'no framework'})`);
+
+    // 1. Architecture Overview (always included)
+    const entryPoints = this.findEntryPoints(sourceFiles, projectType);
     pages.push({
       title: 'Architecture Overview',
       filename: 'architecture.md',
       type: 'overview',
-      context: 'High-level system architecture, main components, and how they interact',
-      sourceFiles: sourceFiles.slice(0, 20), // Sample of key files
+      context: `High-level architecture of this ${projectType.type} project. Main entry points and how components interact.`,
+      sourceFiles: entryPoints.slice(0, 20),
     });
 
-    // 2. Analyze directory structure for component pages
-    const directories = new Map<string, string[]>();
-    for (const file of sourceFiles) {
-      const dir = path.dirname(file);
-      const parts = dir.split(path.sep);
-      // Get the first meaningful directory
-      const mainDir = parts.find(p => p !== '.' && p !== 'src' && p !== 'lib' && p.length > 0) || 'root';
-      if (!directories.has(mainDir)) {
-        directories.set(mainDir, []);
-      }
-      directories.get(mainDir)!.push(file);
+    // 2. Analyze directory structure intelligently
+    const dirAnalysis = this.analyzeDirectoryStructure(sourceFiles);
+
+    // Add pages for significant directories
+    for (const [dirPath, info] of dirAnalysis.entries()) {
+      if (info.files.length < 2) continue; // Skip trivial directories
+
+      const pageType = this.inferPageType(dirPath, info);
+      if (!pageType) continue;
+
+      pages.push({
+        title: pageType.title,
+        filename: pageType.filename,
+        type: pageType.type,
+        context: pageType.context,
+        sourceFiles: info.files.slice(0, 20),
+      });
     }
 
-    // Create a page for each major directory/component
-    for (const [dir, files] of directories) {
-      if (files.length >= 2) { // Only create pages for directories with multiple files
-        const title = this.formatDirectoryName(dir);
-        pages.push({
-          title: `${title} Component`,
-          filename: `components/${dir.toLowerCase().replace(/[^a-z0-9]/g, '-')}.md`,
-          type: 'component',
-          context: `Documentation for the ${title} component/module`,
-          sourceFiles: files.slice(0, 15),
-        });
-      }
+    // 3. Add specialized pages based on project patterns
+
+    // React/Vue/Svelte: Components page if we have many components
+    const componentFiles = sourceFiles.filter(f =>
+      f.includes('/components/') ||
+      f.includes('/Components/') ||
+      (f.endsWith('.tsx') && !f.includes('/pages/'))
+    );
+    if (componentFiles.length >= 5 && !pages.some(p => p.title.includes('Component'))) {
+      pages.push({
+        title: 'UI Components',
+        filename: 'components.md',
+        type: 'component',
+        context: 'Reusable UI components, their props, and usage patterns',
+        sourceFiles: componentFiles.slice(0, 20),
+      });
     }
 
-    // 3. Getting Started guide
+    // Hooks (React)
+    const hookFiles = sourceFiles.filter(f =>
+      f.includes('/hooks/') ||
+      f.includes('use') && f.endsWith('.ts')
+    );
+    if (hookFiles.length >= 3) {
+      pages.push({
+        title: 'Custom Hooks',
+        filename: 'hooks.md',
+        type: 'module',
+        context: 'Custom React hooks, their purpose, and usage examples',
+        sourceFiles: hookFiles,
+      });
+    }
+
+    // API/Routes
+    const apiFiles = sourceFiles.filter(f =>
+      f.includes('/api/') ||
+      f.includes('/routes/') ||
+      f.includes('/endpoints/') ||
+      f.includes('router') ||
+      f.includes('handler')
+    );
+    if (apiFiles.length >= 2) {
+      pages.push({
+        title: 'API Reference',
+        filename: 'api.md',
+        type: 'api',
+        context: 'API endpoints, route handlers, and request/response formats',
+        sourceFiles: apiFiles.slice(0, 20),
+      });
+    }
+
+    // Utils/Helpers
+    const utilFiles = sourceFiles.filter(f =>
+      f.includes('/utils/') ||
+      f.includes('/helpers/') ||
+      f.includes('/lib/') ||
+      f.includes('util') ||
+      f.includes('helper')
+    );
+    if (utilFiles.length >= 3) {
+      pages.push({
+        title: 'Utilities & Helpers',
+        filename: 'utilities.md',
+        type: 'module',
+        context: 'Utility functions, helper modules, and shared logic',
+        sourceFiles: utilFiles.slice(0, 15),
+      });
+    }
+
+    // State Management
+    const stateFiles = sourceFiles.filter(f =>
+      f.includes('/store/') ||
+      f.includes('/state/') ||
+      f.includes('/redux/') ||
+      f.includes('/context/') ||
+      f.includes('store') ||
+      f.includes('slice')
+    );
+    if (stateFiles.length >= 2) {
+      pages.push({
+        title: 'State Management',
+        filename: 'state-management.md',
+        type: 'module',
+        context: 'Application state, stores, reducers, and data flow patterns',
+        sourceFiles: stateFiles,
+      });
+    }
+
+    // Types/Interfaces (TypeScript)
+    const typeFiles = sourceFiles.filter(f =>
+      f.includes('/types/') ||
+      f.includes('/interfaces/') ||
+      f.includes('.d.ts') ||
+      f.includes('types.ts')
+    );
+    if (typeFiles.length >= 2) {
+      pages.push({
+        title: 'Type Definitions',
+        filename: 'types.md',
+        type: 'module',
+        context: 'TypeScript types, interfaces, and type utilities',
+        sourceFiles: typeFiles,
+      });
+    }
+
+    // Configuration
+    const configFiles = sourceFiles.filter(f =>
+      f.includes('config') ||
+      f.includes('.config.') ||
+      f.endsWith('.json') ||
+      f.endsWith('.yaml') ||
+      f.endsWith('.yml') ||
+      f.endsWith('.toml')
+    );
+    if (configFiles.length >= 2) {
+      pages.push({
+        title: 'Configuration',
+        filename: 'configuration.md',
+        type: 'config',
+        context: 'Project configuration, environment setup, and build settings',
+        sourceFiles: configFiles.slice(0, 10),
+      });
+    }
+
+    // 4. Getting Started guide (always included)
+    const setupFiles = sourceFiles.filter(f =>
+      f.includes('package.json') ||
+      f.includes('README') ||
+      f.includes('CONTRIBUTING') ||
+      f.includes('setup') ||
+      f.includes('install')
+    );
     pages.push({
       title: 'Getting Started',
       filename: 'getting-started.md',
       type: 'guide',
-      context: 'How to set up, install, and start using the project',
-      sourceFiles: sourceFiles.filter(f =>
-        f.includes('package.json') ||
-        f.includes('README') ||
-        f.includes('config') ||
-        f.includes('setup')
-      ).slice(0, 10),
+      context: 'Installation, setup, development workflow, and quick start guide',
+      sourceFiles: [...setupFiles, ...entryPoints.slice(0, 5)],
     });
 
-    // 4. API Reference (if there are API-like files)
-    const apiFiles = sourceFiles.filter(f =>
-      f.includes('api') ||
-      f.includes('endpoint') ||
-      f.includes('route') ||
-      f.includes('handler')
-    );
-    if (apiFiles.length > 0) {
-      pages.push({
-        title: 'API Reference',
-        filename: 'api-reference.md',
-        type: 'api',
-        context: 'API endpoints, handlers, and how to use them',
-        sourceFiles: apiFiles.slice(0, 15),
-      });
+    // Remove duplicates (by filename)
+    const seen = new Set<string>();
+    const uniquePages = pages.filter(p => {
+      if (seen.has(p.filename)) return false;
+      seen.add(p.filename);
+      return true;
+    });
+
+    console.log(`[Local] Generated ${uniquePages.length} page specs for this project`);
+    return uniquePages;
+  }
+
+  /**
+   * Detect the project type from package.json and file patterns
+   */
+  private async detectProjectType(): Promise<{ type: string; framework?: string; language: string }> {
+    const packageJsonPath = path.join(this.repoPath, 'package.json');
+
+    if (fs.existsSync(packageJsonPath)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+        const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+
+        // Detect framework
+        if (deps['next']) return { type: 'web app', framework: 'Next.js', language: 'TypeScript' };
+        if (deps['react']) return { type: 'web app', framework: 'React', language: 'TypeScript' };
+        if (deps['vue']) return { type: 'web app', framework: 'Vue', language: 'TypeScript' };
+        if (deps['svelte']) return { type: 'web app', framework: 'Svelte', language: 'TypeScript' };
+        if (deps['express']) return { type: 'server', framework: 'Express', language: 'TypeScript' };
+        if (deps['fastify']) return { type: 'server', framework: 'Fastify', language: 'TypeScript' };
+        if (deps['@anthropic-ai/sdk']) return { type: 'AI application', framework: 'Anthropic SDK', language: 'TypeScript' };
+
+        // CLI tool detection
+        if (pkg.bin) return { type: 'CLI tool', language: 'TypeScript' };
+
+        return { type: 'Node.js project', language: 'TypeScript' };
+      } catch {
+        // Ignore parse errors
+      }
     }
 
-    // Limit total pages to a reasonable number for local mode
-    return pages.slice(0, 15);
+    // Check for other project types
+    if (fs.existsSync(path.join(this.repoPath, 'Cargo.toml'))) {
+      return { type: 'Rust project', language: 'Rust' };
+    }
+    if (fs.existsSync(path.join(this.repoPath, 'go.mod'))) {
+      return { type: 'Go project', language: 'Go' };
+    }
+    if (fs.existsSync(path.join(this.repoPath, 'requirements.txt')) ||
+        fs.existsSync(path.join(this.repoPath, 'pyproject.toml'))) {
+      return { type: 'Python project', language: 'Python' };
+    }
+
+    return { type: 'software project', language: 'unknown' };
+  }
+
+  /**
+   * Find entry points based on project type
+   */
+  private findEntryPoints(sourceFiles: string[], projectType: { type: string; framework?: string }): string[] {
+    const entryPatterns = [
+      // Common entry points
+      /^src\/index\.[tj]sx?$/,
+      /^src\/main\.[tj]sx?$/,
+      /^src\/app\.[tj]sx?$/,
+      /^src\/App\.[tj]sx?$/,
+      /^index\.[tj]sx?$/,
+      /^main\.[tj]sx?$/,
+      // Next.js
+      /^src\/pages\/_app\.[tj]sx?$/,
+      /^src\/app\/layout\.[tj]sx?$/,
+      /^pages\/_app\.[tj]sx?$/,
+      // Config files
+      /^package\.json$/,
+      /vite\.config\.[tj]s$/,
+      /next\.config\.[tj]s$/,
+      /webpack\.config\.[tj]s$/,
+    ];
+
+    const entries: string[] = [];
+
+    for (const file of sourceFiles) {
+      for (const pattern of entryPatterns) {
+        if (pattern.test(file)) {
+          entries.push(file);
+          break;
+        }
+      }
+    }
+
+    // Also include any index files as they're often entry points
+    const indexFiles = sourceFiles.filter(f =>
+      f.endsWith('/index.ts') ||
+      f.endsWith('/index.tsx') ||
+      f.endsWith('/index.js')
+    );
+
+    return [...new Set([...entries, ...indexFiles])].slice(0, 20);
+  }
+
+  /**
+   * Analyze directory structure and return info about significant directories
+   */
+  private analyzeDirectoryStructure(sourceFiles: string[]): Map<string, {
+    files: string[];
+    depth: number;
+    hasIndex: boolean;
+  }> {
+    const dirMap = new Map<string, { files: string[]; depth: number; hasIndex: boolean }>();
+
+    for (const file of sourceFiles) {
+      const dir = path.dirname(file);
+      if (dir === '.' || dir === '') continue;
+
+      // Get the most specific meaningful directory
+      const parts = dir.split(path.sep).filter(p => p !== 'src' && p !== 'lib' && p !== 'app');
+      if (parts.length === 0) continue;
+
+      // Use the first meaningful directory segment
+      const meaningfulDir = parts[0];
+
+      if (!dirMap.has(meaningfulDir)) {
+        dirMap.set(meaningfulDir, { files: [], depth: parts.length, hasIndex: false });
+      }
+
+      const info = dirMap.get(meaningfulDir)!;
+      info.files.push(file);
+
+      if (file.endsWith('/index.ts') || file.endsWith('/index.tsx')) {
+        info.hasIndex = true;
+      }
+    }
+
+    return dirMap;
+  }
+
+  /**
+   * Infer what type of page to create for a directory
+   */
+  private inferPageType(dirPath: string, info: { files: string[]; hasIndex: boolean }): {
+    title: string;
+    filename: string;
+    type: 'component' | 'module' | 'api' | 'guide';
+    context: string;
+  } | null {
+    const dirLower = dirPath.toLowerCase();
+
+    // Skip common non-documentation directories
+    if (['node_modules', 'dist', 'build', '.git', 'coverage', '__tests__', '__mocks__'].includes(dirLower)) {
+      return null;
+    }
+
+    // Map directory names to page types
+    const dirMappings: Record<string, { type: 'component' | 'module' | 'api' | 'guide'; contextPrefix: string }> = {
+      'components': { type: 'component', contextPrefix: 'UI components' },
+      'pages': { type: 'component', contextPrefix: 'Page components and routing' },
+      'views': { type: 'component', contextPrefix: 'View components' },
+      'layouts': { type: 'component', contextPrefix: 'Layout components' },
+      'hooks': { type: 'module', contextPrefix: 'Custom React hooks' },
+      'utils': { type: 'module', contextPrefix: 'Utility functions' },
+      'helpers': { type: 'module', contextPrefix: 'Helper functions' },
+      'lib': { type: 'module', contextPrefix: 'Library code' },
+      'services': { type: 'module', contextPrefix: 'Service layer' },
+      'api': { type: 'api', contextPrefix: 'API endpoints' },
+      'routes': { type: 'api', contextPrefix: 'Route handlers' },
+      'controllers': { type: 'api', contextPrefix: 'Controllers' },
+      'models': { type: 'module', contextPrefix: 'Data models' },
+      'store': { type: 'module', contextPrefix: 'State management' },
+      'context': { type: 'module', contextPrefix: 'React context providers' },
+      'types': { type: 'module', contextPrefix: 'Type definitions' },
+      'config': { type: 'guide', contextPrefix: 'Configuration' },
+      'scripts': { type: 'guide', contextPrefix: 'Build and utility scripts' },
+    };
+
+    const mapping = dirMappings[dirLower];
+    if (mapping) {
+      return {
+        title: this.formatDirectoryName(dirPath),
+        filename: `${dirLower}.md`,
+        type: mapping.type,
+        context: `${mapping.contextPrefix} in the ${this.formatDirectoryName(dirPath)} directory`,
+      };
+    }
+
+    // For other directories with enough files, create a module page
+    if (info.files.length >= 5) {
+      return {
+        title: this.formatDirectoryName(dirPath),
+        filename: `${dirLower.replace(/[^a-z0-9]/g, '-')}.md`,
+        type: 'module',
+        context: `The ${this.formatDirectoryName(dirPath)} module and its functionality`,
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -1336,6 +1735,50 @@ Create all ${missingPages.length} missing pages now.`;
       .split(' ')
       .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
       .join(' ');
+  }
+
+  /**
+   * Convert plain-text source references to clickable markdown links.
+   * Handles various formats like:
+   * - `See: path/file.ts:123`
+   * - `(path/file.ts:123)`
+   * - `Source: path/file.ts:123`
+   * And converts them to: `📄 [path/file.ts:123](../path/file.ts#L123)`
+   */
+  private makeSourceReferencesClickable(content: string): string {
+    let processed = content;
+
+    // Pattern 1: `See: path/file.ts:123` or `See path/file.ts:123`
+    processed = processed.replace(
+      /(?:See:?\s*)`?([a-zA-Z0-9_\-./]+\.[a-zA-Z]+):(\d+)`?/g,
+      (_, filePath, line) => `📄 [${filePath}:${line}](../${filePath}#L${line})`
+    );
+
+    // Pattern 2: `Source: path/file.ts:123`
+    processed = processed.replace(
+      /(?:Source:?\s*)`?([a-zA-Z0-9_\-./]+\.[a-zA-Z]+):(\d+)`?/g,
+      (_, filePath, line) => `📄 [${filePath}:${line}](../${filePath}#L${line})`
+    );
+
+    // Pattern 3: Plain references in backticks like `path/file.ts:123` (but not already linked)
+    processed = processed.replace(
+      /(?<!\[)`([a-zA-Z0-9_\-./]+\.[tj]sx?):(\d+)`(?!\])/g,
+      (_, filePath, line) => `📄 [${filePath}:${line}](../${filePath}#L${line})`
+    );
+
+    // Pattern 4: References in parentheses like (path/file.ts:123)
+    processed = processed.replace(
+      /\(([a-zA-Z0-9_\-./]+\.[tj]sx?):(\d+)\)(?!\])/g,
+      (_, filePath, line) => `(📄 [${filePath}:${line}](../${filePath}#L${line}))`
+    );
+
+    // Pattern 5: Bare references at end of sentences like "in file.ts:123."
+    processed = processed.replace(
+      /(?:in|from|at)\s+([a-zA-Z0-9_\-./]+\.[tj]sx?):(\d+)([.,])/g,
+      (_, filePath, line, punct) => `in 📄 [${filePath}:${line}](../${filePath}#L${line})${punct}`
+    );
+
+    return processed;
   }
 
   /**
@@ -1456,12 +1899,14 @@ Write a well-structured Markdown page with the following sections:
 For each important file, function, or class you see in the code:
 - Explain its purpose and responsibility
 - Describe how it works at a high level
-- Add source reference: \`See: filename.ts:line\`
+- Add a clickable source reference using this exact format: \`📄 [path/to/file.ts:line](../path/to/file.ts#Lline)\`
+  Example: \`📄 [src/hooks/useAuth.ts:42](../src/hooks/useAuth.ts#L42)\`
 
 ### 3. How It Works (required)
 - Explain the data flow or control flow
 - Describe any patterns used (e.g., hooks, state management)
 - Include code snippets where helpful
+- Reference source files using the clickable link format above
 
 ### 4. Related Documentation
 Link to these related pages:
@@ -1469,7 +1914,7 @@ ${relatedLinks}
 
 ## Important Rules
 - Base ALL content on the actual source code shown above
-- Include specific file paths and line numbers as references
+- ALWAYS use clickable source references: \`📄 [path/file.ts:line](../path/file.ts#Lline)\`
 - Do not invent features or files not shown in the code
 - Write for developers who need to understand and work with this code
 
@@ -1479,7 +1924,7 @@ Generate the documentation now:`;
       { role: 'user', content: prompt }
     ];
 
-    const systemPrompt = `You are a senior technical writer creating internal documentation for a software development team. Your documentation is thorough, accurate, and always grounded in the actual source code. You explain not just WHAT the code does, but HOW it works and WHY it's designed that way. You include source file references for every major point.`;
+    const systemPrompt = `You are a senior technical writer creating internal documentation for a software development team. Your documentation is thorough, accurate, and always grounded in the actual source code. You explain not just WHAT the code does, but HOW it works and WHY it's designed that way. You include clickable source file references using this format: 📄 [path/file.ts:line](../path/file.ts#Lline)`;
 
     // Debug: show prompt stats
     console.log(`[Local]   ─────────────────────────────────────────────────────`);
@@ -1504,7 +1949,9 @@ Generate the documentation now:`;
         console.log(`[Local]   Response: ${response.content?.length || 0} chars, stopReason: ${response.stopReason}`);
 
         if (response.content && response.content.length > 200) {
-          return response.content;
+          // Post-process to ensure source references are clickable links
+          const processedContent = this.makeSourceReferencesClickable(response.content);
+          return processedContent;
         }
 
         if (attempt === 1) {
