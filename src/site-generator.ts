@@ -48,6 +48,7 @@ export interface WikiPage {
   headings: Array<{ level: number; text: string; id: string }>;
   codeBlocks: Array<{ language: string; code: string; sourceRef?: string }>;
   mermaidDiagrams: string[];
+  lastModified?: Date;
 }
 
 export interface SiteNavigation {
@@ -111,7 +112,7 @@ export class SiteGenerator {
     this.options = {
       wikiDir: path.resolve(options.wikiDir),
       outputDir: path.resolve(options.outputDir),
-      title: `👻 ${codebaseName}`,
+      title: `${codebaseName} Wiki`,
       description: options.description || 'Interactive architectural documentation',
       theme: options.theme || 'auto',
       features: {
@@ -334,23 +335,10 @@ export class SiteGenerator {
       const extractedTitle = this.extractTitle(markdownContent);
       const title = frontmatter.title || extractedTitle || path.basename(filePath, '.md');
 
-      // Always remove the first H1 if it exists and matches the title to prevent duplication
-      // The title will be displayed in the page header template regardless of source
-      let contentWithoutTitle = markdownContent;
-      if (extractedTitle) {
-        // Normalize both titles for comparison (case-insensitive, trim whitespace)
-        const normalizedFrontmatter = (frontmatter.title || '').toLowerCase().trim();
-        const normalizedExtracted = extractedTitle.toLowerCase().trim();
-
-        // Remove H1 if:
-        // 1. No frontmatter title exists (extracted becomes title), OR
-        // 2. Frontmatter title matches extracted H1 (duplicate), OR
-        // 3. Extracted H1 is present (template will handle title display)
-        if (!frontmatter.title || normalizedFrontmatter === normalizedExtracted || extractedTitle) {
-          // Remove the first H1 line from content (including any trailing newlines)
-          contentWithoutTitle = markdownContent.replace(/^#\s+[^\n]+\n*/, '');
-        }
-      }
+      // Always remove the first H1 from content since the template renders the title separately
+      // This prevents duplication regardless of whether title came from frontmatter or H1
+      // The regex handles optional leading whitespace/newlines that may exist after frontmatter
+      const contentWithoutTitle = markdownContent.replace(/^\s*#\s+[^\n]+\n*/, '');
 
       // Extract headings (after potentially removing title)
       const headings = this.extractHeadings(contentWithoutTitle);
@@ -370,6 +358,10 @@ export class SiteGenerator {
       // Restore mermaid diagrams after markdown processing to preserve their syntax
       const htmlContent = this.restoreMermaidBlocks(parsedHtml);
 
+      // Get file modification time for "last updated" display
+      const stats = fs.statSync(filePath);
+      const lastModified = stats.mtime;
+
       return {
         path: filePath,
         relativePath,
@@ -382,7 +374,8 @@ export class SiteGenerator {
         related: frontmatter.related,
         headings,
         codeBlocks,
-        mermaidDiagrams
+        mermaidDiagrams,
+        lastModified
       };
     } catch (error) {
       console.error(`Failed to parse ${filePath}:`, error);
@@ -740,7 +733,12 @@ export class SiteGenerator {
         rootPath,
         currentPath: htmlPath,
         features: this.options.features,
-        theme: this.options.theme
+        theme: this.options.theme,
+        lastModified: page.lastModified?.toLocaleDateString('en-US', {
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        })
       });
 
       fs.writeFileSync(outputPath, html);

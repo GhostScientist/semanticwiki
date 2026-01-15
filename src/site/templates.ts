@@ -34,6 +34,7 @@ interface PageTemplateData {
     aiChat?: boolean;
   };
   theme: 'light' | 'dark' | 'auto';
+  lastModified?: string;
 }
 
 export function getTemplates() {
@@ -186,7 +187,7 @@ export function getTemplates() {
       <!-- Page footer -->
       <footer class="page-footer">
         <div class="page-meta">
-          <span class="last-updated">Last updated: ${new Date().toLocaleDateString()}</span>
+          <span class="last-updated">Last updated: ${data.lastModified || 'Unknown'}</span>
         </div>
         <div class="page-actions">
           <button class="scroll-to-top" title="Scroll to top">

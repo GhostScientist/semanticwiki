@@ -538,23 +538,24 @@ a:visited {
   color: var(--color-link-visited);
 }
 
-/* Content links - make them more prominent */
+/* Content links - subtle underline effect */
 .page-content a:not(.anchor-link):not(.source-link) {
-  background: linear-gradient(to bottom, transparent 60%, rgba(147, 51, 234, 0.15) 60%);
-  padding: 0 2px;
-  border-radius: 2px;
+  text-decoration: underline;
+  text-decoration-color: rgba(147, 51, 234, 0.4);
+  text-underline-offset: 2px;
+  transition: text-decoration-color var(--transition-fast);
 }
 
 .page-content a:not(.anchor-link):not(.source-link):hover {
-  background: linear-gradient(to bottom, transparent 40%, rgba(147, 51, 234, 0.25) 40%);
+  text-decoration-color: rgba(147, 51, 234, 0.8);
 }
 
 [data-theme="dark"] .page-content a:not(.anchor-link):not(.source-link) {
-  background: linear-gradient(to bottom, transparent 60%, rgba(192, 132, 252, 0.2) 60%);
+  text-decoration-color: rgba(192, 132, 252, 0.4);
 }
 
 [data-theme="dark"] .page-content a:not(.anchor-link):not(.source-link):hover {
-  background: linear-gradient(to bottom, transparent 40%, rgba(192, 132, 252, 0.3) 40%);
+  text-decoration-color: rgba(192, 132, 252, 0.8);
 }
 
 .external-link {
@@ -1706,13 +1707,13 @@ body.chat-open .chat-panel {
   transform: translateX(0);
 }
 
-/* Resize handle */
+/* Resize handle - wider for easier grabbing */
 .chat-resize-handle {
   position: absolute;
-  left: 0;
+  left: -4px;
   top: 0;
   bottom: 0;
-  width: 6px;
+  width: 12px;
   cursor: ew-resize;
   background: transparent;
   z-index: 10;
