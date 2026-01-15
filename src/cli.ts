@@ -1249,6 +1249,294 @@ program
     }
   });
 
+// MCP server command - start the wiki MCP server for AI assistant integration
+program
+  .command('mcp-server')
+  .description('Start the MCP server for AI assistant integration with the wiki')
+  .option('-o, --output <dir>', 'Wiki directory', './wiki')
+  .option('-r, --repo <path>', 'Repository path (enables code search)')
+  .option('--rag-store <path>', 'RAG index store path (auto-detected from wiki if not specified)')
+  .action(async (options) => {
+    try {
+      const wikiDir = path.resolve(options.output);
+
+      if (!fs.existsSync(wikiDir)) {
+        console.error('Wiki directory not found:', wikiDir);
+        process.exit(1);
+      }
+
+      // Auto-detect RAG store if not specified
+      let ragStorePath = options.ragStore;
+      if (!ragStorePath) {
+        const cacheDir = path.join(wikiDir, '.ted-mosby-cache');
+        if (fs.existsSync(path.join(cacheDir, 'metadata.json'))) {
+          ragStorePath = cacheDir;
+        }
+      }
+
+      const repoPath = options.repo ? path.resolve(options.repo) : undefined;
+
+      // Dynamic import to avoid loading MCP dependencies unless needed
+      const { WikiMCPServer } = await import('./mcp-wiki-server.js');
+
+      const server = new WikiMCPServer({
+        wikiPath: wikiDir,
+        ragStorePath,
+        repoPath
+      });
+
+      await server.start();
+    } catch (error) {
+      console.error('Error starting MCP server:', error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
+// Search command - search the wiki and codebase
+program
+  .command('search')
+  .description('Search the wiki documentation and codebase')
+  .argument('<query>', 'Search query')
+  .option('-o, --output <dir>', 'Wiki directory', './wiki')
+  .option('-n, --max-results <number>', 'Maximum results', parseInt, 10)
+  .option('-m, --mode <mode>', 'Search mode: hybrid, vector, or keyword', 'hybrid')
+  .option('--code', 'Search code using RAG index instead of wiki pages')
+  .option('--rerank', 'Enable reranking for more accurate results (slower)')
+  .action(async (query, options) => {
+    try {
+      const wikiDir = path.resolve(options.output);
+
+      if (options.code) {
+        // Search code using RAG
+        const cacheDir = path.join(wikiDir, '.ted-mosby-cache');
+
+        if (!fs.existsSync(path.join(cacheDir, 'metadata.json'))) {
+          console.log(chalk.red('❌ No RAG index found.'));
+          console.log(chalk.gray('Run `ted-mosby generate` first to create the index.'));
+          process.exit(1);
+        }
+
+        console.log(chalk.cyan.bold('\n🔍 Code Search\n'));
+        console.log(chalk.gray(`Query: ${query}`));
+        console.log(chalk.gray(`Mode: ${options.mode}`));
+        console.log();
+
+        const { RAGSystem } = await import('./rag/index.js');
+        const rag = new RAGSystem({
+          storePath: cacheDir,
+          repoPath: wikiDir,
+          useHybridSearch: options.mode !== 'vector',
+          useReranking: options.rerank
+        });
+
+        await rag.loadMetadataOnly();
+
+        const results = await rag.search(query, {
+          maxResults: options.maxResults,
+          mode: options.mode as 'hybrid' | 'vector' | 'keyword',
+          rerank: options.rerank
+        });
+
+        if (results.length === 0) {
+          console.log(chalk.yellow('No results found.'));
+          return;
+        }
+
+        console.log(chalk.green(`Found ${results.length} results:\n`));
+
+        for (const [i, result] of results.entries()) {
+          console.log(chalk.white.bold(`${i + 1}. ${result.filePath}:${result.startLine}-${result.endLine}`));
+          console.log(chalk.gray(`   Type: ${result.chunkType || 'code'}${result.name ? ` | Name: ${result.name}` : ''}`));
+
+          const scores: string[] = [`Score: ${result.score.toFixed(3)}`];
+          if (result.vectorScore !== undefined) scores.push(`Vector: ${result.vectorScore.toFixed(3)}`);
+          if (result.bm25Score !== undefined) scores.push(`BM25: ${result.bm25Score.toFixed(3)}`);
+          console.log(chalk.gray(`   ${scores.join(' | ')}`));
+
+          // Show preview
+          const preview = result.content.split('\n').slice(0, 5).join('\n');
+          console.log(chalk.dim('   ' + preview.split('\n').join('\n   ')));
+          console.log();
+        }
+      } else {
+        // Search wiki pages
+        if (!fs.existsSync(wikiDir)) {
+          console.log(chalk.red('❌ Wiki directory not found: ' + wikiDir));
+          process.exit(1);
+        }
+
+        console.log(chalk.cyan.bold('\n🔍 Wiki Search\n'));
+        console.log(chalk.gray(`Query: ${query}`));
+        console.log();
+
+        // Simple keyword search through wiki pages
+        const mdFiles = await (await import('glob')).glob('**/*.md', { cwd: wikiDir });
+        const results: Array<{ path: string; title: string; score: number; preview: string }> = [];
+        const queryWords = query.toLowerCase().split(/\s+/).filter((w: string) => w.length > 2);
+
+        for (const file of mdFiles) {
+          const content = fs.readFileSync(path.join(wikiDir, file), 'utf-8');
+          const { data: frontmatter, content: body } = (await import('gray-matter')).default(content);
+
+          const title = frontmatter.title || path.basename(file, '.md');
+          const titleLower = title.toLowerCase();
+          const bodyLower = body.toLowerCase();
+
+          let score = 0;
+          for (const word of queryWords) {
+            if (titleLower.includes(word)) score += 10;
+            if (bodyLower.includes(word)) score += 1;
+          }
+
+          if (score > 0) {
+            // Find preview snippet
+            let preview = '';
+            const lines = body.split('\n');
+            for (const line of lines) {
+              if (queryWords.some((w: string) => line.toLowerCase().includes(w))) {
+                preview = line.trim().slice(0, 200);
+                break;
+              }
+            }
+
+            results.push({ path: file, title, score, preview: preview || lines[0]?.trim().slice(0, 200) || '' });
+          }
+        }
+
+        results.sort((a, b) => b.score - a.score);
+        const topResults = results.slice(0, options.maxResults);
+
+        if (topResults.length === 0) {
+          console.log(chalk.yellow('No results found.'));
+          return;
+        }
+
+        console.log(chalk.green(`Found ${results.length} results (showing top ${topResults.length}):\n`));
+
+        for (const [i, result] of topResults.entries()) {
+          console.log(chalk.white.bold(`${i + 1}. ${result.title}`));
+          console.log(chalk.gray(`   Path: ${result.path}`));
+          console.log(chalk.dim(`   ${result.preview}...`));
+          console.log();
+        }
+      }
+    } catch (error) {
+      console.error(chalk.red('\nError:'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
+// Package command - create portable wiki package
+program
+  .command('pack')
+  .description('Create a portable .archiwiki package from wiki directory')
+  .option('-o, --output <dir>', 'Wiki directory to package', './wiki')
+  .option('-f, --file <path>', 'Output package file path (default: wiki name + .archiwiki)')
+  .option('-n, --name <name>', 'Package name')
+  .option('-d, --description <text>', 'Package description')
+  .option('--source-repo <url>', 'Source repository URL')
+  .option('--no-rag', 'Exclude RAG index from package')
+  .action(async (options) => {
+    try {
+      const wikiDir = path.resolve(options.output);
+
+      if (!fs.existsSync(wikiDir)) {
+        console.log(chalk.red('❌ Wiki directory not found: ' + wikiDir));
+        process.exit(1);
+      }
+
+      console.log(chalk.cyan.bold('\n📦 Creating ArchiWiki Package\n'));
+
+      const { createPackage } = await import('./package-format.js');
+
+      const outputPath = options.file || path.join(path.dirname(wikiDir), `${path.basename(wikiDir)}.archiwiki`);
+
+      await createPackage({
+        wikiPath: wikiDir,
+        outputPath,
+        name: options.name,
+        description: options.description,
+        sourceRepo: options.sourceRepo,
+        includeRag: options.rag !== false
+      });
+
+      console.log(chalk.green('\n✅ Package created successfully!'));
+    } catch (error) {
+      console.error(chalk.red('\nError:'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
+// Unpack command - extract portable wiki package
+program
+  .command('unpack')
+  .description('Extract an .archiwiki package to a directory')
+  .argument('<package>', 'Path to .archiwiki package file')
+  .option('-o, --output <dir>', 'Output directory', '.')
+  .option('--wiki-only', 'Extract only wiki files, skip RAG index')
+  .option('--info', 'Show package info without extracting')
+  .option('--list', 'List files in package without extracting')
+  .action(async (packagePath, options) => {
+    try {
+      const pkgPath = path.resolve(packagePath);
+
+      if (!fs.existsSync(pkgPath)) {
+        console.log(chalk.red('❌ Package not found: ' + pkgPath));
+        process.exit(1);
+      }
+
+      const { extractPackage, readPackageManifest, listPackageFiles } = await import('./package-format.js');
+
+      if (options.info) {
+        console.log(chalk.cyan.bold('\n📦 Package Info\n'));
+        const manifest = readPackageManifest(pkgPath);
+        console.log(chalk.white('Name:'), chalk.green(manifest.name));
+        if (manifest.description) {
+          console.log(chalk.white('Description:'), manifest.description);
+        }
+        console.log(chalk.white('Created:'), manifest.createdAt);
+        if (manifest.sourceRepo) {
+          console.log(chalk.white('Source repo:'), manifest.sourceRepo);
+        }
+        if (manifest.sourceCommit) {
+          console.log(chalk.white('Source commit:'), manifest.sourceCommit.slice(0, 7));
+        }
+        console.log(chalk.white('Wiki pages:'), manifest.wikiStats.pageCount);
+        console.log(chalk.white('Total size:'), `${(manifest.wikiStats.totalSize / 1024).toFixed(1)} KB`);
+        if (manifest.ragStats) {
+          console.log(chalk.white('RAG chunks:'), manifest.ragStats.chunkCount);
+          console.log(chalk.white('Embedding model:'), manifest.ragStats.embeddingModel || 'unknown');
+          console.log(chalk.white('Hybrid search:'), manifest.ragStats.hasHybridIndex ? 'yes' : 'no');
+        }
+        return;
+      }
+
+      if (options.list) {
+        console.log(chalk.cyan.bold('\n📦 Package Contents\n'));
+        const files = listPackageFiles(pkgPath);
+        for (const file of files) {
+          console.log(chalk.gray(`  ${file}`));
+        }
+        console.log(chalk.white(`\nTotal: ${files.length} files`));
+        return;
+      }
+
+      console.log(chalk.cyan.bold('\n📦 Extracting ArchiWiki Package\n'));
+
+      const manifest = await extractPackage({
+        packagePath: pkgPath,
+        outputPath: path.resolve(options.output),
+        wikiOnly: options.wikiOnly
+      });
+
+      console.log(chalk.green('\n✅ Package extracted successfully!'));
+      console.log(chalk.gray(`Wiki available at: ${path.resolve(options.output, 'wiki')}`));
+    } catch (error) {
+      console.error(chalk.red('\nError:'), error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
 // Static site generation helper
 async function generateStaticSite(options: {
   output: string;

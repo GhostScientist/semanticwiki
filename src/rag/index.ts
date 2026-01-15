@@ -1,8 +1,12 @@
 /**
  * RAG (Retrieval Augmented Generation) System for ArchitecturalWiki
  *
- * Uses FAISS for vector similarity search over codebase embeddings.
- * Chunks code at logical boundaries and indexes for semantic retrieval.
+ * Enhanced with:
+ * - Hybrid search: Vector similarity + BM25 keyword search
+ * - Reciprocal Rank Fusion (RRF) for combining search results
+ * - BGE-small-en-v1.5 embeddings for better retrieval quality
+ * - Optional cross-encoder reranking for improved precision
+ * - Chunks code at logical boundaries and indexes for semantic retrieval.
  */
 
 import * as fs from 'fs';
@@ -33,6 +37,8 @@ try {
 
 // Embedding model - will be initialized lazily
 let embeddingPipeline: any = null;
+// Reranking model - will be initialized lazily
+let rerankPipeline: any = null;
 
 export interface RAGConfig {
   storePath: string;
@@ -46,6 +52,12 @@ export interface RAGConfig {
   useASTChunking?: boolean;
   /** Extract business domain hints from code (default: true) */
   extractDomainHints?: boolean;
+  /** Enable hybrid search combining vector + BM25 (default: true) */
+  useHybridSearch?: boolean;
+  /** Enable reranking for improved precision (default: false - slower but more accurate) */
+  useReranking?: boolean;
+  /** RRF constant k for rank fusion (default: 60) */
+  rrfK?: number;
 }
 
 export interface BatchInfo {
@@ -84,12 +96,20 @@ export interface CodeChunk {
 
 export interface SearchResult extends CodeChunk {
   score: number;
+  /** Individual scores from hybrid search */
+  vectorScore?: number;
+  bm25Score?: number;
+  rerankScore?: number;
 }
 
 export interface SearchOptions {
   maxResults?: number;
   fileTypes?: string[];
   excludeTests?: boolean;
+  /** Search mode: 'hybrid' (default), 'vector', or 'keyword' */
+  mode?: 'hybrid' | 'vector' | 'keyword';
+  /** Enable reranking for this search (overrides config) */
+  rerank?: boolean;
 }
 
 interface StoredMetadata {
@@ -122,6 +142,26 @@ interface IndexState {
   indexedAt: string;
   fileCount: number;
   chunkCount: number;
+  /** Embedding model used */
+  embeddingModel?: string;
+  /** Whether hybrid search index is available */
+  hasHybridIndex?: boolean;
+}
+
+/**
+ * BM25 index for keyword search
+ */
+interface BM25Index {
+  /** Document frequency for each term */
+  df: Map<string, number>;
+  /** Term frequency for each document */
+  tf: Map<number, Map<string, number>>;
+  /** Document lengths */
+  docLengths: Map<number, number>;
+  /** Average document length */
+  avgDocLength: number;
+  /** Total number of documents */
+  docCount: number;
 }
 
 // File extensions to index
@@ -175,14 +215,21 @@ const EXCLUDE_PATTERNS = [
   '**/_posts/**',
 ];
 
+// Default embedding model - BGE-small-en-v1.5 is better for retrieval than MiniLM
+const DEFAULT_EMBEDDING_MODEL = 'Xenova/bge-small-en-v1.5';
+// Fallback if BGE fails
+const FALLBACK_EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
+
 export class RAGSystem {
   private config: RAGConfig;
   private index: any = null;  // FAISS index
   private metadata: Map<number, StoredMetadata> = new Map();
-  private embeddingDimension = 384;  // all-MiniLM-L6-v2 dimension
+  private embeddingDimension = 384;  // BGE-small-en-v1.5 and MiniLM both use 384
   private documentCount = 0;
   private indexState: IndexState | null = null;
   private astChunker: ASTChunker;
+  private bm25Index: BM25Index | null = null;
+  private embeddingModelName: string;
 
   constructor(config: RAGConfig) {
     this.config = {
@@ -190,8 +237,13 @@ export class RAGSystem {
       chunkOverlap: 200,
       useASTChunking: true,  // Enable AST chunking by default
       extractDomainHints: true,  // Extract domain hints by default
+      useHybridSearch: true,  // Enable hybrid search by default
+      useReranking: false,  // Disable reranking by default (slower)
+      rrfK: 60,  // Standard RRF constant
       ...config
     };
+
+    this.embeddingModelName = this.config.embeddingModel || DEFAULT_EMBEDDING_MODEL;
 
     // Initialize AST chunker
     this.astChunker = new ASTChunker({
@@ -208,14 +260,41 @@ export class RAGSystem {
 
   /**
    * Initialize the embedding model (lazy loading)
+   * Uses BGE-small-en-v1.5 by default for better retrieval quality
    */
   private async getEmbeddingPipeline(): Promise<any> {
     if (!embeddingPipeline) {
-      console.log('  Loading embedding model (first run only)...');
-      // Use all-MiniLM-L6-v2 - small, fast, good quality for code search
-      embeddingPipeline = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
+      console.log(`  Loading embedding model: ${this.embeddingModelName}...`);
+      try {
+        embeddingPipeline = await pipeline('feature-extraction', this.embeddingModelName);
+        console.log(`  ✓ Loaded ${this.embeddingModelName}`);
+      } catch (err) {
+        console.warn(`  Failed to load ${this.embeddingModelName}, falling back to ${FALLBACK_EMBEDDING_MODEL}`);
+        this.embeddingModelName = FALLBACK_EMBEDDING_MODEL;
+        embeddingPipeline = await pipeline('feature-extraction', FALLBACK_EMBEDDING_MODEL);
+      }
     }
     return embeddingPipeline;
+  }
+
+  /**
+   * Initialize the reranking model (lazy loading)
+   * Uses a cross-encoder for more accurate relevance scoring
+   */
+  private async getRerankPipeline(): Promise<any> {
+    if (!rerankPipeline) {
+      console.log('  Loading reranking model...');
+      try {
+        // Use a text-classification pipeline for reranking
+        // This model scores query-document pairs for relevance
+        rerankPipeline = await pipeline('text-classification', 'Xenova/ms-marco-MiniLM-L-6-v2');
+        console.log('  ✓ Loaded reranking model');
+      } catch (err) {
+        console.warn('  Reranking model not available, skipping reranking');
+        rerankPipeline = null;
+      }
+    }
+    return rerankPipeline;
   }
 
   /**
@@ -252,12 +331,186 @@ export class RAGSystem {
   }
 
   /**
+   * Tokenize text for BM25 indexing
+   * Handles code-specific tokenization (camelCase, snake_case, etc.)
+   */
+  private tokenize(text: string): string[] {
+    // Convert to lowercase
+    const lower = text.toLowerCase();
+
+    // Split on whitespace and punctuation, but preserve some code patterns
+    const tokens = lower
+      // Split camelCase and PascalCase
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      // Split snake_case
+      .replace(/_/g, ' ')
+      // Split on common delimiters
+      .split(/[\s\.\,\;\:\!\?\(\)\[\]\{\}\<\>\=\+\-\*\/\&\|\^\~\`\"\'\#\@\$\%\\]+/)
+      // Filter out empty strings and very short tokens
+      .filter(t => t.length >= 2);
+
+    return tokens;
+  }
+
+  /**
+   * Build BM25 index from metadata
+   */
+  private buildBM25Index(): void {
+    const df = new Map<string, number>();
+    const tf = new Map<number, Map<string, number>>();
+    const docLengths = new Map<number, number>();
+    let totalLength = 0;
+
+    for (const [docId, meta] of this.metadata) {
+      // Combine content, name, documentation for indexing
+      const text = [
+        meta.content,
+        meta.name || '',
+        meta.documentation || '',
+        meta.domainContext || '',
+        meta.filePath
+      ].join(' ');
+
+      const tokens = this.tokenize(text);
+      const termFreq = new Map<string, number>();
+
+      for (const token of tokens) {
+        termFreq.set(token, (termFreq.get(token) || 0) + 1);
+      }
+
+      // Update document frequency
+      for (const term of termFreq.keys()) {
+        df.set(term, (df.get(term) || 0) + 1);
+      }
+
+      tf.set(docId, termFreq);
+      docLengths.set(docId, tokens.length);
+      totalLength += tokens.length;
+    }
+
+    this.bm25Index = {
+      df,
+      tf,
+      docLengths,
+      avgDocLength: this.metadata.size > 0 ? totalLength / this.metadata.size : 0,
+      docCount: this.metadata.size
+    };
+  }
+
+  /**
+   * Calculate BM25 score for a document given a query
+   * Uses standard BM25 parameters: k1=1.2, b=0.75
+   */
+  private calculateBM25Score(docId: number, queryTokens: string[]): number {
+    if (!this.bm25Index) return 0;
+
+    const k1 = 1.2;
+    const b = 0.75;
+    const { df, tf, docLengths, avgDocLength, docCount } = this.bm25Index;
+
+    const docTf = tf.get(docId);
+    if (!docTf) return 0;
+
+    const docLength = docLengths.get(docId) || 0;
+    let score = 0;
+
+    for (const term of queryTokens) {
+      const termDf = df.get(term) || 0;
+      const termTf = docTf.get(term) || 0;
+
+      if (termTf === 0) continue;
+
+      // IDF component
+      const idf = Math.log((docCount - termDf + 0.5) / (termDf + 0.5) + 1);
+
+      // TF component with length normalization
+      const tfNorm = (termTf * (k1 + 1)) /
+        (termTf + k1 * (1 - b + b * (docLength / avgDocLength)));
+
+      score += idf * tfNorm;
+    }
+
+    return score;
+  }
+
+  /**
+   * Reciprocal Rank Fusion (RRF) to combine multiple ranked lists
+   * RRF score = sum(1 / (k + rank_i)) for each list i
+   */
+  private reciprocalRankFusion(
+    rankedLists: Array<{ docId: number; score: number }[]>,
+    k: number = 60
+  ): Map<number, number> {
+    const fusedScores = new Map<number, number>();
+
+    for (const list of rankedLists) {
+      for (let rank = 0; rank < list.length; rank++) {
+        const { docId } = list[rank];
+        const rrfScore = 1 / (k + rank + 1);  // rank is 0-indexed
+        fusedScores.set(docId, (fusedScores.get(docId) || 0) + rrfScore);
+      }
+    }
+
+    return fusedScores;
+  }
+
+  /**
+   * Rerank results using a cross-encoder model
+   */
+  private async rerankResults(
+    query: string,
+    results: SearchResult[],
+    maxResults: number
+  ): Promise<SearchResult[]> {
+    const reranker = await this.getRerankPipeline();
+    if (!reranker || results.length === 0) return results;
+
+    try {
+      // Score each result with the cross-encoder
+      const scored: Array<{ result: SearchResult; rerankScore: number }> = [];
+
+      for (const result of results) {
+        // Create query-document pair
+        const docText = [
+          result.name || '',
+          result.documentation?.slice(0, 200) || '',
+          result.content.slice(0, 500)
+        ].join(' ');
+
+        try {
+          const output = await reranker(`${query} [SEP] ${docText}`);
+          // Extract score from classification output
+          const rerankScore = Array.isArray(output) && output[0]?.score
+            ? output[0].score
+            : 0;
+          scored.push({ result, rerankScore });
+        } catch {
+          scored.push({ result, rerankScore: 0 });
+        }
+      }
+
+      // Sort by rerank score
+      scored.sort((a, b) => b.rerankScore - a.rerankScore);
+
+      // Return top results with rerank scores
+      return scored.slice(0, maxResults).map(s => ({
+        ...s.result,
+        rerankScore: s.rerankScore
+      }));
+    } catch (err) {
+      console.warn('Reranking failed, returning original results:', err);
+      return results;
+    }
+  }
+
+  /**
    * Index the repository for semantic search
    */
   async indexRepository(): Promise<void> {
     const cachedIndexPath = path.join(this.config.storePath, 'index.faiss');
     const cachedMetaPath = path.join(this.config.storePath, 'metadata.json');
     const indexStatePath = path.join(this.config.storePath, 'index-state.json');
+    const bm25IndexPath = path.join(this.config.storePath, 'bm25-index.json');
 
     // Get current commit hash
     const currentCommit = await this.getCurrentCommitHash();
@@ -278,6 +531,34 @@ export class RAGSystem {
         } else {
           console.log(`Loaded cached index with ${this.documentCount} chunks`);
         }
+
+        // Build or load BM25 index for hybrid search
+        if (this.config.useHybridSearch) {
+          if (fs.existsSync(bm25IndexPath)) {
+            try {
+              const bm25Data = JSON.parse(fs.readFileSync(bm25IndexPath, 'utf-8'));
+              this.bm25Index = {
+                df: new Map(Object.entries(bm25Data.df)),
+                tf: new Map(Object.entries(bm25Data.tf).map(([k, v]: [string, any]) =>
+                  [parseInt(k), new Map(Object.entries(v))]
+                )),
+                docLengths: new Map(Object.entries(bm25Data.docLengths).map(([k, v]: [string, any]) =>
+                  [parseInt(k), v]
+                )),
+                avgDocLength: bm25Data.avgDocLength,
+                docCount: bm25Data.docCount
+              };
+              console.log('  ✓ Loaded BM25 index for hybrid search');
+            } catch {
+              console.log('  Building BM25 index...');
+              this.buildBM25Index();
+            }
+          } else {
+            console.log('  Building BM25 index...');
+            this.buildBM25Index();
+          }
+        }
+
         return;
       } catch (e) {
         console.warn('Could not load cached index, rebuilding...');
@@ -392,17 +673,46 @@ export class RAGSystem {
           'utf-8'
         );
 
+        // Build and save BM25 index for hybrid search
+        if (this.config.useHybridSearch) {
+          console.log('  Building BM25 index for hybrid search...');
+          this.buildBM25Index();
+
+          // Save BM25 index
+          if (this.bm25Index) {
+            const bm25Data = {
+              df: Object.fromEntries(this.bm25Index.df),
+              tf: Object.fromEntries(
+                Array.from(this.bm25Index.tf.entries()).map(([k, v]) =>
+                  [k.toString(), Object.fromEntries(v)]
+                )
+              ),
+              docLengths: Object.fromEntries(
+                Array.from(this.bm25Index.docLengths.entries()).map(([k, v]) =>
+                  [k.toString(), v]
+                )
+              ),
+              avgDocLength: this.bm25Index.avgDocLength,
+              docCount: this.bm25Index.docCount
+            };
+            fs.writeFileSync(bm25IndexPath, JSON.stringify(bm25Data), 'utf-8');
+            console.log('  ✓ BM25 index built and saved');
+          }
+        }
+
         // Save index state with commit hash
         this.indexState = {
           commitHash: currentCommit,
           indexedAt: new Date().toISOString(),
           fileCount: files.length,
-          chunkCount: chunksToIndex.length
+          chunkCount: chunksToIndex.length,
+          embeddingModel: this.embeddingModelName,
+          hasHybridIndex: this.config.useHybridSearch
         };
         fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
         this.documentCount = chunksToIndex.length;
-        console.log(`  ✓ Indexed ${this.documentCount} chunks with FAISS (commit ${currentCommit.slice(0, 7)})`);
+        console.log(`  ✓ Indexed ${this.documentCount} chunks with FAISS + BM25 (commit ${currentCommit.slice(0, 7)})`);
         return;
       }
     }
@@ -437,12 +747,18 @@ export class RAGSystem {
       'utf-8'
     );
 
+    // Build BM25 index even in fallback mode
+    console.log('  Building BM25 index...');
+    this.buildBM25Index();
+
     // Save index state with commit hash (even in fallback mode)
     this.indexState = {
       commitHash: currentCommit,
       indexedAt: new Date().toISOString(),
       fileCount: files.length,
-      chunkCount: chunksToIndex.length
+      chunkCount: chunksToIndex.length,
+      embeddingModel: this.embeddingModelName,
+      hasHybridIndex: true
     };
     fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
@@ -582,7 +898,7 @@ export class RAGSystem {
 
   /**
    * Generate embeddings for code chunks using local Transformers.js model
-   * Uses all-MiniLM-L6-v2 - a fast, high-quality embedding model
+   * Uses BGE-small-en-v1.5 by default for better retrieval quality
    *
    * When domain context is available, prepends it to improve retrieval quality
    * by making the embedding more semantically aware of the code's purpose.
@@ -662,19 +978,112 @@ export class RAGSystem {
   }
 
   /**
-   * Search the codebase for relevant code
+   * Search the codebase for relevant code using hybrid search
+   * Combines vector similarity (semantic) with BM25 (keyword) using RRF
    */
   async search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
     const maxResults = options.maxResults || 10;
+    const mode = options.mode || (this.config.useHybridSearch ? 'hybrid' : 'vector');
+    const shouldRerank = options.rerank ?? this.config.useReranking;
 
     if (this.metadata.size === 0) {
       return [];
     }
 
+    let results: SearchResult[] = [];
+
+    if (mode === 'keyword') {
+      // Pure keyword search using BM25
+      results = await this.searchBM25(query, options, maxResults * 2);
+    } else if (mode === 'vector' || !this.bm25Index) {
+      // Pure vector search
+      results = await this.searchVector(query, options, maxResults * 2);
+    } else {
+      // Hybrid search: combine vector and BM25 using RRF
+      const vectorResults = await this.searchVector(query, options, maxResults * 3);
+      const bm25Results = await this.searchBM25(query, options, maxResults * 3);
+
+      // Apply RRF to combine results
+      const k = this.config.rrfK || 60;
+      const fusedScores = this.reciprocalRankFusion(
+        [
+          vectorResults.map(r => ({ docId: this.getDocIdFromResult(r), score: r.score })),
+          bm25Results.map(r => ({ docId: this.getDocIdFromResult(r), score: r.score }))
+        ],
+        k
+      );
+
+      // Create map of vector and BM25 scores for each doc
+      const vectorScoreMap = new Map(
+        vectorResults.map(r => [this.getDocIdFromResult(r), r.score])
+      );
+      const bm25ScoreMap = new Map(
+        bm25Results.map(r => [this.getDocIdFromResult(r), r.score])
+      );
+
+      // Build final results
+      const allDocIds = new Set([
+        ...vectorResults.map(r => this.getDocIdFromResult(r)),
+        ...bm25Results.map(r => this.getDocIdFromResult(r))
+      ]);
+
+      for (const docId of allDocIds) {
+        const meta = this.metadata.get(docId);
+        if (!meta) continue;
+
+        // Apply filters
+        if (options.excludeTests && this.isTestFile(meta.filePath)) continue;
+        if (options.fileTypes && !options.fileTypes.some(ext => meta.filePath.endsWith(ext))) continue;
+
+        const fusedScore = fusedScores.get(docId) || 0;
+        results.push({
+          ...meta,
+          score: fusedScore,
+          vectorScore: vectorScoreMap.get(docId),
+          bm25Score: bm25ScoreMap.get(docId)
+        });
+      }
+
+      // Sort by fused score
+      results.sort((a, b) => b.score - a.score);
+      results = results.slice(0, maxResults * 2);
+    }
+
+    // Apply reranking if enabled
+    if (shouldRerank && results.length > 0) {
+      results = await this.rerankResults(query, results, maxResults);
+    } else {
+      results = results.slice(0, maxResults);
+    }
+
+    return results;
+  }
+
+  /**
+   * Get document ID from a search result
+   */
+  private getDocIdFromResult(result: SearchResult): number {
+    // Find the document ID by matching the id field
+    for (const [docId, meta] of this.metadata) {
+      if (meta.id === result.id) {
+        return docId;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Vector-only search using FAISS
+   */
+  private async searchVector(
+    query: string,
+    options: SearchOptions,
+    maxResults: number
+  ): Promise<SearchResult[]> {
+    const results: SearchResult[] = [];
+
     // Generate query embedding using local model
     const queryEmbedding = await this.generateSingleEmbedding(query);
-
-    let results: SearchResult[] = [];
 
     if (this.index && faiss) {
       // FAISS search - pass flat array (faiss-node expects flat, not nested)
@@ -695,22 +1104,20 @@ export class RAGSystem {
 
         results.push({
           ...meta,
-          score: distances[i]
+          score: distances[i],
+          vectorScore: distances[i]
         });
 
         if (results.length >= maxResults) break;
       }
     } else {
-      // Fallback: simple keyword matching
-      const queryTerms = query.toLowerCase().split(/\s+/);
-
-      const scored: Array<{ meta: StoredMetadata; score: number }> = [];
-      for (const [, meta] of this.metadata) {
-        // Apply filters
+      // Fallback: cosine similarity computation
+      for (const [docId, meta] of this.metadata) {
         if (options.excludeTests && this.isTestFile(meta.filePath)) continue;
         if (options.fileTypes && !options.fileTypes.some(ext => meta.filePath.endsWith(ext))) continue;
 
-        // Simple relevance score
+        // Simple fallback - use keyword matching as approximation
+        const queryTerms = query.toLowerCase().split(/\s+/);
         const content = meta.content.toLowerCase();
         let score = 0;
         for (const term of queryTerms) {
@@ -719,20 +1126,52 @@ export class RAGSystem {
         }
 
         if (score > 0) {
-          scored.push({ meta, score });
+          results.push({ ...meta, score, vectorScore: score });
         }
       }
 
-      // Sort by score descending
-      scored.sort((a, b) => b.score - a.score);
-
-      results = scored.slice(0, maxResults).map(s => ({
-        ...s.meta,
-        score: s.score
-      }));
+      results.sort((a, b) => b.score - a.score);
     }
 
-    return results;
+    return results.slice(0, maxResults);
+  }
+
+  /**
+   * BM25-only keyword search
+   */
+  private async searchBM25(
+    query: string,
+    options: SearchOptions,
+    maxResults: number
+  ): Promise<SearchResult[]> {
+    const results: SearchResult[] = [];
+
+    // Ensure BM25 index exists
+    if (!this.bm25Index) {
+      this.buildBM25Index();
+    }
+
+    const queryTokens = this.tokenize(query);
+
+    for (const [docId, meta] of this.metadata) {
+      // Apply filters
+      if (options.excludeTests && this.isTestFile(meta.filePath)) continue;
+      if (options.fileTypes && !options.fileTypes.some(ext => meta.filePath.endsWith(ext))) continue;
+
+      const score = this.calculateBM25Score(docId, queryTokens);
+      if (score > 0) {
+        results.push({
+          ...meta,
+          score,
+          bm25Score: score
+        });
+      }
+    }
+
+    // Sort by BM25 score descending
+    results.sort((a, b) => b.score - a.score);
+
+    return results.slice(0, maxResults);
   }
 
   /**
@@ -804,6 +1243,17 @@ export class RAGSystem {
    */
   getDocumentCount(): number {
     return this.documentCount;
+  }
+
+  /**
+   * Get search configuration info
+   */
+  getSearchConfig(): { hybridEnabled: boolean; rerankEnabled: boolean; embeddingModel: string } {
+    return {
+      hybridEnabled: this.config.useHybridSearch || false,
+      rerankEnabled: this.config.useReranking || false,
+      embeddingModel: this.embeddingModelName
+    };
   }
 
   /**
@@ -929,6 +1379,7 @@ export class RAGSystem {
   async loadMetadataOnly(): Promise<void> {
     const mainMetaPath = path.join(this.config.storePath, 'metadata.json');
     const cachedIndexPath = path.join(this.config.storePath, 'index.faiss');
+    const bm25IndexPath = path.join(this.config.storePath, 'bm25-index.json');
 
     if (!fs.existsSync(mainMetaPath)) {
       console.warn('No metadata found to load');
@@ -946,10 +1397,35 @@ export class RAGSystem {
         this.index = faiss.IndexFlatIP.read(cachedIndexPath);
         console.log(`  Loaded FAISS index with ${this.documentCount} chunks`);
       } catch (e) {
-        console.log(`  FAISS index not available, using keyword search (${this.documentCount} chunks)`);
+        console.log(`  FAISS index not available, using hybrid/keyword search (${this.documentCount} chunks)`);
       }
     } else {
       console.log(`  Loaded ${this.documentCount} chunks (keyword search mode)`);
+    }
+
+    // Load or build BM25 index
+    if (this.config.useHybridSearch) {
+      if (fs.existsSync(bm25IndexPath)) {
+        try {
+          const bm25Data = JSON.parse(fs.readFileSync(bm25IndexPath, 'utf-8'));
+          this.bm25Index = {
+            df: new Map(Object.entries(bm25Data.df)),
+            tf: new Map(Object.entries(bm25Data.tf).map(([k, v]: [string, any]) =>
+              [parseInt(k), new Map(Object.entries(v))]
+            )),
+            docLengths: new Map(Object.entries(bm25Data.docLengths).map(([k, v]: [string, any]) =>
+              [parseInt(k), v]
+            )),
+            avgDocLength: bm25Data.avgDocLength,
+            docCount: bm25Data.docCount
+          };
+          console.log('  ✓ Loaded BM25 index');
+        } catch {
+          this.buildBM25Index();
+        }
+      } else {
+        this.buildBM25Index();
+      }
     }
   }
 
@@ -960,6 +1436,7 @@ export class RAGSystem {
     const mainMetaPath = path.join(this.config.storePath, 'metadata.json');
     const cachedIndexPath = path.join(this.config.storePath, 'index.faiss');
     const indexStatePath = path.join(this.config.storePath, 'index-state.json');
+    const bm25IndexPath = path.join(this.config.storePath, 'bm25-index.json');
 
     if (!fs.existsSync(mainMetaPath)) {
       console.warn('No metadata found to finalize');
@@ -971,6 +1448,28 @@ export class RAGSystem {
     this.documentCount = this.metadata.size;
 
     console.log(`  Finalizing index with ${this.documentCount} chunks...`);
+
+    // Build BM25 index
+    console.log('  Building BM25 index...');
+    this.buildBM25Index();
+    if (this.bm25Index) {
+      const bm25Data = {
+        df: Object.fromEntries(this.bm25Index.df),
+        tf: Object.fromEntries(
+          Array.from(this.bm25Index.tf.entries()).map(([k, v]) =>
+            [k.toString(), Object.fromEntries(v)]
+          )
+        ),
+        docLengths: Object.fromEntries(
+          Array.from(this.bm25Index.docLengths.entries()).map(([k, v]) =>
+            [k.toString(), v]
+          )
+        ),
+        avgDocLength: this.bm25Index.avgDocLength,
+        docCount: this.bm25Index.docCount
+      };
+      fs.writeFileSync(bm25IndexPath, JSON.stringify(bm25Data), 'utf-8');
+    }
 
     if (!faiss || this.documentCount === 0) {
       console.log('  Using keyword search mode (FAISS not available or no chunks)');
@@ -1000,11 +1499,13 @@ export class RAGSystem {
         commitHash: currentCommit,
         indexedAt: new Date().toISOString(),
         fileCount: new Set(chunks.map(c => (c as any).filePath)).size,
-        chunkCount: this.documentCount
+        chunkCount: this.documentCount,
+        embeddingModel: this.embeddingModelName,
+        hasHybridIndex: true
       };
       fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
-      console.log(`  ✓ Finalized FAISS index with ${this.documentCount} chunks`);
+      console.log(`  ✓ Finalized FAISS + BM25 index with ${this.documentCount} chunks`);
     } catch (err) {
       console.warn(`  FAISS indexing failed, using keyword search: ${err}`);
     }
@@ -1026,6 +1527,7 @@ export class RAGSystem {
     const cachedIndexPath = path.join(this.config.storePath, 'index.faiss');
     const cachedMetaPath = path.join(this.config.storePath, 'metadata.json');
     const indexStatePath = path.join(this.config.storePath, 'index-state.json');
+    const bm25IndexPath = path.join(this.config.storePath, 'bm25-index.json');
 
     // Load existing metadata
     if (!fs.existsSync(cachedMetaPath)) {
@@ -1169,6 +1671,28 @@ export class RAGSystem {
           'utf-8'
         );
 
+        // Rebuild BM25 index
+        console.log('  Rebuilding BM25 index...');
+        this.buildBM25Index();
+        if (this.bm25Index) {
+          const bm25Data = {
+            df: Object.fromEntries(this.bm25Index.df),
+            tf: Object.fromEntries(
+              Array.from(this.bm25Index.tf.entries()).map(([k, v]) =>
+                [k.toString(), Object.fromEntries(v)]
+              )
+            ),
+            docLengths: Object.fromEntries(
+              Array.from(this.bm25Index.docLengths.entries()).map(([k, v]) =>
+                [k.toString(), v]
+              )
+            ),
+            avgDocLength: this.bm25Index.avgDocLength,
+            docCount: this.bm25Index.docCount
+          };
+          fs.writeFileSync(bm25IndexPath, JSON.stringify(bm25Data), 'utf-8');
+        }
+
         // Update index state
         const currentCommit = await this.getCurrentCommitHash();
         const uniqueFiles = new Set(allChunks.map(c => c.filePath));
@@ -1177,7 +1701,9 @@ export class RAGSystem {
           commitHash: currentCommit,
           indexedAt: new Date().toISOString(),
           fileCount: uniqueFiles.size,
-          chunkCount: allChunks.length
+          chunkCount: allChunks.length,
+          embeddingModel: this.embeddingModelName,
+          hasHybridIndex: true
         };
         fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
@@ -1223,6 +1749,9 @@ export class RAGSystem {
       'utf-8'
     );
 
+    // Build BM25 index
+    this.buildBM25Index();
+
     const currentCommit = await this.getCurrentCommitHash();
     const uniqueFiles = new Set(allChunks.map(c => c.filePath));
 
@@ -1230,7 +1759,9 @@ export class RAGSystem {
       commitHash: currentCommit,
       indexedAt: new Date().toISOString(),
       fileCount: uniqueFiles.size,
-      chunkCount: allChunks.length
+      chunkCount: allChunks.length,
+      embeddingModel: this.embeddingModelName,
+      hasHybridIndex: true
     };
     fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
