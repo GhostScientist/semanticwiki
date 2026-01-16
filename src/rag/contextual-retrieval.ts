@@ -138,10 +138,10 @@ export class ContextualRetrieval {
       console.log('  Initializing bundled local LLM for contextual retrieval...');
       try {
         const { createLLMProvider } = await import('../llm/index.js');
+        // Don't pass localModel - let it use the default gpt-oss model
         this.localProvider = await createLLMProvider({
           fullLocal: true,
-          modelFamily: 'gpt-oss',  // Only gpt-oss is currently supported
-          localModel: this.config.localModel,
+          modelFamily: 'gpt-oss',
         });
         console.log(`  Using bundled local LLM for contextual retrieval`);
       } catch (error) {
