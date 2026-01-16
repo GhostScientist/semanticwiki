@@ -217,7 +217,7 @@ describe('Chat Client Scripts', () => {
   });
 
   describe('Keyword Search Fallback', () => {
-    const scripts = getClientScripts({ aiChat: true });
+    const scripts = getClientScripts({ aiChat: true, search: true });
 
     it('should fallback to keyword search', () => {
       expect(scripts).toContain('state.searchIndex');
@@ -249,7 +249,7 @@ describe('Chat Client Scripts', () => {
 
     it('should include system prompt', () => {
       expect(scripts).toContain('documentation assistant');
-      expect(scripts).toContain('Be concise, accurate');
+      expect(scripts).toContain('Answer the user');
     });
 
     it('should format prompt with SmolLM2 chat template', () => {
@@ -271,7 +271,8 @@ describe('Chat Client Scripts', () => {
 
     it('should handle intelligent fallback response', () => {
       expect(scripts).toContain("generateIntelligentFallback");
-      expect(scripts).toContain("Here\\'s what I found");
+      // Fallback extracts relevant content from context using scored sentences
+      expect(scripts).toContain("scoredSentences");
     });
 
     it('should provide no-result fallback', () => {

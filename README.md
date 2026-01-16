@@ -136,6 +136,57 @@ ted-mosby continue -r ./my-project -o ./wiki --verify-only
 ted-mosby continue -r ./my-project -o ./wiki --skip-index
 ```
 
+### Search Command
+
+Search your wiki from the command line:
+
+```bash
+# Search wiki content
+ted-mosby search "authentication flow" -w ./wiki
+
+# Hybrid search (keyword + semantic)
+ted-mosby search "how does login work" -w ./wiki --hybrid
+```
+
+### MCP Server
+
+Start an MCP server for AI assistant integration (Claude Desktop, Claude Code):
+
+```bash
+# Start MCP server for a wiki
+ted-mosby mcp-server -w ./wiki
+
+# With code search (requires RAG index)
+ted-mosby mcp-server -w ./wiki -r ./my-project
+```
+
+Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "my-wiki": {
+      "command": "ted-mosby",
+      "args": ["mcp-server", "-w", "/path/to/wiki"]
+    }
+  }
+}
+```
+
+### Pack & Unpack
+
+Create portable wiki packages for sharing:
+
+```bash
+# Create package (includes wiki + RAG index)
+ted-mosby pack -w ./wiki -o ./my-wiki.archiwiki
+
+# Extract package
+ted-mosby unpack -p ./my-wiki.archiwiki -o ./extracted
+
+# Extract wiki only (no RAG index)
+ted-mosby unpack -p ./my-wiki.archiwiki -o ./extracted --wiki-only
+```
+
 ### Large Codebase Options
 
 For repositories with 10,000+ files:
@@ -191,6 +242,7 @@ ted-mosby generate -r ./my-project --max-turns 50
 | `-v, --verbose` | Show detailed progress | - |
 | `-e, --estimate` | Estimate time/cost (dry run) | - |
 | `-s, --site` | Generate interactive static site | - |
+| `--ai-chat` | Add AI chat assistant to site | - |
 | `--site-only` | Generate site only (skip wiki) | - |
 | `--site-title <title>` | Custom site title | Project name |
 | `--theme <theme>` | Site theme: `light`, `dark`, `auto` | `auto` |
@@ -214,6 +266,39 @@ ted-mosby generate -r ./my-project --max-turns 50
 | `--direct-api` | Use Anthropic API directly | - |
 | `--max-turns <n>` | Limit agent iterations | `200` |
 
+### `search` - Search wiki content
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `<query>` | Search query (required) | - |
+| `-w, --wiki <dir>` | Wiki directory | `./wiki` |
+| `-n, --limit <n>` | Max results | `10` |
+| `--hybrid` | Use hybrid search (keyword + semantic) | - |
+
+### `mcp-server` - Start MCP server
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-w, --wiki <dir>` | Wiki directory (required) | - |
+| `-r, --repo <path>` | Repository path (enables code search) | - |
+
+### `pack` - Create wiki package
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-w, --wiki <dir>` | Wiki directory (required) | - |
+| `-o, --output <file>` | Output package path | `<name>.archiwiki` |
+| `-n, --name <name>` | Package name | wiki folder name |
+| `--no-rag` | Exclude RAG index | - |
+
+### `unpack` - Extract wiki package
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-p, --package <file>` | Package file (required) | - |
+| `-o, --output <dir>` | Output directory | `.` |
+| `--wiki-only` | Extract wiki only (no RAG index) | - |
+
 ---
 
 ## Static Site Features
@@ -221,12 +306,27 @@ ted-mosby generate -r ./my-project --max-turns 50
 When you use `--site`, Ted Mosby generates a fully interactive documentation site:
 
 - **Full-text search** - Instant search across all pages (Cmd/Ctrl+K)
+- **AI Chat Assistant** - Ask questions about your codebase (`--ai-chat`)
 - **Keyboard navigation** - Arrow keys, vim-style (j/k/h/l)
 - **Dark/light mode** - Respects system preference or manual toggle
 - **Table of contents** - Auto-generated from headings
 - **Mobile responsive** - Works on all devices
-- **Offline capable** - No server required
+- **Offline capable** - No server required, AI runs client-side
 - **Mermaid diagrams** - Rendered automatically
+
+### AI Chat (`--ai-chat`)
+
+Add an interactive AI assistant to your documentation site:
+
+```bash
+ted-mosby generate -r ./my-project --site --ai-chat
+```
+
+The chat assistant:
+- Runs entirely in the browser (SmolLM2 via transformers.js)
+- Searches your docs semantically to answer questions
+- Works offline after initial model download
+- Includes "codemap" mode for architecture visualization
 
 ---
 
@@ -322,15 +422,16 @@ Create a `wiki.json` file in your project root to customize generation:
 
 ## Technical Details
 
-### RAG Chunking System
+### RAG & Hybrid Search System
 
-Ted Mosby uses a sophisticated RAG (Retrieval Augmented Generation) system:
+Ted Mosby uses a sophisticated retrieval system combining multiple strategies:
 
 - **Chunk size**: 1,500 characters with 200 character overlap
 - **Language-aware boundaries**: Chunks end at logical points (`}`, `};`, `end`)
-- **Embedding model**: `all-MiniLM-L6-v2` (384 dimensions, runs locally)
+- **Embedding model**: `BGE-small-en-v1.5` (384 dimensions, runs locally)
+- **Hybrid search**: BM25 keyword + vector similarity with RRF fusion
 - **Vector search**: FAISS with `IndexFlatIP` for cosine similarity
-- **Fallback**: Keyword search when FAISS unavailable
+- **Incremental updates**: Only re-embeds changed files on subsequent runs
 
 ### Chunk Prioritization
 

@@ -2,6 +2,60 @@
 
 All notable changes to ted-mosby will be documented in this file.
 
+## [1.2.0] - 2026-01-16
+
+### Added
+
+#### AI Chat in Static Sites (`--ai-chat`)
+Interactive AI assistant embedded in generated sites:
+- Client-side SmolLM2 model via transformers.js (works offline)
+- Semantic search using page embeddings
+- Intelligent fallback responses when model unavailable
+- Codemap visualization mode for architecture questions
+
+#### Hybrid Search System
+Advanced retrieval combining multiple search strategies:
+- **BM25 keyword search** for exact term matching
+- **Vector similarity** with BGE-small-en-v1.5 embeddings (better than MiniLM)
+- **Reciprocal Rank Fusion (RRF)** to combine results
+- Optional cross-encoder reranking for precision
+
+#### MCP Wiki Server (`ted-mosby mcp-server`)
+Model Context Protocol server for AI assistant integration:
+- `search_wiki` - Semantic search across documentation
+- `get_wiki_page` - Retrieve full page content
+- `list_wiki_pages` - Browse available pages
+- `search_code` - RAG-powered code search
+- `get_architecture_overview` - Quick architecture summary
+
+#### Portable Package Format (`ted-mosby pack/unpack`)
+Bundle wikis with RAG indexes for sharing:
+- `.archiwiki` compressed format with manifest
+- Includes wiki content + embeddings + BM25 index
+- Extract wiki-only or full package
+
+#### New CLI Commands
+- `ted-mosby search <query>` - Search wiki from command line
+- `ted-mosby mcp-server` - Start MCP server for AI assistants
+- `ted-mosby pack` - Create portable wiki package
+- `ted-mosby unpack` - Extract wiki package
+
+#### Incremental Embedding Updates
+- Tracks file changes via content hashing
+- Only re-embeds modified files on subsequent runs
+- Stores index state for efficient updates
+
+### Changed
+- Site title now derived from wiki index page (not folder name)
+- Upgraded embedding model from MiniLM to BGE-small-en-v1.5
+- Chat panel hides TOC for better space utilization
+- Improved dark mode styling for chat interface
+
+### Fixed
+- Chat response formatting (no more malformed markdown links)
+- Reduced repetition in chat "Related pages" section
+- Title duplication in generated pages
+
 ## [1.1.2] - 2026-01-10
 
 ### Changed

@@ -1650,6 +1650,9 @@ export function getClientScripts(features: Features): string {
     // Inline code
     formatted = formatted.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
 
+    // Markdown links [text](url)
+    formatted = formatted.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2">$1</a>');
+
     // Bold and italic
     formatted = formatted
       .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
@@ -2201,7 +2204,7 @@ export function getClientScripts(features: Features): string {
     // If we have the model, use it for real inference
     if (chatState.generator) {
       try {
-        const systemPrompt = 'You are a helpful documentation assistant for this project. Answer based on the documentation below. Be concise, accurate, and helpful. Reference specific sections when relevant. If unsure, say so.\\n\\n' + contextText;
+        const systemPrompt = 'You are a documentation assistant. Answer the user\\'s question directly based on the context below. Provide a clear, informative answer in 2-4 sentences. Do not mention "the documentation" - just answer naturally as if you know the project.\\n\\nContext:\\n' + contextText;
 
         // Format prompt using SmolLM2 chat template
         const formattedPrompt = formatChatPrompt(
@@ -2262,30 +2265,33 @@ export function getClientScripts(features: Features): string {
     const questionLower = question.toLowerCase();
     const topResult = context[0];
 
-    // Detect question type for better response framing
-    const isHowQuestion = /^how/i.test(question);
-    const isWhatQuestion = /^what/i.test(question);
-    const isWhyQuestion = /^why/i.test(question);
-    const isWhereQuestion = /^where/i.test(question);
-
-    let answer = '';
-
-    // Frame the response based on question type
-    if (isHowQuestion) {
-      answer = 'Here\\'s how this works based on the documentation:\\n\\n';
-    } else if (isWhatQuestion) {
-      answer = 'Based on the documentation:\\n\\n';
-    } else if (isWhyQuestion) {
-      answer = 'According to the documentation, the reason is:\\n\\n';
-    } else if (isWhereQuestion) {
-      answer = 'You can find this in:\\n\\n';
-    } else {
-      answer = 'Here\\'s what I found in the documentation:\\n\\n';
+    // Helper to clean markdown from text
+    function cleanMarkdown(text) {
+      return text
+        .replace(/^#+\\s+[^\\n]*/gm, '') // Remove markdown headers
+        .replace(/\\[([^\\]]+)\\]\\([^)]+\\)/g, '$1') // [text](url) -> text
+        .replace(/\\*\\*([^*]+)\\*\\*/g, '$1') // **bold** -> bold
+        .replace(/\\*([^*]+)\\*/g, '$1') // *italic* -> italic
+        .replace(/\\\`([^\\\`]+)\\\`/g, '$1') // \`code\` -> code
+        .replace(/\\n{3,}/g, '\\n\\n') // Multiple newlines -> double
+        .trim();
     }
 
-    // Extract relevant sentences using keyword matching
-    const sentences = topResult.content.split(/[.!?]+/).filter(s => s.trim().length > 20);
-    const questionWords = questionLower.split(/\\s+/).filter(w => w.length > 3);
+    // Extract key terms from the question
+    const stopWords = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'what', 'how', 'why', 'where', 'when', 'which', 'who', 'this', 'that', 'these', 'those', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'you', 'do', 'run', 'can', 'does']);
+    const questionWords = questionLower
+      .replace(/[^a-z0-9\\s]/g, '')
+      .split(/\\s+/)
+      .filter(w => w.length > 2 && !stopWords.has(w));
+
+    // Clean the content first
+    const cleanContent = cleanMarkdown(topResult.content);
+
+    // Split into sentences
+    const sentences = cleanContent
+      .split(/(?<=[.!?])\\s+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 15 && s.length < 500);
 
     // Score sentences by relevance
     const scoredSentences = sentences.map(s => {
@@ -2294,31 +2300,36 @@ export function getClientScripts(features: Features): string {
       for (const word of questionWords) {
         if (sLower.includes(word)) score += 1;
       }
-      return { text: s.trim(), score };
-    }).filter(s => s.score > 0).sort((a, b) => b.score - a.score);
+      return { text: s, score };
+    }).sort((a, b) => b.score - a.score);
 
-    // Build response from top sentences
-    if (scoredSentences.length > 0) {
-      const topSentences = scoredSentences.slice(0, 3).map(s => s.text);
-      answer += '**From "' + topResult.title + '":**\\n';
-      answer += topSentences.join('. ') + '.';
+    // Build answer from best sentences
+    let answer = '';
+    const relevantSentences = scoredSentences.filter(s => s.score > 0).slice(0, 3);
+
+    if (relevantSentences.length > 0) {
+      answer = relevantSentences.map(s => s.text).join(' ');
     } else {
-      // No good matches, show summary of top result
-      answer += '**' + topResult.title + '** covers this topic.\\n\\n';
-      answer += sentences.slice(0, 2).join('. ') + '.';
+      // No matches - use first few sentences as overview
+      answer = sentences.slice(0, 2).join(' ');
     }
 
-    // Add additional context from other results
+    // Ensure answer doesn't end abruptly
+    if (answer && !answer.match(/[.!?]$/)) {
+      answer += '.';
+    }
+
+    // Add source - just the title, clean
+    answer += '\\n\\n*Source: ' + topResult.title + '*';
+
+    // Add related pages (skip the first one since we just showed it)
     if (context.length > 1) {
-      answer += '\\n\\n**Related documentation:**\\n';
-      for (let i = 1; i < Math.min(context.length, 3); i++) {
-        answer += '- **' + context[i].title + '**: ';
-        const firstSentence = context[i].content.split(/[.!?]/)[0];
-        answer += firstSentence.trim().slice(0, 100) + '...\\n';
+      answer += '\\n\\n**Related pages:**';
+      for (let i = 1; i < Math.min(context.length, 4); i++) {
+        const ctx = context[i];
+        answer += '\\n- ' + ctx.title;
       }
     }
-
-    answer += '\\n\\nSee the linked sources above for complete details.';
 
     return answer;
   }
