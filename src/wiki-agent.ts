@@ -1207,9 +1207,20 @@ Create all ${missingPages.length} missing pages now.`;
     // Phase 3: Initialize local LLM provider
     yield { type: 'phase', message: 'Initializing local LLM', progress: 15 };
 
-    let provider: LLMProvider;
-    try {
-      provider = await createLLMProvider({
+    let provider: LLMProvider | null = null;
+    let pagesSinceProviderInit = 0;
+    const PROVIDER_RESET_THRESHOLD = 15; // Reset before hitting 20 sequence limit
+
+    // Helper to (re)initialize provider
+    const initializeProvider = async (): Promise<LLMProvider> => {
+      if (provider && 'shutdown' in provider) {
+        try {
+          await (provider as any).shutdown();
+        } catch {
+          // Ignore shutdown errors
+        }
+      }
+      const newProvider = await createLLMProvider({
         fullLocal: true,
         useOllama: options.useOllama,
         ollamaHost: options.ollamaHost,
@@ -1221,6 +1232,13 @@ Create all ${missingPages.length} missing pages now.`;
         threads: options.threads,
         verbose: options.verbose,
       });
+      provider = newProvider;
+      pagesSinceProviderInit = 0;
+      return newProvider;
+    };
+
+    try {
+      provider = await initializeProvider();
     } catch (error) {
       const err = error as Error;
       yield { type: 'error', message: `Failed to initialize local LLM: ${err.message}` };
@@ -1260,8 +1278,19 @@ Create all ${missingPages.length} missing pages now.`;
 
       console.log(`\n[Local] ─── Page ${pagesGenerated + 1}/${pagesToGenerate.length}: ${pageSpec.title} ───`);
 
+      // Check if we need to reinitialize provider before hitting sequence limit
+      if (pagesSinceProviderInit >= PROVIDER_RESET_THRESHOLD) {
+        console.log(`[Local] Resetting LLM provider (${pagesSinceProviderInit} pages since last reset)...`);
+        try {
+          await initializeProvider();
+        } catch (error) {
+          console.error(`[Local] Failed to reinitialize provider: ${(error as Error).message}`);
+        }
+      }
+
       try {
         const content = await this.generateSinglePage(provider, pageSpec, pagesToGenerate, options);
+        pagesSinceProviderInit++;
 
         if (content) {
           // Write the page
@@ -1281,8 +1310,36 @@ Create all ${missingPages.length} missing pages now.`;
         }
       } catch (error) {
         const err = error as Error;
-        console.error(`[Local] ✗ Failed: ${pageSpec.title} - ${err.message}`);
-        pagesFailed++;
+        // Handle sequence exhaustion - reinitialize and retry once
+        if (err.message.includes('No sequences left')) {
+          console.log(`[Local] Sequence exhausted, reinitializing provider and retrying...`);
+          try {
+            await initializeProvider();
+            const content = await this.generateSinglePage(provider, pageSpec, pagesToGenerate, options);
+            pagesSinceProviderInit++;
+
+            if (content) {
+              const pagePath = path.join(this.outputDir, pageSpec.filename);
+              const pageDir = path.dirname(pagePath);
+              if (!fs.existsSync(pageDir)) {
+                fs.mkdirSync(pageDir, { recursive: true });
+              }
+              fs.writeFileSync(pagePath, content, 'utf-8');
+              console.log(`[Local] ✓ Generated (after retry): ${pageSpec.filename}`);
+              pagesGenerated++;
+              yield { type: 'file', message: pageSpec.filename, detail: pageSpec.title };
+            } else {
+              console.log(`[Local] ⚠ Empty content for: ${pageSpec.title}`);
+              pagesFailed++;
+            }
+          } catch (retryError) {
+            console.error(`[Local] ✗ Failed after retry: ${pageSpec.title} - ${(retryError as Error).message}`);
+            pagesFailed++;
+          }
+        } else {
+          console.error(`[Local] ✗ Failed: ${pageSpec.title} - ${err.message}`);
+          pagesFailed++;
+        }
       }
     }
 
@@ -1327,6 +1384,16 @@ Create all ${missingPages.length} missing pages now.`;
 
         console.log(`[Local] ─── Generating missing page: ${pageTitle} ───`);
 
+        // Check if we need to reinitialize provider
+        if (pagesSinceProviderInit >= PROVIDER_RESET_THRESHOLD) {
+          console.log(`[Local] Resetting LLM provider (${pagesSinceProviderInit} pages since last reset)...`);
+          try {
+            await initializeProvider();
+          } catch (error) {
+            console.error(`[Local] Failed to reinitialize provider: ${(error as Error).message}`);
+          }
+        }
+
         // Find broken links that reference this page to get context
         const referencingLinks = verification.brokenLinks.filter(l => l.resolvedTarget === missingFile);
         const linkContexts = referencingLinks.map(l => l.linkText).join(', ');
@@ -1354,6 +1421,7 @@ Create all ${missingPages.length} missing pages now.`;
             [...pagesToGenerate, missingPageSpec],
             options
           );
+          pagesSinceProviderInit++;
 
           if (content) {
             const pagePath = path.join(this.outputDir, missingFile);
@@ -1370,8 +1438,41 @@ Create all ${missingPages.length} missing pages now.`;
             yield { type: 'file', message: missingFile, detail: pageTitle };
           }
         } catch (error) {
-          console.error(`[Local] ✗ Failed to generate missing page: ${missingFile}`);
-          pagesFailed++;
+          const err = error as Error;
+          // Handle sequence exhaustion
+          if (err.message.includes('No sequences left')) {
+            console.log(`[Local] Sequence exhausted, reinitializing provider and retrying...`);
+            try {
+              await initializeProvider();
+              const content = await this.generateSinglePage(
+                provider,
+                missingPageSpec,
+                [...pagesToGenerate, missingPageSpec],
+                options
+              );
+              pagesSinceProviderInit++;
+
+              if (content) {
+                const pagePath = path.join(this.outputDir, missingFile);
+                const pageDir = path.dirname(pagePath);
+                if (!fs.existsSync(pageDir)) {
+                  fs.mkdirSync(pageDir, { recursive: true });
+                }
+                fs.writeFileSync(pagePath, content, 'utf-8');
+                console.log(`[Local] ✓ Generated missing page (after retry): ${missingFile}`);
+                pagesGenerated++;
+                generatedFilenames.add(missingFile);
+                pagesToGenerate.push(missingPageSpec);
+                yield { type: 'file', message: missingFile, detail: pageTitle };
+              }
+            } catch (retryError) {
+              console.error(`[Local] ✗ Failed to generate missing page after retry: ${missingFile}`);
+              pagesFailed++;
+            }
+          } else {
+            console.error(`[Local] ✗ Failed to generate missing page: ${missingFile}`);
+            pagesFailed++;
+          }
         }
       }
     }
