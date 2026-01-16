@@ -1432,9 +1432,9 @@ program
 // Package command - create portable wiki package
 program
   .command('pack')
-  .description('Create a portable .archiwiki package from wiki directory')
+  .description('Create a portable .semantics package from wiki directory')
   .option('-o, --output <dir>', 'Wiki directory to package', './wiki')
-  .option('-f, --file <path>', 'Output package file path (default: wiki name + .archiwiki)')
+  .option('-f, --file <path>', 'Output package file path (default: wiki name + .semantics)')
   .option('-n, --name <name>', 'Package name')
   .option('-d, --description <text>', 'Package description')
   .option('--source-repo <url>', 'Source repository URL')
@@ -1448,11 +1448,11 @@ program
         process.exit(1);
       }
 
-      console.log(chalk.cyan.bold('\n📦 Creating ArchiWiki Package\n'));
+      console.log(chalk.cyan.bold('\n📦 Creating SemanticWiki Package\n'));
 
       const { createPackage } = await import('./package-format.js');
 
-      const outputPath = options.file || path.join(path.dirname(wikiDir), `${path.basename(wikiDir)}.archiwiki`);
+      const outputPath = options.file || path.join(path.dirname(wikiDir), `${path.basename(wikiDir)}.semantics`);
 
       await createPackage({
         wikiPath: wikiDir,
@@ -1473,8 +1473,8 @@ program
 // Unpack command - extract portable wiki package
 program
   .command('unpack')
-  .description('Extract an .archiwiki package to a directory')
-  .argument('<package>', 'Path to .archiwiki package file')
+  .description('Extract a .semantics package to a directory')
+  .argument('<package>', 'Path to .semantics package file')
   .option('-o, --output <dir>', 'Output directory', '.')
   .option('--wiki-only', 'Extract only wiki files, skip RAG index')
   .option('--info', 'Show package info without extracting')
@@ -1524,7 +1524,7 @@ program
         return;
       }
 
-      console.log(chalk.cyan.bold('\n📦 Extracting ArchiWiki Package\n'));
+      console.log(chalk.cyan.bold('\n📦 Extracting SemanticWiki Package\n'));
 
       const manifest = await extractPackage({
         packagePath: pkgPath,
