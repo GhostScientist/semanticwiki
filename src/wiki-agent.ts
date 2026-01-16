@@ -1368,13 +1368,19 @@ Create all ${missingPages.length} missing pages now.`;
     const allFiles = await this.gatherProjectFiles(this.repoPath);
     console.log(`[Local] Gathered ${allFiles.length} project files for LLM analysis`);
 
-    // 2. Build a compact representation for the LLM
+    // 2. Calculate minimum pages based on source file count
+    const docExtensions = new Set(['.md', '.txt', '.rst', '.adoc']);
+    const sourceFiles = allFiles.filter(f => !docExtensions.has(f.extension));
+    const minPages = Math.max(5, Math.min(25, Math.ceil(sourceFiles.length / 8)));
+    console.log(`[Local] Source files: ${sourceFiles.length}, minimum pages: ${minPages}`);
+
+    // 3. Build a compact representation for the LLM
     const fileList = allFiles.map(f => {
       const sizeLabel = f.size < 1000 ? 'small' : f.size < 10000 ? 'medium' : 'large';
       return `${f.relativePath} (${f.extension}, ${sizeLabel})`;
     }).join('\n');
 
-    // 3. Summarize file types for the LLM
+    // 4. Summarize file types for the LLM
     const extCounts = new Map<string, number>();
     for (const f of allFiles) {
       extCounts.set(f.extension, (extCounts.get(f.extension) || 0) + 1);
@@ -1384,50 +1390,53 @@ Create all ${missingPages.length} missing pages now.`;
       .map(([ext, count]) => `${ext}: ${count} files`)
       .join(', ');
 
-    // 4. Ask LLM to analyze and categorize files
-    const analysisPrompt = `You are analyzing a software project to create architectural documentation.
+    // 5. Generate language-aware grouping suggestions
+    const groupingSuggestions = this.generateGroupingSuggestions(extCounts, sourceFiles.length);
+
+    // 6. Ask LLM to analyze and categorize files
+    const analysisPrompt = `You are analyzing a software project to create comprehensive architectural documentation.
+
+## Project Statistics
+- Total source files: ${sourceFiles.length}
+- File types: ${extSummary}
+- **Required pages: ${minPages}-${minPages + 10}** (based on project size)
 
 ## Project Files
 ${fileList}
 
-## File Type Summary
-${extSummary}
-
 ## Task
-Analyze these files and return a JSON object that identifies:
-1. Which files are architecturally important (core application logic)
-2. How to group them into documentation pages
-
-Return ONLY valid JSON in this exact format:
+Create a documentation plan with ${minPages}-${minPages + 10} pages. Return ONLY valid JSON:
 {
-  "projectType": "brief description of project type and primary language/platform",
+  "projectType": "description of project type, language, and platform",
   "pages": [
     {
       "title": "Page Title",
       "filename": "page-slug.md",
-      "type": "overview|component|api|guide|module|config",
-      "context": "What this page documents and why it's important",
+      "type": "overview|component|module|guide|config",
+      "context": "What this page documents - be specific about functionality",
       "files": ["path/to/file1.ext", "path/to/file2.ext"]
     }
-  ],
-  "excludedPatterns": ["paths or patterns that are content/data, not architecture"]
+  ]
 }
 
-## Guidelines
-- This project may use ANY programming language or platform (web, mainframe, mobile, embedded, etc.)
-- Recognize source code by extension:
-  - Modern: .ts, .js, .py, .go, .rs, .java, .rb, .php, .cs, .swift, .kt
-  - Legacy/Mainframe: .cbl/.cob (COBOL), .cpy (copybooks), .jcl (job control), .pli (PL/I), .asm (assembly), .bms (screen maps), .rpg (RPG)
-  - Data/Config: .sql, .json, .yaml, .xml
-- Focus on SOURCE CODE that defines the application's behavior and structure
-- EXCLUDE: test fixtures, generated files, binary data, pure documentation (.md about the project)
-- INCLUDE: programs, modules, procedures, copybooks, job scripts, screen definitions, data definitions
-- Create 5-15 pages depending on project complexity
-- Each page should have 2-10 related files
-- Always include an "Architecture Overview" page first
-- Group related functionality together (e.g., all transaction programs, all copybooks, all batch jobs)
+## Grouping Suggestions for This Project
+${groupingSuggestions}
 
-Return only the JSON, no markdown code blocks or explanation.`;
+## Requirements
+1. **MINIMUM ${minPages} pages required** - the project has ${sourceFiles.length} source files
+2. Every major program/module should be documented
+3. Group by FUNCTIONALITY, not just file type
+4. Each page should document 2-8 related files
+5. Include specific file paths in the "files" array
+
+## Page Types to Consider
+- **overview**: System architecture, data flow, key concepts
+- **component**: A functional unit (e.g., "User Authentication", "Payment Processing", "Report Generation")
+- **module**: A technical module (e.g., "Database Layer", "API Handlers", "Utility Functions")
+- **guide**: Setup, deployment, testing procedures
+- **config**: Configuration, environment setup, build process
+
+Return only the JSON, no markdown code blocks.`;
 
     const messages: LLMMessage[] = [{ role: 'user', content: analysisPrompt }];
 
@@ -1435,14 +1444,14 @@ Return only the JSON, no markdown code blocks or explanation.`;
 
     try {
       const response = await provider.chat(messages, [], {
-        maxTokens: 4096,
-        systemPrompt: 'You are a software architect analyzing codebases. Return only valid JSON.',
-        temperature: 0.2, // Low temperature for structured output
+        maxTokens: 8192, // Increased for larger page lists
+        systemPrompt: 'You are a software architect creating documentation plans. Return only valid JSON with comprehensive coverage.',
+        temperature: 0.3,
       });
 
       if (!response.content) {
         console.log(`[Local] LLM returned empty response, falling back to pattern-based analysis`);
-        return this.analyzeCodebaseForPages(options);
+        return this.generateComprehensivePages(allFiles, minPages);
       }
 
       // Parse the JSON response
@@ -1455,11 +1464,9 @@ Return only the JSON, no markdown code blocks or explanation.`;
           context: string;
           files: string[];
         }>;
-        excludedPatterns: string[];
       };
 
       try {
-        // Clean up response - remove markdown code blocks if present
         let jsonStr = response.content.trim();
         if (jsonStr.startsWith('```')) {
           jsonStr = jsonStr.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
@@ -1468,7 +1475,7 @@ Return only the JSON, no markdown code blocks or explanation.`;
       } catch (parseErr) {
         console.log(`[Local] Failed to parse LLM response as JSON: ${(parseErr as Error).message}`);
         console.log(`[Local] Response was: ${response.content.slice(0, 500)}...`);
-        return this.analyzeCodebaseForPages(options);
+        return this.generateComprehensivePages(allFiles, minPages);
       }
 
       console.log(`[Local] LLM identified project as: ${analysis.projectType}`);
@@ -1487,8 +1494,8 @@ Return only the JSON, no markdown code blocks or explanation.`;
       for (const page of analysis.pages) {
         const validFiles = (page.files || []).filter(f => existingFiles.has(f));
 
-        // Only include pages that have at least one valid file
-        if (validFiles.length > 0 || page.type === 'overview') {
+        // Include pages even with no valid files for overview/guide types
+        if (validFiles.length > 0 || page.type === 'overview' || page.type === 'guide') {
           validatedPages.push({
             title: page.title,
             filename: page.filename.endsWith('.md') ? page.filename : `${page.filename}.md`,
@@ -1497,6 +1504,13 @@ Return only the JSON, no markdown code blocks or explanation.`;
             sourceFiles: validFiles,
           });
         }
+      }
+
+      // If LLM returned too few pages, augment with pattern-based pages
+      if (validatedPages.length < minPages) {
+        console.log(`[Local] LLM returned ${validatedPages.length} pages, augmenting to reach minimum ${minPages}`);
+        const additionalPages = this.augmentWithPatternPages(allFiles, validatedPages, minPages, analysis.projectType);
+        validatedPages.push(...additionalPages);
       }
 
       // Ensure we have an architecture overview
@@ -1516,25 +1530,373 @@ Return only the JSON, no markdown code blocks or explanation.`;
 
       // Always add Getting Started
       if (!validatedPages.some(p => p.title.toLowerCase().includes('getting started'))) {
+        const setupFiles = allFiles
+          .filter(f =>
+            f.relativePath.toLowerCase().includes('readme') ||
+            f.relativePath.includes('package.json') ||
+            f.relativePath.includes('Makefile') ||
+            f.relativePath.includes('setup.') ||
+            f.relativePath.includes('install'))
+          .map(f => f.relativePath);
+
         validatedPages.push({
           title: 'Getting Started',
           filename: 'getting-started.md',
           type: 'guide',
           context: 'Installation, setup, and development workflow',
-          sourceFiles: allFiles
-            .filter(f => f.relativePath.includes('package.json') || f.relativePath.includes('README'))
-            .map(f => f.relativePath),
+          sourceFiles: setupFiles,
         });
       }
 
-      console.log(`[Local] Validated ${validatedPages.length} pages with existing files`);
+      console.log(`[Local] Final page count: ${validatedPages.length} pages`);
       return validatedPages;
 
     } catch (error) {
       console.error(`[Local] LLM analysis failed: ${(error as Error).message}`);
-      console.log(`[Local] Falling back to pattern-based analysis`);
-      return this.analyzeCodebaseForPages(options);
+      console.log(`[Local] Falling back to comprehensive pattern-based analysis`);
+      return this.generateComprehensivePages(allFiles, minPages);
     }
+  }
+
+  /**
+   * Generate language-aware grouping suggestions based on detected file types
+   */
+  private generateGroupingSuggestions(extCounts: Map<string, number>, totalFiles: number): string {
+    const suggestions: string[] = [];
+
+    // Detect project type and provide specific suggestions
+    const hasCobol = extCounts.has('.cbl') || extCounts.has('.cob');
+    const hasCopybooks = extCounts.has('.cpy');
+    const hasJcl = extCounts.has('.jcl');
+    const hasBms = extCounts.has('.bms');
+    const hasTypeScript = extCounts.has('.ts') || extCounts.has('.tsx');
+    const hasJava = extCounts.has('.java');
+    const hasPython = extCounts.has('.py');
+    const hasGo = extCounts.has('.go');
+    const hasRust = extCounts.has('.rs');
+    const hasCpp = extCounts.has('.cpp') || extCounts.has('.c');
+    const hasSwift = extCounts.has('.swift');
+
+    // Mainframe/COBOL projects
+    if (hasCobol || hasCopybooks || hasJcl || hasBms) {
+      suggestions.push(`**Mainframe/COBOL Project Detected** - Consider these page groupings:`);
+      if (hasCobol) {
+        const count = (extCounts.get('.cbl') || 0) + (extCounts.get('.cob') || 0);
+        suggestions.push(`- **Online Programs** (${count} COBOL files): Group CICS transaction programs by function (e.g., Account Management, Transaction Processing, Reports)`);
+        suggestions.push(`- **Batch Programs**: Group batch processing programs and their JCL`);
+      }
+      if (hasCopybooks) {
+        suggestions.push(`- **Copybooks & Data Structures** (${extCounts.get('.cpy')} files): Document shared data definitions, record layouts, communication areas`);
+      }
+      if (hasJcl) {
+        suggestions.push(`- **Job Control (JCL)** (${extCounts.get('.jcl')} files): Document batch jobs, procedures, job streams`);
+      }
+      if (hasBms) {
+        suggestions.push(`- **Screen Maps (BMS)** (${extCounts.get('.bms')} files): Document terminal screens, field layouts, user interface`);
+      }
+      suggestions.push(`- **Data Layer**: Document VSAM files, DB2 tables, IMS segments`);
+    }
+
+    // TypeScript/JavaScript projects
+    else if (hasTypeScript) {
+      suggestions.push(`**TypeScript/JavaScript Project** - Consider these groupings:`);
+      suggestions.push(`- **API Routes/Handlers**: Group by domain (auth, users, products, etc.)`);
+      suggestions.push(`- **Components/UI**: Group React/Vue/Svelte components by feature`);
+      suggestions.push(`- **Services/Business Logic**: Group service classes and utilities`);
+      suggestions.push(`- **State Management**: Document stores, reducers, context`);
+      suggestions.push(`- **Configuration**: Build config, environment, types`);
+    }
+
+    // Java projects
+    else if (hasJava) {
+      suggestions.push(`**Java Project** - Consider these groupings:`);
+      suggestions.push(`- **Controllers/Endpoints**: REST or web controllers`);
+      suggestions.push(`- **Services**: Business logic layer`);
+      suggestions.push(`- **Repositories/DAOs**: Data access layer`);
+      suggestions.push(`- **Models/Entities**: Domain objects and DTOs`);
+      suggestions.push(`- **Configuration**: Spring config, application properties`);
+    }
+
+    // Python projects
+    else if (hasPython) {
+      suggestions.push(`**Python Project** - Consider these groupings:`);
+      suggestions.push(`- **API/Views**: Flask routes, Django views, FastAPI endpoints`);
+      suggestions.push(`- **Models**: Database models, data classes`);
+      suggestions.push(`- **Services/Logic**: Business logic modules`);
+      suggestions.push(`- **Utils/Helpers**: Utility functions and helpers`);
+    }
+
+    // Go projects
+    else if (hasGo) {
+      suggestions.push(`**Go Project** - Consider these groupings:`);
+      suggestions.push(`- **Handlers**: HTTP handlers, gRPC services`);
+      suggestions.push(`- **Domain/Models**: Core business types`);
+      suggestions.push(`- **Repository/Storage**: Database and storage layer`);
+      suggestions.push(`- **Pkg/Internal**: Shared packages and internal modules`);
+    }
+
+    // C/C++ projects
+    else if (hasCpp) {
+      suggestions.push(`**C/C++ Project** - Consider these groupings:`);
+      suggestions.push(`- **Core/Src**: Main application logic`);
+      suggestions.push(`- **Lib**: Libraries and reusable modules`);
+      suggestions.push(`- **Include/Headers**: Header files and interfaces`);
+      suggestions.push(`- **Drivers/HAL**: Hardware abstraction (if embedded)`);
+    }
+
+    // Generic fallback
+    else {
+      suggestions.push(`**General Project** - Consider these groupings:`);
+      suggestions.push(`- Group files by **directory** (each major folder = 1 page)`);
+      suggestions.push(`- Group files by **functionality** (what they do together)`);
+      suggestions.push(`- Create separate pages for **configuration** and **utilities**`);
+    }
+
+    // Universal suggestions
+    suggestions.push(`\n**Universal Guidelines:**`);
+    suggestions.push(`- Create ${Math.ceil(totalFiles / 8)}-${Math.ceil(totalFiles / 5)} pages for ${totalFiles} source files`);
+    suggestions.push(`- Each page should have 2-8 related files, not more`);
+    suggestions.push(`- Name pages by WHAT they do, not WHERE they are`);
+
+    return suggestions.join('\n');
+  }
+
+  /**
+   * Augment LLM-generated pages with pattern-based pages if count is too low
+   */
+  private augmentWithPatternPages(
+    allFiles: Array<{ relativePath: string; extension: string; size: number }>,
+    existingPages: Array<{ title: string; filename: string; type: string; context: string; sourceFiles: string[] }>,
+    minPages: number,
+    projectType: string
+  ): Array<{ title: string; filename: string; type: 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config'; context: string; sourceFiles: string[] }> {
+    const additionalPages: Array<{ title: string; filename: string; type: 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config'; context: string; sourceFiles: string[] }> = [];
+    const existingTitles = new Set(existingPages.map(p => p.title.toLowerCase()));
+    const coveredFiles = new Set(existingPages.flatMap(p => p.sourceFiles));
+
+    // Group uncovered files by directory
+    const uncoveredByDir = new Map<string, Array<{ relativePath: string; extension: string; size: number }>>();
+    for (const f of allFiles) {
+      if (!coveredFiles.has(f.relativePath)) {
+        const dir = f.relativePath.split('/').slice(0, -1).join('/') || 'root';
+        if (!uncoveredByDir.has(dir)) {
+          uncoveredByDir.set(dir, []);
+        }
+        uncoveredByDir.get(dir)!.push(f);
+      }
+    }
+
+    // Sort directories by file count (most files first)
+    const sortedDirs = Array.from(uncoveredByDir.entries())
+      .sort((a, b) => b[1].length - a[1].length);
+
+    // Create pages for uncovered directories
+    for (const [dir, files] of sortedDirs) {
+      if (existingPages.length + additionalPages.length >= minPages) break;
+      if (files.length < 2) continue; // Skip dirs with only 1 file
+
+      const title = this.formatDirectoryTitle(dir);
+      if (existingTitles.has(title.toLowerCase())) continue;
+
+      additionalPages.push({
+        title,
+        filename: this.toSlug(title) + '.md',
+        type: 'module',
+        context: `Source files in ${dir || 'root directory'} - part of ${projectType}`,
+        sourceFiles: files.slice(0, 10).map(f => f.relativePath),
+      });
+      existingTitles.add(title.toLowerCase());
+    }
+
+    // Group remaining by extension type
+    if (existingPages.length + additionalPages.length < minPages) {
+      const byExt = new Map<string, string[]>();
+      for (const f of allFiles) {
+        if (!coveredFiles.has(f.relativePath)) {
+          if (!byExt.has(f.extension)) byExt.set(f.extension, []);
+          byExt.get(f.extension)!.push(f.relativePath);
+        }
+      }
+
+      const extTitles: Record<string, string> = {
+        '.cbl': 'COBOL Programs', '.cob': 'COBOL Programs',
+        '.cpy': 'Copybooks & Data Structures',
+        '.jcl': 'Job Control (JCL)',
+        '.bms': 'Screen Maps (BMS)',
+        '.ts': 'TypeScript Modules', '.tsx': 'React Components',
+        '.js': 'JavaScript Modules', '.jsx': 'React Components',
+        '.py': 'Python Modules',
+        '.java': 'Java Classes',
+        '.go': 'Go Packages',
+        '.rs': 'Rust Modules',
+        '.sql': 'Database Scripts',
+      };
+
+      for (const [ext, files] of byExt.entries()) {
+        if (existingPages.length + additionalPages.length >= minPages) break;
+        if (files.length < 3) continue;
+
+        const title = extTitles[ext] || `${ext.replace('.', '').toUpperCase()} Files`;
+        if (existingTitles.has(title.toLowerCase())) continue;
+
+        additionalPages.push({
+          title,
+          filename: this.toSlug(title) + '.md',
+          type: 'module',
+          context: `${files.length} ${ext} files in the project`,
+          sourceFiles: files.slice(0, 10),
+        });
+        existingTitles.add(title.toLowerCase());
+      }
+    }
+
+    console.log(`[Local] Added ${additionalPages.length} pattern-based pages`);
+    return additionalPages;
+  }
+
+  /**
+   * Generate comprehensive pages when LLM analysis fails completely
+   */
+  private generateComprehensivePages(
+    allFiles: Array<{ relativePath: string; extension: string; size: number }>,
+    minPages: number
+  ): Array<{ title: string; filename: string; type: 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config'; context: string; sourceFiles: string[] }> {
+    const pages: Array<{ title: string; filename: string; type: 'overview' | 'component' | 'api' | 'guide' | 'module' | 'config'; context: string; sourceFiles: string[] }> = [];
+
+    // Detect project type from extensions
+    const extCounts = new Map<string, number>();
+    for (const f of allFiles) {
+      extCounts.set(f.extension, (extCounts.get(f.extension) || 0) + 1);
+    }
+    const topExt = Array.from(extCounts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+    const projectType = this.getProjectTypeFromExtension(topExt);
+
+    // 1. Architecture Overview
+    pages.push({
+      title: 'Architecture Overview',
+      filename: 'architecture.md',
+      type: 'overview',
+      context: `High-level architecture of this ${projectType} project`,
+      sourceFiles: allFiles
+        .filter(f => this.isEntryPoint(f.relativePath))
+        .slice(0, 10)
+        .map(f => f.relativePath),
+    });
+
+    // 2. Group by top-level directories
+    const byDir = new Map<string, string[]>();
+    for (const f of allFiles) {
+      const topDir = f.relativePath.split('/')[0] || 'root';
+      if (!byDir.has(topDir)) byDir.set(topDir, []);
+      byDir.get(topDir)!.push(f.relativePath);
+    }
+
+    const sortedDirs = Array.from(byDir.entries())
+      .filter(([dir]) => !['node_modules', '.git', 'dist', 'build'].includes(dir))
+      .sort((a, b) => b[1].length - a[1].length);
+
+    for (const [dir, files] of sortedDirs) {
+      if (pages.length >= minPages - 1) break;
+      if (files.length < 2) continue;
+
+      pages.push({
+        title: this.formatDirectoryTitle(dir),
+        filename: this.toSlug(dir) + '.md',
+        type: 'module',
+        context: `Files in the ${dir} directory`,
+        sourceFiles: files.slice(0, 10),
+      });
+    }
+
+    // 3. Group by file type if still under minimum
+    if (pages.length < minPages) {
+      for (const [ext, count] of extCounts.entries()) {
+        if (pages.length >= minPages - 1) break;
+        if (count < 3) continue;
+
+        const files = allFiles.filter(f => f.extension === ext).map(f => f.relativePath);
+        const title = this.getExtensionTitle(ext);
+
+        if (!pages.some(p => p.title === title)) {
+          pages.push({
+            title,
+            filename: this.toSlug(title) + '.md',
+            type: 'module',
+            context: `${count} ${ext} files in the project`,
+            sourceFiles: files.slice(0, 10),
+          });
+        }
+      }
+    }
+
+    // 4. Getting Started
+    pages.push({
+      title: 'Getting Started',
+      filename: 'getting-started.md',
+      type: 'guide',
+      context: 'Setup and development workflow',
+      sourceFiles: allFiles
+        .filter(f => f.relativePath.toLowerCase().includes('readme') || f.relativePath.includes('package.json'))
+        .map(f => f.relativePath),
+    });
+
+    console.log(`[Local] Generated ${pages.length} comprehensive pages`);
+    return pages;
+  }
+
+  /**
+   * Get project type name from file extension (synchronous helper)
+   */
+  private getProjectTypeFromExtension(ext: string): string {
+    const types: Record<string, string> = {
+      '.ts': 'TypeScript', '.tsx': 'TypeScript/React', '.js': 'JavaScript', '.jsx': 'JavaScript/React',
+      '.py': 'Python', '.java': 'Java', '.kt': 'Kotlin', '.scala': 'Scala',
+      '.go': 'Go', '.rs': 'Rust', '.c': 'C', '.cpp': 'C++',
+      '.cs': 'C#/.NET', '.rb': 'Ruby', '.php': 'PHP',
+      '.swift': 'Swift/iOS', '.dart': 'Dart/Flutter',
+      '.cbl': 'COBOL/Mainframe', '.cob': 'COBOL/Mainframe', '.cpy': 'COBOL/Mainframe',
+      '.jcl': 'Mainframe/JCL', '.bms': 'CICS/Mainframe',
+    };
+    return types[ext] || 'Software';
+  }
+
+  /**
+   * Convert a string to a URL-safe slug
+   */
+  private toSlug(text: string): string {
+    return text
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+  }
+
+  /**
+   * Get a readable title for a file extension
+   */
+  private getExtensionTitle(ext: string): string {
+    const titles: Record<string, string> = {
+      '.ts': 'TypeScript Modules', '.tsx': 'React Components',
+      '.js': 'JavaScript Modules', '.jsx': 'React Components',
+      '.py': 'Python Modules', '.java': 'Java Classes',
+      '.go': 'Go Packages', '.rs': 'Rust Modules',
+      '.cbl': 'COBOL Programs', '.cob': 'COBOL Programs',
+      '.cpy': 'Copybooks', '.jcl': 'JCL Jobs',
+      '.bms': 'BMS Screen Maps', '.sql': 'Database Scripts',
+      '.c': 'C Source Files', '.cpp': 'C++ Source Files',
+      '.cs': 'C# Classes', '.rb': 'Ruby Files',
+    };
+    return titles[ext] || `${ext.replace('.', '').toUpperCase()} Files`;
+  }
+
+  /**
+   * Format a directory name as a page title
+   */
+  private formatDirectoryTitle(dir: string): string {
+    if (!dir || dir === 'root') return 'Core Modules';
+    return dir
+      .split(/[-_\/]/)
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
   }
 
   /**
