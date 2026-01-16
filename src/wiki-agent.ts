@@ -222,7 +222,14 @@ export class ArchitecturalWikiAgent {
     this.ragSystem = new RAGSystem({
       storePath: path.join(this.outputDir, '.semanticwiki-cache'),
       repoPath: this.repoPath,
-      maxChunks: options.maxChunks  // Limit chunks for large codebases
+      maxChunks: options.maxChunks,  // Limit chunks for large codebases
+      // Contextual retrieval options
+      useContextualRetrieval: options.useContextualRetrieval,
+      contextualLocal: options.contextualLocal,
+      contextualApiKey: options.contextualApiKey || this.apiKey,
+      contextualModel: options.contextualModel,
+      contextualOllamaHost: options.contextualOllamaHost || options.ollamaHost,
+      contextualLocalModel: options.contextualLocalModel
     });
     await this.ragSystem.indexRepository();
     yield { type: 'step', message: `Indexed ${this.ragSystem.getDocumentCount()} code chunks` };
@@ -769,7 +776,14 @@ export class ArchitecturalWikiAgent {
       this.ragSystem = new RAGSystem({
         storePath: cachePath,
         repoPath: this.repoPath,
-        maxChunks: options.maxChunks
+        maxChunks: options.maxChunks,
+        // Contextual retrieval options
+        useContextualRetrieval: options.useContextualRetrieval,
+        contextualLocal: options.contextualLocal,
+        contextualApiKey: options.contextualApiKey || this.apiKey,
+        contextualModel: options.contextualModel,
+        contextualOllamaHost: options.contextualOllamaHost || options.ollamaHost,
+        contextualLocalModel: options.contextualLocalModel
       });
       await this.ragSystem.indexRepository();
     }
@@ -1143,7 +1157,14 @@ Create all ${missingPages.length} missing pages now.`;
       this.ragSystem = new RAGSystem({
         storePath: cachePath,
         repoPath: this.repoPath,
-        maxChunks: options.maxChunks
+        maxChunks: options.maxChunks,
+        // Contextual retrieval options
+        useContextualRetrieval: options.useContextualRetrieval,
+        contextualLocal: options.contextualLocal,
+        contextualApiKey: options.contextualApiKey || this.apiKey,
+        contextualModel: options.contextualModel,
+        contextualOllamaHost: options.contextualOllamaHost || options.ollamaHost,
+        contextualLocalModel: options.contextualLocalModel
       });
       await this.ragSystem.indexRepository();
     }

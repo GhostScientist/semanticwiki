@@ -94,6 +94,11 @@ program
   .option('--gpu-layers <n>', 'Number of GPU layers to offload (default: auto)', parseInt)
   .option('--context-size <n>', 'Context window size for local models (default: 32768)', parseInt)
   .option('--threads <n>', 'CPU threads for local inference (default: auto)', parseInt)
+  // Contextual retrieval options
+  .option('--contextual', 'Enable contextual retrieval for better chunk understanding (uses Claude API)')
+  .option('--contextual-local', 'Use local LLM for contextual retrieval instead of Claude API')
+  .option('--contextual-model <model>', 'Claude model for contextual retrieval (default: claude-3-haiku-20240307)')
+  .option('--contextual-ollama-model <model>', 'Ollama model for local contextual retrieval (default: qwen2.5-coder:7b)')
   .action(async (options) => {
     try {
       const configManager = new ConfigManager();
@@ -304,7 +309,13 @@ program
         ollamaHost: options.ollamaHost,
         gpuLayers: options.gpuLayers,
         contextSize: options.contextSize,
-        threads: options.threads
+        threads: options.threads,
+        // Contextual retrieval options
+        useContextualRetrieval: options.contextual || options.contextualLocal,
+        contextualLocal: options.contextualLocal,
+        contextualModel: options.contextualModel,
+        contextualOllamaHost: options.ollamaHost,  // Reuse Ollama host if set
+        contextualLocalModel: options.contextualOllamaModel
       };
 
       // Choose generator based on options
