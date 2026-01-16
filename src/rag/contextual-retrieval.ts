@@ -182,10 +182,41 @@ export class ContextualRetrieval {
 
     const enrichedChunks: ContextualChunk[] = [];
     let processedCount = 0;
+    let successCount = 0;
+    let emptyCount = 0;
+    let fallbackCount = 0;
+    let sequenceResetCount = 0;
+
+    // For bundled local mode, we need to reinitialize periodically to avoid "No sequences left" error
+    // The node-llama-cpp context has limited sequences (20), and they don't get released fast enough
+    const SEQUENCE_RESET_THRESHOLD = 15; // Reset before hitting the 20 sequence limit
+    let localChunksSinceReset = 0;
 
     // Process files in batches (or sequentially for local)
     const fileEntries = Array.from(chunksByFile.entries());
     const concurrency = this.config.useLocal && !this.config.useOllama ? 1 : this.config.concurrency;
+
+    // Helper to reinitialize local provider when sequences are exhausted
+    const reinitializeLocalProvider = async () => {
+      if (this.localProvider && this.config.useLocal && !this.config.useOllama) {
+        try {
+          // Shutdown existing provider
+          if ('shutdown' in this.localProvider) {
+            await (this.localProvider as any).shutdown();
+          }
+          // Reinitialize
+          const { createLLMProvider } = await import('../llm/index.js');
+          this.localProvider = await createLLMProvider({
+            fullLocal: true,
+            modelFamily: 'gpt-oss',
+          });
+          localChunksSinceReset = 0;
+          sequenceResetCount++;
+        } catch (error) {
+          console.warn(`  Warning: Failed to reinitialize local provider: ${(error as Error).message}`);
+        }
+      }
+    };
 
     for (let i = 0; i < fileEntries.length; i += concurrency) {
       const batch = fileEntries.slice(i, i + concurrency);
@@ -211,14 +242,59 @@ export class ContextualRetrieval {
 
           // Check cache first
           let contextualPrefix = this.contextCache.get(cacheKey);
+          let usedFallback = false;
 
           if (!contextualPrefix) {
+            // For bundled local mode, check if we need to reset sequences
+            if (this.config.useLocal && !this.config.useOllama) {
+              if (localChunksSinceReset >= SEQUENCE_RESET_THRESHOLD) {
+                console.log(`  Resetting local LLM context (sequence limit reached)...`);
+                await reinitializeLocalProvider();
+              }
+              localChunksSinceReset++;
+            }
+
             try {
               contextualPrefix = await this.generateContext(fileContent, chunk);
+
+              // If LLM returned empty, use fallback
+              if (!contextualPrefix || contextualPrefix.trim().length === 0) {
+                emptyCount++;
+                contextualPrefix = this.generateFallbackContext(chunk);
+                usedFallback = true;
+              } else {
+                successCount++;
+              }
+
               this.contextCache.set(cacheKey, contextualPrefix);
             } catch (error) {
-              console.warn(`  Warning: Failed to generate context for ${chunk.id}: ${(error as Error).message}`);
-              contextualPrefix = this.generateFallbackContext(chunk);
+              const errorMsg = (error as Error).message;
+              // If we hit sequence limit, try to recover
+              if (errorMsg.includes('No sequences left')) {
+                console.log(`  Recovering from sequence exhaustion...`);
+                await reinitializeLocalProvider();
+                // Retry once after reset
+                try {
+                  contextualPrefix = await this.generateContext(fileContent, chunk);
+                  if (!contextualPrefix || contextualPrefix.trim().length === 0) {
+                    emptyCount++;
+                    contextualPrefix = this.generateFallbackContext(chunk);
+                    usedFallback = true;
+                  } else {
+                    successCount++;
+                  }
+                  this.contextCache.set(cacheKey, contextualPrefix);
+                } catch {
+                  contextualPrefix = this.generateFallbackContext(chunk);
+                  usedFallback = true;
+                  fallbackCount++;
+                }
+              } else {
+                console.warn(`  Warning: Failed to generate context for ${chunk.id}: ${errorMsg}`);
+                contextualPrefix = this.generateFallbackContext(chunk);
+                usedFallback = true;
+                fallbackCount++;
+              }
             }
           }
 
@@ -243,6 +319,19 @@ export class ContextualRetrieval {
       // Log progress
       const progress = Math.round((processedCount / chunks.length) * 100);
       console.log(`  Contextual enrichment: ${processedCount}/${chunks.length} (${progress}%)`);
+    }
+
+    // Log summary stats
+    console.log(`  Contextual enrichment complete:`);
+    console.log(`    ✓ ${successCount} chunks enriched by LLM`);
+    if (emptyCount > 0) {
+      console.log(`    ⚠ ${emptyCount} empty responses (fallback used)`);
+    }
+    if (fallbackCount > 0) {
+      console.log(`    ✗ ${fallbackCount} errors (fallback used)`);
+    }
+    if (sequenceResetCount > 0) {
+      console.log(`    🔄 ${sequenceResetCount} context resets (sequence management)`);
     }
 
     // Save cache
@@ -341,6 +430,9 @@ export class ContextualRetrieval {
       throw new Error('Local LLM provider not initialized');
     }
 
+    // System prompt to guide the local model
+    const systemPrompt = `You are a code documentation assistant. Your task is to write a brief context description (under 100 words) that explains what a code chunk does within its file. Be concise and factual. Output ONLY the context description, nothing else.`;
+
     try {
       const response = await this.localProvider.chat(
         [{ role: 'user', content: prompt }],
@@ -348,6 +440,7 @@ export class ContextualRetrieval {
         {
           maxTokens: 150,
           temperature: 0.3,
+          systemPrompt,
         }
       );
 
@@ -449,6 +542,100 @@ export class ContextualRetrieval {
     } catch {
       // Ignore cache errors
     }
+  }
+
+  /**
+   * Preview contextual enrichment for a sample of chunks
+   * Useful for debugging and validating the enrichment quality
+   */
+  async previewEnrichment(
+    chunks: ASTChunk[],
+    repoPath: string,
+    sampleSize: number = 10
+  ): Promise<{
+    mode: string;
+    totalChunks: number;
+    sampleSize: number;
+    samples: Array<{
+      id: string;
+      filePath: string;
+      chunkType?: string;
+      name?: string;
+      contentPreview: string;
+      contextualPrefix: string;
+      status: 'success' | 'empty' | 'fallback' | 'error';
+    }>;
+  }> {
+    // Determine mode
+    let mode = 'claude-api';
+    if (this.config.useLocal) {
+      mode = this.config.useOllama ? 'ollama' : 'bundled-local';
+    }
+
+    // Sample chunks (spread across different files)
+    const sampleChunks: ASTChunk[] = [];
+    const filesSeen = new Set<string>();
+
+    for (const chunk of chunks) {
+      if (sampleChunks.length >= sampleSize) break;
+      if (!filesSeen.has(chunk.filePath) || sampleChunks.length < sampleSize / 2) {
+        sampleChunks.push(chunk);
+        filesSeen.add(chunk.filePath);
+      }
+    }
+
+    const samples: Array<{
+      id: string;
+      filePath: string;
+      chunkType?: string;
+      name?: string;
+      contentPreview: string;
+      contextualPrefix: string;
+      status: 'success' | 'empty' | 'fallback' | 'error';
+    }> = [];
+
+    for (const chunk of sampleChunks) {
+      let contextualPrefix = '';
+      let status: 'success' | 'empty' | 'fallback' | 'error' = 'success';
+
+      // Read file content
+      let fileContent = '';
+      try {
+        const fullPath = path.join(repoPath, chunk.filePath);
+        fileContent = fs.readFileSync(fullPath, 'utf-8');
+      } catch {
+        fileContent = chunk.content;
+      }
+
+      try {
+        contextualPrefix = await this.generateContext(fileContent, chunk);
+
+        if (!contextualPrefix || contextualPrefix.trim().length === 0) {
+          status = 'empty';
+          contextualPrefix = this.generateFallbackContext(chunk);
+        }
+      } catch (error) {
+        status = 'error';
+        contextualPrefix = this.generateFallbackContext(chunk);
+      }
+
+      samples.push({
+        id: chunk.id,
+        filePath: chunk.filePath,
+        chunkType: chunk.chunkType,
+        name: chunk.name,
+        contentPreview: chunk.content.slice(0, 100) + (chunk.content.length > 100 ? '...' : ''),
+        contextualPrefix,
+        status,
+      });
+    }
+
+    return {
+      mode,
+      totalChunks: chunks.length,
+      sampleSize: samples.length,
+      samples,
+    };
   }
 
   /**
