@@ -107,6 +107,22 @@ export interface WikiGenerationOptions {
     /** New wiki pages that should be created */
     pagesToCreate: string[];
   };
+
+  // Contextual retrieval options
+  /** Enable contextual retrieval for improved chunk understanding */
+  useContextualRetrieval?: boolean;
+  /** Use local LLM for contextual retrieval instead of Claude API */
+  contextualLocal?: boolean;
+  /** Use Ollama server for contextual retrieval (requires contextualLocal) */
+  contextualUseOllama?: boolean;
+  /** Anthropic API key for contextual retrieval */
+  contextualApiKey?: string;
+  /** Model for contextual retrieval (default: claude-3-haiku) */
+  contextualModel?: string;
+  /** Ollama host for contextual retrieval */
+  contextualOllamaHost?: string;
+  /** Local model name for contextual retrieval */
+  contextualLocalModel?: string;
 }
 
 export interface WikiAgentConfig {
@@ -227,7 +243,7 @@ export class ArchitecturalWikiAgent {
       useContextualRetrieval: options.useContextualRetrieval,
       contextualLocal: options.contextualLocal,
       contextualUseOllama: options.contextualUseOllama,
-      contextualApiKey: options.contextualApiKey || this.apiKey,
+      contextualApiKey: options.contextualApiKey || this.config.apiKey,
       contextualModel: options.contextualModel,
       contextualOllamaHost: options.contextualOllamaHost || options.ollamaHost,
       contextualLocalModel: options.contextualLocalModel
@@ -782,7 +798,7 @@ export class ArchitecturalWikiAgent {
         useContextualRetrieval: options.useContextualRetrieval,
         contextualLocal: options.contextualLocal,
         contextualUseOllama: options.contextualUseOllama,
-        contextualApiKey: options.contextualApiKey || this.apiKey,
+        contextualApiKey: options.contextualApiKey || this.config.apiKey,
         contextualModel: options.contextualModel,
         contextualOllamaHost: options.contextualOllamaHost || options.ollamaHost,
         contextualLocalModel: options.contextualLocalModel
@@ -1164,7 +1180,7 @@ Create all ${missingPages.length} missing pages now.`;
         useContextualRetrieval: options.useContextualRetrieval,
         contextualLocal: options.contextualLocal,
         contextualUseOllama: options.contextualUseOllama,
-        contextualApiKey: options.contextualApiKey || this.apiKey,
+        contextualApiKey: options.contextualApiKey || this.config.apiKey,
         contextualModel: options.contextualModel,
         contextualOllamaHost: options.contextualOllamaHost || options.ollamaHost,
         contextualLocalModel: options.contextualLocalModel

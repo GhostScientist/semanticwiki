@@ -140,7 +140,7 @@ export class ContextualRetrieval {
         const { createLLMProvider } = await import('../llm/index.js');
         this.localProvider = await createLLMProvider({
           fullLocal: true,
-          modelFamily: this.config.modelFamily as 'gpt-oss' | 'qwen' | 'lfm',
+          modelFamily: 'gpt-oss',  // Only gpt-oss is currently supported
           localModel: this.config.localModel,
         });
         console.log(`  Using bundled local LLM for contextual retrieval`);
@@ -342,12 +342,16 @@ export class ContextualRetrieval {
     }
 
     try {
-      const response = await this.localProvider.complete(prompt, {
-        maxTokens: 150,
-        temperature: 0.3,
-      });
+      const response = await this.localProvider.chat(
+        [{ role: 'user', content: prompt }],
+        [],  // No tools needed for simple completion
+        {
+          maxTokens: 150,
+          temperature: 0.3,
+        }
+      );
 
-      return response.trim();
+      return response.content.trim();
     } catch (error) {
       throw new Error(`Local LLM error: ${(error as Error).message}`);
     }
