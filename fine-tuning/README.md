@@ -1,6 +1,19 @@
 # Fine-Tuning gpt-oss-20b for SemanticWiki
 
-This directory contains comprehensive planning documents for fine-tuning OpenAI's gpt-oss-20b to become a specialized architectural wiki agent for SemanticWiki in local-only mode.
+This directory contains planning documents for fine-tuning OpenAI's gpt-oss-20b to become a specialized architectural wiki agent for SemanticWiki in local-only mode.
+
+## Quick Start (Tonight!)
+
+**Want results in 3-4 hours?** See [QUICK-START.md](./QUICK-START.md) for a minimal, achievable plan.
+
+```bash
+pip install torch transformers peft trl datasets bitsandbytes
+python prepare_data.py   # 30 min - downloads CodeWikiBench
+python train.py          # 1-2 hrs - LoRA fine-tuning
+python test.py           # 5 min - verify it works
+```
+
+---
 
 ## Project Goal
 
