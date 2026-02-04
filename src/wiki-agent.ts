@@ -107,6 +107,12 @@ export interface WikiGenerationOptions {
     /** New wiki pages that should be created */
     pagesToCreate: string[];
   };
+
+  /**
+   * Truncate search results to first 500 chars to reduce token usage.
+   * Useful for large codebases where search results can be verbose.
+   */
+  compactSearch?: boolean;
 }
 
 export interface WikiAgentConfig {
@@ -775,7 +781,25 @@ export class ArchitecturalWikiAgent {
     }
 
     const searchMode = this.ragSystem['index'] ? 'vector search' : 'keyword search';
-    yield { type: 'step', message: `Loaded ${this.ragSystem.getDocumentCount()} chunks (${searchMode})` };
+    const chunkCount = this.ragSystem.getDocumentCount();
+    yield { type: 'step', message: `Loaded ${chunkCount} chunks (${searchMode})` };
+
+    // Large codebase detection - auto-optimize settings for >50k chunks
+    const isLargeCodebase = chunkCount > 50000;
+    const effectiveMaxResults = isLargeCodebase ? 5 : (options.maxSearchResults || 10);
+    const effectiveCompactSearch = options.compactSearch ?? isLargeCodebase;
+
+    if (isLargeCodebase) {
+      console.log(`[DirectAPI] Large codebase detected (${chunkCount.toLocaleString()} chunks)`);
+      console.log(`[DirectAPI] Auto-optimizing: maxResults=${effectiveMaxResults}, compactSearch=${effectiveCompactSearch}`);
+    }
+
+    // Store effective settings for use in executeDirectApiTool
+    currentGenerationOptions = {
+      ...options,
+      maxSearchResults: effectiveMaxResults,
+      compactSearch: effectiveCompactSearch
+    };
 
     // Phase 3: Run direct API agent (or local mode)
     const modeLabel = options.fullLocal ? 'Local Mode' : 'Direct API mode';
@@ -844,6 +868,11 @@ export class ArchitecturalWikiAgent {
     let totalToolCalls = 0;
     let done = false;
 
+    // Token usage tracking for context window management
+    let cumulativeInputTokens = 0;
+    let warnedAboutTokens = false;
+    const logPrefix = options.fullLocal ? 'Local' : 'DirectAPI';
+
     try {
       while (!done && turnCount < maxTurns) {
         turnCount++;
@@ -851,7 +880,15 @@ export class ArchitecturalWikiAgent {
         yield { type: 'step', message: `Turn ${turnCount}/${maxTurns}`, progress };
 
         if (options.verbose) {
-          console.log(`\n[${options.fullLocal ? 'Local' : 'DirectAPI'}] === Turn ${turnCount} ===`);
+          console.log(`\n[${logPrefix}] === Turn ${turnCount} ===`);
+        }
+
+        // Prune old messages if approaching token limit
+        const pruneResult = this.pruneMessagesIfNeeded(messages, cumulativeInputTokens);
+        if (pruneResult.pruned) {
+          messages.length = 0;
+          messages.push(...pruneResult.messages);
+          console.log(`[${logPrefix}] Pruned conversation history to ${messages.length} messages to stay within token limits`);
         }
 
         // Call the LLM provider
@@ -861,9 +898,16 @@ export class ArchitecturalWikiAgent {
           temperature: 0.7,
         });
 
+        // Track cumulative token usage
+        cumulativeInputTokens += response.usage.inputTokens;
+        if (cumulativeInputTokens > 150000 && !warnedAboutTokens) {
+          console.log(`[${logPrefix}] ⚠️  High token usage: ${cumulativeInputTokens.toLocaleString()} tokens. Context will be pruned if needed.`);
+          warnedAboutTokens = true;
+        }
+
         if (options.verbose) {
-          console.log(`[${options.fullLocal ? 'Local' : 'DirectAPI'}] Stop reason: ${response.stopReason}`);
-          console.log(`[${options.fullLocal ? 'Local' : 'DirectAPI'}] Usage: input=${response.usage.inputTokens}, output=${response.usage.outputTokens}`);
+          console.log(`[${logPrefix}] Stop reason: ${response.stopReason}`);
+          console.log(`[${logPrefix}] Usage: input=${response.usage.inputTokens}, output=${response.usage.outputTokens} (cumulative: ${cumulativeInputTokens.toLocaleString()})`);
         }
 
         // Process response content - use explicit type for our content blocks
@@ -948,7 +992,6 @@ export class ArchitecturalWikiAgent {
         }
 
         // Check if we're done
-        const logPrefix = options.fullLocal ? 'Local' : 'DirectAPI';
         if (response.stopReason === 'end_turn' && toolResults.length === 0) {
           done = true;
           console.log(`[${logPrefix}] Agent finished naturally after ${turnCount} turns`);
@@ -957,7 +1000,6 @@ export class ArchitecturalWikiAgent {
         }
       }
 
-      const logPrefix = options.fullLocal ? 'Local' : 'DirectAPI';
       if (!done && turnCount >= maxTurns) {
         console.log(`[${logPrefix}] Warning: Reached max turns (${maxTurns})`);
         yield { type: 'error', message: `Reached maximum turns (${maxTurns})` };
@@ -2982,12 +3024,16 @@ Generate the complete Markdown content for the index page:`;
           if (!this.ragSystem) {
             return 'Error: RAG system not initialized';
           }
-          const maxResults = input.maxResults || 10;
-          const results = await this.ragSystem.search(input.query, { maxResults });
+          // Use effective max results from large codebase detection, or explicit input
+          const effectiveMaxResults = input.maxResults || currentGenerationOptions?.maxSearchResults || 10;
+          const results = await this.ragSystem.search(input.query, { maxResults: effectiveMaxResults });
 
           if (results.length === 0) {
             return 'No relevant code found for this query.';
           }
+
+          // Check if compact search is enabled (auto-enabled for large codebases)
+          const useCompactSearch = currentGenerationOptions?.compactSearch ?? false;
 
           const formatted = results.map((r, i) => {
             // Build domain context section if available
@@ -3011,11 +3057,16 @@ Generate the complete Markdown content for the index page:`;
               docSection = `\n**Documentation:**\n\`\`\`\n${docSnippet}${docSnippet.length < r.documentation.length ? '...' : ''}\n\`\`\`\n`;
             }
 
+            // Truncate code content in compact mode to reduce token usage
+            const codeContent = useCompactSearch && r.content.length > 500
+              ? r.content.slice(0, 500) + '\n// ... truncated'
+              : r.content;
+
             return `### Result ${i + 1} (score: ${r.score.toFixed(3)})\n` +
               `**Source:** \`${r.filePath}:${r.startLine}-${r.endLine}\`\n` +
               domainSection +
               docSection +
-              '\n```' + (r.language || '') + '\n' + r.content + '\n```';
+              '\n```' + (r.language || '') + '\n' + codeContent + '\n```';
           }).join('\n\n');
 
           return `Found ${results.length} relevant code snippets:\n\n${formatted}`;
@@ -4110,6 +4161,37 @@ Remember: Every architectural concept MUST include file:line references to the s
     }
 
     return files;
+  }
+
+  /**
+   * Prune old messages from conversation history when approaching token limit.
+   * Keeps the first message (initial prompt) and last N turns to preserve context.
+   * This prevents "prompt is too long" errors for large codebases.
+   */
+  private pruneMessagesIfNeeded(
+    messages: LLMMessage[],
+    currentTokens: number,
+    maxTokens: number = 180000
+  ): { messages: LLMMessage[]; pruned: boolean } {
+    if (currentTokens < maxTokens) {
+      return { messages, pruned: false };
+    }
+
+    // Keep first message (initial prompt) and last 10 turns (20 messages for assistant+user pairs)
+    const keepTurns = 10;
+    const keepMessages = keepTurns * 2;
+
+    if (messages.length <= keepMessages + 1) {
+      return { messages, pruned: false };
+    }
+
+    const firstMessage = messages[0];
+    const recentMessages = messages.slice(-keepMessages);
+
+    return {
+      messages: [firstMessage, ...recentMessages],
+      pruned: true
+    };
   }
 
   /**

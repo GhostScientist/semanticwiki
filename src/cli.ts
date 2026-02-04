@@ -48,15 +48,15 @@ program
       const config = configManager.get();
       console.log(chalk.cyan('\n📋 Current Configuration:'));
       console.log(chalk.gray('API Key:'), config.apiKey ? '***' + config.apiKey.slice(-4) : chalk.red('Not set'));
-      console.log(chalk.gray('Source:'), process.env.CLAUDE_API_KEY ? 'Environment variable' : 'Config file');
+      console.log(chalk.gray('Source:'), process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY ? 'Environment variable' : 'Config file');
       return;
     }
 
     console.log(chalk.yellow('\n🔐 API Key Configuration\n'));
     console.log(chalk.white('To configure your API key, create a .env file in the project root:\n'));
-    console.log(chalk.gray('  echo "CLAUDE_API_KEY=your-key-here" > .env\n'));
+    console.log(chalk.gray('  echo "ANTHROPIC_API_KEY=your-key-here" > .env\n'));
     console.log(chalk.white('Or set the environment variable directly:\n'));
-    console.log(chalk.gray('  export CLAUDE_API_KEY=your-key-here\n'));
+    console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here\n'));
     console.log(chalk.cyan('Tip: Copy .env.example to .env and fill in your API key.'));
   });
 
@@ -94,6 +94,7 @@ program
   .option('--gpu-layers <n>', 'Number of GPU layers to offload (default: auto)', parseInt)
   .option('--context-size <n>', 'Context window size for local models (default: 32768)', parseInt)
   .option('--threads <n>', 'CPU threads for local inference (default: auto)', parseInt)
+  .option('--compact-search', 'Truncate search results to reduce token usage (auto-enabled for large codebases)')
   .action(async (options) => {
     try {
       const configManager = new ConfigManager();
@@ -304,7 +305,8 @@ program
         ollamaHost: options.ollamaHost,
         gpuLayers: options.gpuLayers,
         contextSize: options.contextSize,
-        threads: options.threads
+        threads: options.threads,
+        compactSearch: options.compactSearch
       };
 
       // Choose generator based on options
@@ -1623,9 +1625,9 @@ program
       if (!configManager.hasApiKey()) {
         console.log(chalk.red('❌ No API key found.'));
         console.log(chalk.yellow('\nCreate a .env file with your API key:'));
-        console.log(chalk.gray('  echo "CLAUDE_API_KEY=your-key-here" > .env'));
+        console.log(chalk.gray('  echo "ANTHROPIC_API_KEY=your-key-here" > .env'));
         console.log(chalk.yellow('\nOr set the environment variable:'));
-        console.log(chalk.gray('  export CLAUDE_API_KEY=your-key-here'));
+        console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
         process.exit(1);
       }
 

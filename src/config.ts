@@ -21,8 +21,10 @@ export class ConfigManager {
       this.config = {};
     }
 
-    // Override with environment variables
-    if (process.env.CLAUDE_API_KEY) {
+    // Override with environment variables (ANTHROPIC_API_KEY is standard, CLAUDE_API_KEY for backward compat)
+    if (process.env.ANTHROPIC_API_KEY) {
+      this.config.apiKey = process.env.ANTHROPIC_API_KEY;
+    } else if (process.env.CLAUDE_API_KEY) {
       this.config.apiKey = process.env.CLAUDE_API_KEY;
     }
 

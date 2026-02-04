@@ -93,10 +93,23 @@ export class AnthropicProvider implements LLMProvider {
     const anthropicTools = this.convertTools(tools);
 
     try {
+      // Build system parameter - use cache_control for prompt caching if system prompt provided
+      const systemParam = options.systemPrompt
+        ? [
+            {
+              type: 'text' as const,
+              text: options.systemPrompt,
+              cache_control: { type: 'ephemeral' as const }
+            }
+          ]
+        : undefined;
+
       const response = await this.client.messages.create({
         model: this.modelName,
         max_tokens: options.maxTokens,
-        system: options.systemPrompt,
+        // Use cache_control on system prompt to enable Anthropic's prompt caching
+        // System prompt is 3,500+ tokens - caching saves significant tokens over many turns
+        system: systemParam,
         tools: anthropicTools.length > 0 ? anthropicTools : undefined,
         messages: anthropicMessages,
         stop_sequences: options.stopSequences,

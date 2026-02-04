@@ -1,5 +1,7 @@
 # SemanticWiki
 
+**SemanticWiki is the intellectual property of [reasoning.software](https://reasoning.software) (MadWatch LLC). Created by Dakota Kim.**
+
 > Generate architectural documentation wikis with source code traceability
 
 An AI-powered CLI that does two things:
@@ -520,4 +522,6 @@ This project was created using the [Claude Agent SDK](https://github.com/anthrop
 
 ## License
 
-MIT
+MIT License - Copyright (c) 2025 Dakota Kim / reasoning.software (MadWatch LLC)
+
+See [LICENSE](./LICENSE) for full terms. Attribution to Dakota Kim as the original creator is required in all forks and derivative works.

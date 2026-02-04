@@ -30,16 +30,16 @@ interface ModelRegistryEntry extends ModelRecommendation {
  * Registry of available models with their hardware requirements
  */
 const MODEL_REGISTRY: ModelRegistryEntry[] = [
-  // GPT-OSS 21B - excellent quality open source model (only supported model for now)
+  // GPT-OSS 20B fine-tuned for architectural wiki (SemanticWiki)
   {
     family: 'gpt-oss',
-    modelId: 'gpt-oss-20b-q8',
-    ggufFile: 'gpt-oss-20b-Q8_0.gguf',
+    modelId: 'gpt-oss-20b-semanticwiki-q8',
+    ggufFile: 'gpt-oss-20b-semanticwiki-q8_0.gguf',
     downloadUrl:
-      'https://huggingface.co/unsloth/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-Q8_0.gguf',
-    fileSizeBytes: 12_100_000_000, // ~12.1 GB
-    minVram: 14,
-    minRam: 16,
+      'https://huggingface.co/GhostScientist/gpt-oss-20b-semanticwiki-gguf/resolve/main/gpt-oss-20b-semanticwiki-q8_0.gguf',
+    fileSizeBytes: 22_300_000_000, // ~22.3 GB
+    minVram: 24,
+    minRam: 32,
     contextLength: 32768,
     quality: 'excellent',
   },
