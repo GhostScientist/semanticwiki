@@ -2,6 +2,11 @@
 
 All notable changes to semanticwiki will be documented in this file.
 
+## [1.3.0] - 2026-05-07
+
+### Fixed
+- `semanticwiki generate --full-local` no longer requires `ANTHROPIC_API_KEY`. The agent constructor previously threw before the local provider was ever consulted; key validation is now deferred to the provider that actually needs it (`AnthropicProvider.initialize()`), so Ollama and bundled llama.cpp paths work with no Anthropic credentials.
+
 ## [1.2.1] - 2026-05-07
 
 ### Added
