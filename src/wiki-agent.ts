@@ -191,12 +191,11 @@ export class ArchitecturalWikiAgent {
   constructor(config: WikiAgentConfig = {}) {
     this.config = config;
 
+    // Sync apiKey into the env var so the Claude Agent SDK and AnthropicProvider can pick it up.
+    // Validation is deferred to the providers: AnthropicProvider.initialize() throws if cloud
+    // mode is requested without a key, while local providers (Ollama, llama.cpp) need no key.
     if (config.apiKey) {
       process.env.ANTHROPIC_API_KEY = config.apiKey;
-    }
-
-    if (!process.env.ANTHROPIC_API_KEY) {
-      throw new Error('Anthropic API key required. Set ANTHROPIC_API_KEY environment variable.');
     }
 
     this.permissionManager = config.permissionManager || new PermissionManager({ policy: 'permissive' });

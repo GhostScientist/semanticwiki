@@ -2,6 +2,25 @@
 
 All notable changes to semanticwiki will be documented in this file.
 
+## [1.3.0] - 2026-05-07
+
+### Fixed
+- `semanticwiki generate --full-local` no longer requires `ANTHROPIC_API_KEY`. The agent constructor previously threw before the local provider was ever consulted; key validation is now deferred to the provider that actually needs it (`AnthropicProvider.initialize()`), so Ollama and bundled llama.cpp paths work with no Anthropic credentials.
+
+## [1.2.1] - 2026-05-07
+
+### Added
+- Anthropic prompt caching on the agent's system prompt (3,500+ tokens) to reduce cost and latency across turns
+- `--compact-search` flag to truncate search-tool results and reduce token usage
+- Automatic large-codebase optimization: when the index exceeds 50k chunks, search defaults to fewer results and compact mode, with conversation pruning when approaching context limits
+- Support for the standard `ANTHROPIC_API_KEY` environment variable (`CLAUDE_API_KEY` retained for backward compatibility)
+
+### Changed
+- Local mode now uses the `GhostScientist/gpt-oss-20b-semanticwiki` fine-tuned model (~22.3 GB Q8 GGUF, requires 24 GB VRAM / 32 GB RAM) for higher-quality wiki generation
+
+### Maintenance
+- Refreshed and pruned `package-lock.json` against current dependency ranges
+
 ## [1.2.0] - 2026-01-16
 
 ### Added
