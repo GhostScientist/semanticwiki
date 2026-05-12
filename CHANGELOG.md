@@ -2,6 +2,18 @@
 
 All notable changes to semanticwiki will be documented in this file.
 
+## [1.4.0] - 2026-05-11
+
+### Changed
+- Default Claude model upgraded from `claude-sonnet-4-20250514` (Sonnet 4.0, deprecated, retires June 2026) to `claude-opus-4-7` across `generate`, `update-docs`, `update-wiki`, and `continue`
+- `AnthropicProvider` (`--direct-api` path) now enables adaptive thinking with `effort: "high"` and round-trips thinking blocks across tool-use turns — meaningfully better output quality for the wiki planning loop
+- `@anthropic-ai/claude-agent-sdk` bumped `^0.1.53` → `^0.2.139`; `@anthropic-ai/sdk` bumped `^0.71.2` → `^0.95.2`
+
+### Added
+- First-run mode picker on `generate`: when none of `--full-local`, `--direct-api`, or `-m` is passed and stdin is a TTY, prompt for "Anthropic API vs Local model" — picking API chains into the model picker, picking Local skips the API-key check entirely
+- Interactive model picker (Opus 4.7 / Sonnet 4.6) on `generate`, `update-docs`, `update-wiki`, and `continue` when `-m` isn't passed and stdin is a TTY. Non-interactive runs (CI, piped input) silently use the default
+- `ThinkingContentBlock` type and `LLMResponse.thinkingBlocks` so providers can preserve adaptive-thinking state across multi-turn tool use
+
 ## [1.3.0] - 2026-05-07
 
 ### Fixed

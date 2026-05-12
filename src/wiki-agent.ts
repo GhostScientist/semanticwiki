@@ -912,10 +912,19 @@ export class ArchitecturalWikiAgent {
         // Process response content - use explicit type for our content blocks
         type LocalContentBlock =
           | { type: 'text'; text: string }
-          | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> };
+          | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+          | { type: 'thinking'; thinking: string; signature: string };
 
         const assistantContent: LocalContentBlock[] = [];
         const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
+
+        // Thinking blocks must come first in the assistant message when adaptive thinking
+        // is combined with tool use — the API requires them preserved between turns.
+        if (response.thinkingBlocks) {
+          for (const tb of response.thinkingBlocks) {
+            assistantContent.push({ type: 'thinking', thinking: tb.thinking, signature: tb.signature });
+          }
+        }
 
         // Handle text content
         if (response.content) {
@@ -956,11 +965,13 @@ export class ArchitecturalWikiAgent {
           });
         }
 
-        // Add assistant message with text and tool uses
+        // Add assistant message with thinking (if any), text, and tool uses
         // Map to our ContentBlock types from ./llm/types
         const mappedContent = assistantContent.map(block => {
           if (block.type === 'text') {
             return { type: 'text' as const, text: block.text };
+          } else if (block.type === 'thinking') {
+            return { type: 'thinking' as const, thinking: block.thinking, signature: block.signature };
           } else {
             return {
               type: 'tool_use' as const,
@@ -1072,8 +1083,20 @@ Create all ${missingPages.length} missing pages now.`;
             console.log(`[${logPrefix}] Continuation turn ${continuationTurns}: ${response.stopReason}`);
           }
 
-          const assistantContentBlocks: Array<{ type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }> = [];
+          const assistantContentBlocks: Array<
+            | { type: 'text'; text: string }
+            | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
+            | { type: 'thinking'; thinking: string; signature: string }
+          > = [];
           const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
+
+          // Thinking blocks must come first in the assistant message when adaptive thinking
+          // is combined with tool use — the API requires them preserved between turns.
+          if (response.thinkingBlocks) {
+            for (const tb of response.thinkingBlocks) {
+              assistantContentBlocks.push({ type: 'thinking', thinking: tb.thinking, signature: tb.signature });
+            }
+          }
 
           // Handle text content
           if (response.content) {
@@ -3445,7 +3468,7 @@ Generate the complete Markdown content for the index page:`;
    */
   private buildAgentOptions(wikiOptions: WikiGenerationOptions): any {
     return {
-      model: wikiOptions.model || 'claude-sonnet-4-20250514',
+      model: wikiOptions.model || 'claude-opus-4-7',
       cwd: this.repoPath,
       systemPrompt: WIKI_SYSTEM_PROMPT,
       mcpServers: {

@@ -20,7 +20,7 @@ import type { LLMProvider, CreateProviderOptions } from './types.js';
  *
  * @example
  * // Use Claude API (default)
- * const provider = await createLLMProvider({ model: 'claude-sonnet-4-20250514' });
+ * const provider = await createLLMProvider({ model: 'claude-opus-4-7' });
  *
  * @example
  * // Use local mode (self-contained)
@@ -82,7 +82,7 @@ export async function createLLMProvider(options: CreateProviderOptions = {}): Pr
     // Use cloud Anthropic API
     provider = new AnthropicProvider({
       apiKey: options.apiKey,
-      model: options.model || 'claude-sonnet-4-20250514',
+      model: options.model || 'claude-opus-4-7',
       onProgress: options.onProgress,
     });
     console.log('[createLLMProvider] Created AnthropicProvider');

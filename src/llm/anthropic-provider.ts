@@ -16,6 +16,7 @@ import type {
   ModelInfo,
   ProgressCallback,
   ContentBlock,
+  ThinkingContentBlock,
 } from './types.js';
 
 /**
@@ -24,7 +25,7 @@ import type {
 export interface AnthropicProviderOptions {
   /** Anthropic API key */
   apiKey?: string;
-  /** Model name to use (default: claude-sonnet-4-20250514) */
+  /** Model name to use (default: claude-opus-4-7) */
   model?: string;
   /** Progress callback for status updates */
   onProgress?: ProgressCallback;
@@ -43,7 +44,7 @@ export class AnthropicProvider implements LLMProvider {
 
   constructor(options: AnthropicProviderOptions = {}) {
     this.apiKey = options.apiKey;
-    this.modelName = options.model || 'claude-sonnet-4-20250514';
+    this.modelName = options.model || 'claude-opus-4-7';
     this.progressCallback = options.onProgress;
   }
 
@@ -104,7 +105,14 @@ export class AnthropicProvider implements LLMProvider {
           ]
         : undefined;
 
-      const response = await this.client.messages.create({
+      // Adaptive thinking + high effort. On Opus 4.7 / 4.6 / Sonnet 4.6 this lets Claude
+      // decide when and how deeply to reason — meaningfully better output for the wiki
+      // planning loop. Thinking blocks come back with empty .thinking but populated
+      // .signature on Opus 4.7 (display defaults to "omitted"); we round-trip them
+      // verbatim because adaptive + tool use requires preserving them between turns.
+      // The `as any` casts fall away once @anthropic-ai/sdk is bumped to a version whose
+      // typings include `thinking.type: "adaptive"` and `output_config.effort`.
+      const createParams = {
         model: this.modelName,
         max_tokens: options.maxTokens,
         // Use cache_control on system prompt to enable Anthropic's prompt caching
@@ -113,7 +121,10 @@ export class AnthropicProvider implements LLMProvider {
         tools: anthropicTools.length > 0 ? anthropicTools : undefined,
         messages: anthropicMessages,
         stop_sequences: options.stopSequences,
-      });
+        thinking: { type: 'adaptive' },
+        output_config: { effort: 'high' },
+      };
+      const response = (await this.client.messages.create(createParams as any)) as Anthropic.Message;
 
       return this.parseResponse(response);
     } catch (error) {
@@ -220,7 +231,7 @@ export class AnthropicProvider implements LLMProvider {
    */
   private convertContentBlock(
     block: ContentBlock
-  ): Anthropic.TextBlockParam | Anthropic.ToolUseBlockParam | Anthropic.ToolResultBlockParam {
+  ): Anthropic.TextBlockParam | Anthropic.ToolUseBlockParam | Anthropic.ToolResultBlockParam | { type: 'thinking'; thinking: string; signature: string } {
     switch (block.type) {
       case 'text':
         return { type: 'text', text: block.text };
@@ -238,6 +249,10 @@ export class AnthropicProvider implements LLMProvider {
           content: block.content,
           is_error: block.is_error,
         };
+      case 'thinking':
+        // Pass thinking blocks back verbatim — signature carries the encrypted reasoning
+        // that the server needs to reconstruct context on the next turn.
+        return { type: 'thinking', thinking: block.thinking, signature: block.signature };
       default:
         throw new Error(`Unknown content block type: ${(block as ContentBlock).type}`);
     }
@@ -259,6 +274,7 @@ export class AnthropicProvider implements LLMProvider {
    */
   private parseResponse(response: Anthropic.Message): LLMResponse {
     const toolCalls: LLMToolCall[] = [];
+    const thinkingBlocks: ThinkingContentBlock[] = [];
     let textContent = '';
 
     for (const block of response.content) {
@@ -270,6 +286,11 @@ export class AnthropicProvider implements LLMProvider {
           name: block.name,
           arguments: block.input as Record<string, unknown>,
         });
+      } else if ((block as { type: string }).type === 'thinking') {
+        // Collect adaptive-thinking blocks so the caller can round-trip them on the next
+        // turn. signature is opaque; thinking text is empty on Opus 4.7 by default.
+        const t = block as unknown as { thinking: string; signature: string };
+        thinkingBlocks.push({ type: 'thinking', thinking: t.thinking ?? '', signature: t.signature });
       }
     }
 
@@ -283,6 +304,7 @@ export class AnthropicProvider implements LLMProvider {
     return {
       content: textContent,
       toolCalls,
+      thinkingBlocks: thinkingBlocks.length > 0 ? thinkingBlocks : undefined,
       stopReason,
       usage: {
         inputTokens: response.usage.input_tokens,

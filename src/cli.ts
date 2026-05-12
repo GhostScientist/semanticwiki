@@ -35,6 +35,76 @@ program
   .description('Generate architectural documentation wikis for code repositories with source traceability.')
   .version('1.0.0');
 
+// Interactive model picker. Shown when the user didn't pass -m AND stdin is a TTY.
+// Non-interactive runs (CI, piped input, scripts) silently keep `defaultValue`.
+async function selectModelInteractive(command: Command, defaultValue: string): Promise<string> {
+  const source = command.getOptionValueSource('model');
+  if (source && source !== 'default') return defaultValue;
+  if (!process.stdin.isTTY) return defaultValue;
+
+  const { model } = await inquirer.prompt([{
+    type: 'list',
+    name: 'model',
+    message: 'Select Claude model:',
+    default: defaultValue,
+    choices: [
+      {
+        name: 'Opus 4.7  — highest quality, $5/M in · $25/M out',
+        value: 'claude-opus-4-7',
+      },
+      {
+        name: 'Sonnet 4.6 — strong quality, ~3x cheaper, $3/M in · $15/M out',
+        value: 'claude-sonnet-4-6',
+      },
+    ],
+  }]);
+  return model;
+}
+
+// First-run mode picker for the `generate` command. When the user runs
+// `semanticwiki generate -r ./repo` with no execution-mode flags, prompt them
+// to choose between local inference and the Anthropic API. If they pick API,
+// chain into the model picker so they don't have to know the model strings.
+// Skipped if any of --full-local, --direct-api, or -m was passed, or if stdin
+// isn't a TTY (CI, piped input).
+async function selectModeInteractive(
+  command: Command,
+  options: { fullLocal?: boolean; directApi?: boolean; model?: string },
+): Promise<void> {
+  const modelSource = command.getOptionValueSource('model');
+  const localSource = command.getOptionValueSource('fullLocal');
+  const directApiSource = command.getOptionValueSource('directApi');
+  const anyExplicit =
+    (modelSource && modelSource !== 'default') ||
+    (localSource && localSource !== 'default') ||
+    (directApiSource && directApiSource !== 'default');
+  if (anyExplicit) return;
+  if (!process.stdin.isTTY) return;
+
+  const { mode } = await inquirer.prompt([{
+    type: 'list',
+    name: 'mode',
+    message: 'How would you like to run the wiki generator?',
+    choices: [
+      {
+        name: 'Anthropic API  — best quality, uses your ANTHROPIC_API_KEY',
+        value: 'api',
+      },
+      {
+        name: 'Local model    — free, runs on your machine (one-time ~22 GB model download)',
+        value: 'local',
+      },
+    ],
+  }]);
+
+  if (mode === 'local') {
+    options.fullLocal = true;
+  } else {
+    options.directApi = true;
+    options.model = await selectModelInteractive(command, options.model || 'claude-opus-4-7');
+  }
+}
+
 // Config command
 program
   .command('config')
@@ -68,7 +138,7 @@ program
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
   .option('-c, --config <file>', 'Path to wiki configuration file (wiki.json)')
   .option('-t, --token <token>', 'Access token for private repositories')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-m, --model <model>', 'Claude model to use', 'claude-opus-4-7')
   .option('-p, --path <path>', 'Specific path within repo to focus on')
   .option('-f, --force', 'Force regeneration (ignore cache)')
   .option('-v, --verbose', 'Verbose output')
@@ -95,10 +165,21 @@ program
   .option('--context-size <n>', 'Context window size for local models (default: 32768)', parseInt)
   .option('--threads <n>', 'CPU threads for local inference (default: auto)', parseInt)
   .option('--compact-search', 'Truncate search results to reduce token usage (auto-enabled for large codebases)')
-  .action(async (options) => {
+  .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
+
+      // First-run interactive picker: when no mode/model flag was passed and stdin is a
+      // TTY, ask local vs API (and which model if API). This mutates options.fullLocal,
+      // options.directApi, and options.model. Skipped entirely in non-interactive runs.
+      await selectModeInteractive(command, options);
+
+      // If user (or the picker) chose cloud mode, still allow the model picker to run
+      // for the case where mode was set via flag but model wasn't.
+      if (!options.fullLocal) {
+        options.model = await selectModelInteractive(command, options.model);
+      }
 
       // API key only required for cloud mode
       if (!options.fullLocal && !configManager.hasApiKey()) {
@@ -416,9 +497,9 @@ program
   .description('Update documentation based on changes since last index')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-m, --model <model>', 'Claude model to use', 'claude-opus-4-7')
   .option('-v, --verbose', 'Verbose output')
-  .action(async (options) => {
+  .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
@@ -429,6 +510,8 @@ program
         console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
         process.exit(1);
       }
+
+      options.model = await selectModelInteractive(command, options.model);
 
       const wikiDir = path.resolve(options.output);
       const cacheDir = path.join(wikiDir, '.semanticwiki-cache');
@@ -696,11 +779,11 @@ program
   .description('Update wiki documentation based on code changes (handles both modifications and new additions)')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-m, --model <model>', 'Claude model to use', 'claude-opus-4-7')
   .option('-v, --verbose', 'Verbose output')
   .option('--direct-api', 'Use Anthropic API directly (bypasses Claude Code billing)')
   .option('--dry-run', 'Show what would be updated without making changes')
-  .action(async (options) => {
+  .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
@@ -711,6 +794,8 @@ program
         console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
         process.exit(1);
       }
+
+      options.model = await selectModelInteractive(command, options.model);
 
       const wikiDir = path.resolve(options.output);
       const cacheDir = path.join(wikiDir, '.semanticwiki-cache');
@@ -1015,13 +1100,13 @@ program
   .description('Continue generating missing wiki pages (verifies completeness and creates missing pages)')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-m, --model <model>', 'Claude model to use', 'claude-opus-4-7')
   .option('-v, --verbose', 'Verbose output')
   .option('--verify-only', 'Only verify completeness, do not generate missing pages')
   .option('--skip-index', 'Skip indexing and use existing cached index')
   .option('--direct-api', 'Use Anthropic API directly (bypasses Claude Code billing)')
   .option('--max-turns <number>', 'Maximum agent turns (default 200)', parseInt)
-  .action(async (options) => {
+  .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
@@ -1032,6 +1117,8 @@ program
         console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
         process.exit(1);
       }
+
+      options.model = await selectModelInteractive(command, options.model);
 
       const wikiDir = path.resolve(options.output);
 

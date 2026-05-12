@@ -37,7 +37,20 @@ export interface ToolResultContentBlock {
   is_error?: boolean;
 }
 
-export type ContentBlock = TextContentBlock | ToolUseContentBlock | ToolResultContentBlock;
+// Opus 4.7 / 4.6 with adaptive thinking + tool use returns thinking blocks that must be
+// passed back verbatim on subsequent turns. signature is the opaque encrypted thinking;
+// thinking text is empty on Opus 4.7 unless display: "summarized" is set.
+export interface ThinkingContentBlock {
+  type: 'thinking';
+  thinking: string;
+  signature: string;
+}
+
+export type ContentBlock =
+  | TextContentBlock
+  | ToolUseContentBlock
+  | ToolResultContentBlock
+  | ThinkingContentBlock;
 
 /**
  * Message format for LLM conversations
@@ -73,6 +86,10 @@ export interface LLMToolCall {
 export interface LLMResponse {
   content: string;
   toolCalls: LLMToolCall[];
+  // Thinking blocks returned by the provider. Must be round-tripped verbatim in the next
+  // assistant message when adaptive thinking is combined with tool use (Anthropic API
+  // requirement). Local/Ollama providers leave this undefined.
+  thinkingBlocks?: ThinkingContentBlock[];
   stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'error';
   usage: {
     inputTokens: number;
