@@ -2,6 +2,20 @@
 
 All notable changes to semanticwiki will be documented in this file.
 
+## [1.4.0] - 2026-07-13
+
+### Changed
+- Default cloud model is now **`claude-sonnet-5`** (was `claude-sonnet-4-20250514`, which is deprecated and retires 2026-06-15). Applies to wiki generation, the direct-API agent loop, the interactive development agent, and all `--model` defaults. The `--model` flag still overrides — pass `--model claude-opus-4-8` for top-tier quality.
+- `AnthropicProvider` now sends `thinking: { type: 'disabled' }`. Current Claude models enable adaptive thinking by default when `thinking` is omitted, which emits `thinking` blocks that must be replayed unchanged on later turns; the provider reconstructs assistant turns from text/tool_use only, so thinking is disabled to keep the multi-turn tool loop working exactly as before.
+
+### Maintenance
+- Upgraded `@anthropic-ai/sdk` (0.71 → 0.111) and `@anthropic-ai/claude-agent-sdk` (0.1 → 0.3); refreshed `vitest`, `@vitest/coverage-v8`, and `@types/node` within their current majors.
+- Fixed the CLI `--version` output, which was hardcoded to `1.0.0`.
+- Added `docs/plans/ROADMAP.md` with the prioritized next-feature roadmap.
+
+### Note
+- Claude Sonnet 5 uses a newer tokenizer that counts ~30% more tokens than Sonnet 4 for the same text, so per-run token usage (and cost) will rise even though per-token pricing is unchanged.
+
 ## [1.3.0] - 2026-05-07
 
 ### Fixed

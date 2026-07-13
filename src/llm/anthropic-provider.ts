@@ -24,7 +24,7 @@ import type {
 export interface AnthropicProviderOptions {
   /** Anthropic API key */
   apiKey?: string;
-  /** Model name to use (default: claude-sonnet-4-20250514) */
+  /** Model name to use (default: claude-sonnet-5) */
   model?: string;
   /** Progress callback for status updates */
   onProgress?: ProgressCallback;
@@ -43,7 +43,7 @@ export class AnthropicProvider implements LLMProvider {
 
   constructor(options: AnthropicProviderOptions = {}) {
     this.apiKey = options.apiKey;
-    this.modelName = options.model || 'claude-sonnet-4-20250514';
+    this.modelName = options.model || 'claude-sonnet-5';
     this.progressCallback = options.onProgress;
   }
 
@@ -107,6 +107,12 @@ export class AnthropicProvider implements LLMProvider {
       const response = await this.client.messages.create({
         model: this.modelName,
         max_tokens: options.maxTokens,
+        // Disable extended/adaptive thinking. Sonnet 5 (and other current models)
+        // enable adaptive thinking by default when `thinking` is omitted, which
+        // emits `thinking` blocks that must be echoed back unchanged on later
+        // turns. This provider reconstructs assistant turns from text/tool_use
+        // only, so leaving thinking on would break the multi-turn tool loop.
+        thinking: { type: 'disabled' },
         // Use cache_control on system prompt to enable Anthropic's prompt caching
         // System prompt is 3,500+ tokens - caching saves significant tokens over many turns
         system: systemParam,

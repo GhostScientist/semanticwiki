@@ -3445,7 +3445,7 @@ Generate the complete Markdown content for the index page:`;
    */
   private buildAgentOptions(wikiOptions: WikiGenerationOptions): any {
     return {
-      model: wikiOptions.model || 'claude-sonnet-4-20250514',
+      model: wikiOptions.model || 'claude-sonnet-5',
       cwd: this.repoPath,
       systemPrompt: WIKI_SYSTEM_PROMPT,
       mcpServers: {

@@ -33,7 +33,7 @@ const program = new Command();
 program
   .name('semanticwiki')
   .description('Generate architectural documentation wikis for code repositories with source traceability.')
-  .version('1.0.0');
+  .version('1.4.0');
 
 // Config command
 program
@@ -68,7 +68,7 @@ program
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
   .option('-c, --config <file>', 'Path to wiki configuration file (wiki.json)')
   .option('-t, --token <token>', 'Access token for private repositories')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
   .option('-p, --path <path>', 'Specific path within repo to focus on')
   .option('-f, --force', 'Force regeneration (ignore cache)')
   .option('-v, --verbose', 'Verbose output')
@@ -416,7 +416,7 @@ program
   .description('Update documentation based on changes since last index')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
   .option('-v, --verbose', 'Verbose output')
   .action(async (options) => {
     try {
@@ -696,7 +696,7 @@ program
   .description('Update wiki documentation based on code changes (handles both modifications and new additions)')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
   .option('-v, --verbose', 'Verbose output')
   .option('--direct-api', 'Use Anthropic API directly (bypasses Claude Code billing)')
   .option('--dry-run', 'Show what would be updated without making changes')
@@ -1015,7 +1015,7 @@ program
   .description('Continue generating missing wiki pages (verifies completeness and creates missing pages)')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-sonnet-4-20250514')
+  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
   .option('-v, --verbose', 'Verbose output')
   .option('--verify-only', 'Only verify completeness, do not generate missing pages')
   .option('--skip-index', 'Skip indexing and use existing cached index')
