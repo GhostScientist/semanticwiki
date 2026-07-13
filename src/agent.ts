@@ -108,7 +108,7 @@ export class DevelopmentAgentAgent {
     const externalMcpServers = await this.loadExternalMcpServers();
 
     const options: any = {
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-5',
       cwd: process.cwd(),
       systemPrompt,
       mcpServers: {
