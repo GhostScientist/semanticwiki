@@ -1,5 +1,7 @@
 # Local Mode Implementation Plan
 
+> **Status: Implemented** (v1.2.x). This is the original design document, kept for historical reference — some details have since changed. In particular, the bundled model registry now ships the `gpt-oss-20b-semanticwiki` fine-tune rather than the Qwen 2.5 Coder family described below. For current, user-facing local mode documentation see [`docs/local-mode.md`](../local-mode.md). Remaining unshipped items from "Future Enhancements" are tracked in [`ROADMAP.md`](./ROADMAP.md).
+
 ## Overview
 
 This document outlines the implementation plan for adding a `--full-local` flag to the `semanticwiki generate` command, enabling complete offline operation using local language models with **zero external dependencies**.

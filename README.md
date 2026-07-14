@@ -6,50 +6,41 @@
 
 An AI-powered CLI that does two things:
 
-1. **Generates architectural wikis** with source code traceability (`file:line` references)
-2. **Works as an agentic coding assistant** like Claude Code
+1. **Generates architectural wikis** with source traceability (`file:line` references), Mermaid diagrams, and an optional interactive static site
+2. **Works as an agentic coding assistant** with semantic (RAG) search over your codebase
 
 **Built with [buildanagentworkshop.com](https://buildanagentworkshop.com)**
 
 ---
 
-## Two Ways to Use SemanticWiki
+## Choose Your Mode: Cloud or Local
 
-### 1. Generate Documentation (`semanticwiki generate`)
+SemanticWiki can generate documentation three ways. **Pick one before you start** — it determines whether you need an API key at all.
 
-Point SemanticWiki at any codebase and get a complete architectural wiki:
+| Mode | Flag | Requires | Billing | Best for |
+|------|------|----------|---------|----------|
+| **Claude Code** (default) | _none_ | Claude Code installed + credits | Claude Code account | Existing Claude Code users |
+| **Direct API** | `--direct-api` | `ANTHROPIC_API_KEY` | Your Anthropic API credits | Most users with an API key |
+| **Fully local** | `--full-local` | Capable hardware (see below) | **Free** — no API key, no cloud | Privacy, air-gapped, zero-cost runs |
 
 ```bash
+# Cloud, via Claude Code subprocess (default)
 semanticwiki generate -r ./my-project --site
+
+# Cloud, directly against the Anthropic API with your key
+semanticwiki generate -r ./my-project --site --direct-api
+
+# 100% local — no API key, nothing leaves your machine
+semanticwiki generate -r ./my-project --site --full-local
 ```
 
-This creates:
-- **Architecture Overview** with Mermaid diagrams
-- **Module Documentation** with source traceability
-- **Data Flow Documentation**
-- **Getting Started Guides**
-- **Interactive static site** with search, keyboard nav, dark mode
+Notes on each mode:
 
-Every concept links directly to source code (`src/auth/jwt.ts:23-67`), so you can navigate from docs to implementation.
+- **Claude Code mode** spawns a Claude Code subprocess and uses its billing. If you hit a "Credit balance is too low" error here, switch to `--direct-api`.
+- **Direct API mode** runs the same agentic loop against the Anthropic API using your `ANTHROPIC_API_KEY` (default model: `claude-sonnet-5`; override with `--model`).
+- **Local mode** downloads a fine-tuned GGUF model (`gpt-oss-20b-semanticwiki`, ~22 GB one-time download) and runs inference on your machine via node-llama-cpp. Recommended: 24 GB VRAM or 32 GB RAM. You can also point it at an existing [Ollama](https://ollama.com) server with `--use-ollama`. See the **[Local Mode Guide](./docs/local-mode.md)** for hardware requirements, tuning, and troubleshooting.
 
-### 2. Agentic Codebase Assistant
-
-Under the hood, SemanticWiki is a full agentic coding assistant powered by Claude. It doesn't just template docs—it:
-
-- **Explores your codebase** using filesystem tools
-- **Searches semantically** via RAG embeddings (FAISS + all-MiniLM-L6-v2)
-- **Reasons about architecture** to identify patterns and relationships
-- **Writes and verifies** documentation with automatic link checking
-
-```bash
-# The agent runs autonomously, reading files, searching code, writing docs
-semanticwiki generate -r ./my-project --verbose
-
-# Continue where you left off—agent resumes with cached context
-semanticwiki continue -r ./my-project --skip-index
-```
-
-The same RAG system that powers documentation generation gives the agent deep, semantic understanding of your codebase—like Claude Code, but with your entire project pre-indexed for instant retrieval.
+In every mode, embeddings and semantic search always run locally — the mode only changes which LLM writes the documentation.
 
 ---
 
@@ -59,349 +50,195 @@ The same RAG system that powers documentation generation gives the agent deep, s
 npm install -g semanticwiki
 ```
 
-## Prerequisites
+**Prerequisites:**
 
-- **Node.js** >= 18.0.0
-- **Anthropic API key** - Get one at [console.anthropic.com](https://console.anthropic.com)
+- Node.js >= 18
+- For cloud modes: an Anthropic API key from [console.anthropic.com](https://console.anthropic.com)
+- For local mode: see the [Local Mode Guide](./docs/local-mode.md)
 
 ---
 
 ## Quick Start
 
-### 1. Set your API key
-
 ```bash
+# 1. Set your API key (skip this step for --full-local)
 export ANTHROPIC_API_KEY=your-api-key-here
+
+# 2. Generate a wiki + interactive site
+semanticwiki generate -r ./my-project --site --direct-api
+
+# Works with GitHub URLs too
+semanticwiki generate -r https://github.com/user/repo --site --direct-api
+
+# 3. View the results
+#    Markdown wiki:    ./wiki/README.md
+#    Interactive site: ./site/index.html  (generated next to the wiki directory)
 ```
 
-### 2. Generate wiki + interactive site
-
-```bash
-# Generate wiki with interactive site in one command
-semanticwiki generate -r ./my-project --site
-
-# Or for a GitHub repository
-semanticwiki generate -r https://github.com/user/repo --site
-```
-
-### 3. View the results
-
-- **Markdown wiki**: Open `wiki/README.md`
-- **Interactive site**: Open `wiki/site/index.html` in your browser
-
-The static site includes search, navigation, keyboard shortcuts, and works offline.
+Tip: run with `-e / --estimate` first for a dry-run time/cost estimate (in local mode this also checks your hardware and shows the recommended model).
 
 ---
 
-## Usage
+## What You Get
 
-### Generate Command
+The generated wiki contains an architecture overview with Mermaid diagrams, per-module documentation, data-flow docs, getting-started guides, and a glossary. Every concept links to specific source locations:
 
-```bash
-# Basic: Generate wiki for current directory
-semanticwiki generate -r .
+```markdown
+The authentication system uses JWT tokens for stateless auth.
 
-# With interactive static site
-semanticwiki generate -r ./my-project --site
-
-# Custom site title and theme
-semanticwiki generate -r ./my-project --site --site-title "My Project Docs" --theme dark
-
-# Generate site only (if wiki already exists)
-semanticwiki generate -r ./my-project --site-only
-
-# Specify output directory
-semanticwiki generate -r ./my-project -o ./docs/architecture
-
-# Focus on a specific subdirectory
-semanticwiki generate -r ./my-project -p src/core
-
-# Verbose output (see what the agent is doing)
-semanticwiki generate -r ./my-project -v
-
-# Estimate time/cost before running (dry run)
-semanticwiki generate -r ./my-project -e
+**Source:** [`src/auth/jwt-provider.ts:23-67`](../../../src/auth/jwt-provider.ts#L23-L67)
 ```
 
-### Continue Command
+With `--site`, you also get a self-contained static site with full-text search (`/`), keyboard navigation, dark/light themes, rendered Mermaid diagrams, and — with `--ai-chat` — an AI assistant that runs entirely in the browser (SmolLM2 via transformers.js, works offline after the first model download).
 
-Resume generation to fix broken links or add missing pages:
+---
+
+## Commands
+
+### `generate` — create a wiki
 
 ```bash
-# Check for and generate missing pages
+semanticwiki generate -r <repo-path-or-url> [options]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-r, --repo <path/url>` | Repository path or GitHub/GitLab URL (required) | — |
+| `-o, --output <dir>` | Output directory for wiki | `./wiki` |
+| `-c, --config <file>` | Path to `wiki.json` config file | — |
+| `-t, --token <token>` | Access token for private repos | `$GITHUB_TOKEN` |
+| `-m, --model <model>` | Claude model (cloud modes) | `claude-sonnet-5` |
+| `-p, --path <path>` | Focus on a specific directory | — |
+| `-f, --force` | Force regeneration (ignore cache) | — |
+| `-v, --verbose` | Show detailed progress | — |
+| `-e, --estimate` | Estimate time/cost without running | — |
+| `-s, --site` | Also generate the interactive static site | — |
+| `--site-only` | Generate site from existing wiki markdown | — |
+| `--site-title <title>` | Custom site title | `Architecture Wiki` |
+| `--theme <theme>` | Site theme: `light`, `dark`, `auto` | `auto` |
+| `--ai-chat` | Add the in-browser AI chat assistant to the site | — |
+| `--direct-api` | **Mode:** use the Anthropic API directly | — |
+| `--full-local` | **Mode:** run entirely locally, no API key | — |
+| `--max-turns <n>` | Limit agent iterations | `200` |
+| `--skip-index` | Reuse the cached embeddings index | — |
+| `--max-chunks <n>` | Limit indexed chunks (large repos) | unlimited |
+| `--max-results <n>` | Max search results per query | `10` |
+| `--batch-size <n>` | Batched indexing for very large repos | — |
+| `--compact-search` | Truncate search results to save tokens (auto for large repos) | — |
+
+Local-mode-only options (`--local-model`, `--model-path`, `--use-ollama`, `--ollama-host`, `--gpu-layers`, `--context-size`, `--threads`) are documented in the [Local Mode Guide](./docs/local-mode.md).
+
+### `continue` — finish an incomplete wiki
+
+Verifies internal links and generates any missing pages.
+
+```bash
 semanticwiki continue -r ./my-project -o ./wiki
-
-# Just verify (don't generate)
-semanticwiki continue -r ./my-project -o ./wiki --verify-only
-
-# Use cached index for faster iteration
-semanticwiki continue -r ./my-project -o ./wiki --skip-index
+semanticwiki continue -r ./my-project -o ./wiki --verify-only   # check only
+semanticwiki continue -r ./my-project -o ./wiki --skip-index    # faster iteration
 ```
 
-### Search Command
+Also supports `-m/--model`, `--direct-api`, `--max-turns`, `-v`.
 
-Search your wiki from the command line:
+### `verify` — check wiki completeness
 
 ```bash
-# Search wiki content
-semanticwiki search "authentication flow" -w ./wiki
-
-# Hybrid search (keyword + semantic)
-semanticwiki search "how does login work" -w ./wiki --hybrid
+semanticwiki verify -o ./wiki          # human-readable report
+semanticwiki verify -o ./wiki --json   # JSON output; exit code 1 if incomplete
 ```
 
-### MCP Server
+### `update-embeddings` / `update-wiki` — keep docs current
 
-Start an MCP server for AI assistant integration (Claude Desktop, Claude Code):
+After new commits, update the RAG index and then the affected wiki pages:
 
 ```bash
-# Start MCP server for a wiki
-semanticwiki mcp-server -w ./wiki
-
-# With code search (requires RAG index)
-semanticwiki mcp-server -w ./wiki -r ./my-project
+semanticwiki update-embeddings -r ./my-project -o ./wiki          # incremental re-index
+semanticwiki update-embeddings -r ./my-project -o ./wiki --full   # full re-index
+semanticwiki update-wiki -r ./my-project -o ./wiki                # update affected pages
+semanticwiki update-wiki -r ./my-project -o ./wiki --dry-run      # preview only
 ```
 
-Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+(`update-docs` also exists but currently re-runs full generation; prefer the two commands above.)
+
+### `search` — search the wiki or the code index
+
+```bash
+semanticwiki search "authentication flow" -o ./wiki               # search wiki pages
+semanticwiki search "token validation" -o ./wiki --code           # search code (RAG index)
+semanticwiki search "login" -o ./wiki --code -m keyword           # mode: hybrid|vector|keyword
+semanticwiki search "login" -o ./wiki --code --rerank             # cross-encoder reranking
+```
+
+Options: `-o, --output <dir>` (wiki dir, default `./wiki`), `-n, --max-results <n>` (default 10), `-m, --mode <mode>` (default `hybrid`), `--code`, `--rerank`.
+
+### `mcp-server` — expose the wiki to AI assistants
+
+Starts a stdio MCP server with wiki search/Q&A tools for Claude Desktop or Claude Code:
+
+```bash
+semanticwiki mcp-server -o ./wiki                     # wiki tools
+semanticwiki mcp-server -o ./wiki -r ./my-project     # + code search
+```
+
+Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
 ```json
 {
   "mcpServers": {
     "my-wiki": {
       "command": "semanticwiki",
-      "args": ["mcp-server", "-w", "/path/to/wiki"]
+      "args": ["mcp-server", "-o", "/path/to/wiki"]
     }
   }
 }
 ```
 
-### Pack & Unpack
+### `pack` / `unpack` — share portable wiki packages
 
-Create portable wiki packages for sharing:
-
-```bash
-# Create package (includes wiki + RAG index)
-semanticwiki pack -w ./wiki -o ./my-wiki.archiwiki
-
-# Extract package
-semanticwiki unpack -p ./my-wiki.archiwiki -o ./extracted
-
-# Extract wiki only (no RAG index)
-semanticwiki unpack -p ./my-wiki.archiwiki -o ./extracted --wiki-only
-```
-
-### Large Codebase Options
-
-For repositories with 10,000+ files:
+Bundle a wiki (optionally with its RAG index) into a single `.archiwiki` file:
 
 ```bash
-# Limit indexed chunks (reduces memory usage)
-semanticwiki generate -r ./large-project --max-chunks 5000
-
-# Reduce search results per query
-semanticwiki generate -r ./large-project --max-results 5
-
-# Batched processing (for very large repos)
-semanticwiki generate -r ./large-project --batch-size 3000
+semanticwiki pack -o ./wiki -f ./my-wiki.archiwiki    # create (add --no-rag to exclude index)
+semanticwiki unpack ./my-wiki.archiwiki -o ./extracted
+semanticwiki unpack ./my-wiki.archiwiki --info        # inspect without extracting
+semanticwiki unpack ./my-wiki.archiwiki --wiki-only   # skip the RAG index
 ```
 
-### Direct API Mode
+### Coding assistant (default command)
 
-Bypass Claude Code billing and use your API credits directly:
+Without a subcommand, SemanticWiki is a general-purpose coding agent (requires an API key):
 
 ```bash
-# Uses ANTHROPIC_API_KEY directly
-semanticwiki generate -r ./my-project --direct-api
-
-# Combine with skip-index for fast iteration
-semanticwiki generate -r ./my-project --direct-api --skip-index
+semanticwiki "explain the auth flow in this repo"   # one-shot query
+semanticwiki -i                                     # interactive session
+semanticwiki -p "refactor the config loader"       # plan mode: review a plan before executing
 ```
 
-### Debug & Development
+The interactive session supports slash commands (`/help`, `/plan`, `/mcp-add`, custom commands from `.claude/commands/`, skills, and workflows) and loads the target repo's own `CLAUDE.md`.
 
-```bash
-# Skip re-indexing (use cached embeddings)
-semanticwiki generate -r ./my-project --skip-index
+### `config` — API key help
 
-# Limit agent turns (reduces cost)
-semanticwiki generate -r ./my-project --max-turns 50
-```
+`semanticwiki config --show` displays the current API key source. Keys are read from `ANTHROPIC_API_KEY` (or legacy `CLAUDE_API_KEY`), including from a `.env` file in the working directory.
 
 ---
 
-## Command Reference
+## Large Codebases
 
-### `generate` - Create wiki documentation
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-r, --repo <path/url>` | Repository path or GitHub URL (required) | - |
-| `-o, --output <dir>` | Output directory for wiki | `./wiki` |
-| `-c, --config <file>` | Path to wiki.json config file | - |
-| `-t, --token <token>` | GitHub token for private repos | - |
-| `-m, --model <model>` | Claude model to use | `claude-sonnet-4-20250514` |
-| `-p, --path <path>` | Focus on specific directory | - |
-| `-f, --force` | Force regeneration (ignore cache) | - |
-| `-v, --verbose` | Show detailed progress | - |
-| `-e, --estimate` | Estimate time/cost (dry run) | - |
-| `-s, --site` | Generate interactive static site | - |
-| `--ai-chat` | Add AI chat assistant to site | - |
-| `--site-only` | Generate site only (skip wiki) | - |
-| `--site-title <title>` | Custom site title | Project name |
-| `--theme <theme>` | Site theme: `light`, `dark`, `auto` | `auto` |
-| `--max-chunks <n>` | Limit indexed chunks | unlimited |
-| `--max-results <n>` | Max search results per query | `10` |
-| `--batch-size <n>` | Enable batched processing | - |
-| `--skip-index` | Use cached embeddings index | - |
-| `--max-turns <n>` | Limit agent iterations | `200` |
-| `--direct-api` | Use Anthropic API directly | - |
-
-### `continue` - Resume/fix wiki generation
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-r, --repo <path>` | Repository path (required) | - |
-| `-o, --output <dir>` | Wiki output directory | `./wiki` |
-| `-m, --model <model>` | Claude model to use | `claude-sonnet-4-20250514` |
-| `-v, --verbose` | Show detailed progress | - |
-| `--verify-only` | Only check, don't generate | - |
-| `--skip-index` | Use cached embeddings index | - |
-| `--direct-api` | Use Anthropic API directly | - |
-| `--max-turns <n>` | Limit agent iterations | `200` |
-
-### `search` - Search wiki content
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `<query>` | Search query (required) | - |
-| `-w, --wiki <dir>` | Wiki directory | `./wiki` |
-| `-n, --limit <n>` | Max results | `10` |
-| `--hybrid` | Use hybrid search (keyword + semantic) | - |
-
-### `mcp-server` - Start MCP server
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-w, --wiki <dir>` | Wiki directory (required) | - |
-| `-r, --repo <path>` | Repository path (enables code search) | - |
-
-### `pack` - Create wiki package
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-w, --wiki <dir>` | Wiki directory (required) | - |
-| `-o, --output <file>` | Output package path | `<name>.archiwiki` |
-| `-n, --name <name>` | Package name | wiki folder name |
-| `--no-rag` | Exclude RAG index | - |
-
-### `unpack` - Extract wiki package
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-p, --package <file>` | Package file (required) | - |
-| `-o, --output <dir>` | Output directory | `.` |
-| `--wiki-only` | Extract wiki only (no RAG index) | - |
-
----
-
-## Static Site Features
-
-When you use `--site`, SemanticWiki generates a fully interactive documentation site:
-
-- **Full-text search** - Instant search across all pages (Cmd/Ctrl+K)
-- **AI Chat Assistant** - Ask questions about your codebase (`--ai-chat`)
-- **Keyboard navigation** - Arrow keys, vim-style (j/k/h/l)
-- **Dark/light mode** - Respects system preference or manual toggle
-- **Table of contents** - Auto-generated from headings
-- **Mobile responsive** - Works on all devices
-- **Offline capable** - No server required, AI runs client-side
-- **Mermaid diagrams** - Rendered automatically
-
-### AI Chat (`--ai-chat`)
-
-Add an interactive AI assistant to your documentation site:
+For repos with 10,000+ files:
 
 ```bash
-semanticwiki generate -r ./my-project --site --ai-chat
+semanticwiki generate -r ./large-project --max-chunks 5000   # cap memory usage
+semanticwiki generate -r ./large-project --batch-size 3000   # batched indexing
+semanticwiki generate -r ./large-project --max-results 5     # smaller search results
 ```
 
-The chat assistant:
-- Runs entirely in the browser (SmolLM2 via transformers.js)
-- Searches your docs semantically to answer questions
-- Works offline after initial model download
-- Includes "codemap" mode for architecture visualization
-
----
-
-## What to Expect
-
-When you run SemanticWiki:
-
-1. **Repository Analysis** - The agent scans your codebase structure
-2. **Semantic Indexing** - Creates embeddings for intelligent code search
-3. **Architecture Discovery** - Identifies patterns, components, and relationships
-4. **Documentation Generation** - Writes markdown pages with diagrams
-5. **Verification Loop** - Checks all links and generates missing pages
-6. **Source Linking** - Every concept links to specific file:line references
-
-### Typical Runtime
-
-| Codebase Size | Approximate Time |
-|---------------|------------------|
-| Small (<50 files) | 1-2 minutes |
-| Medium (50-200 files) | 2-5 minutes |
-| Large (200+ files) | 5-10 minutes |
-
-Use `--estimate` to get a cost/time estimate before running.
-
----
-
-## Example Output
-
-The generated wiki structure:
-
-```
-wiki/
-├── README.md                    # Navigation entry point
-├── architecture/
-│   ├── overview.md              # System architecture + diagrams
-│   └── data-flow.md             # Data flow documentation
-├── components/
-│   └── {module}/
-│       └── index.md             # Per-module documentation
-├── guides/
-│   └── getting-started.md       # Quick start guide
-├── glossary.md                  # Concept index
-└── site/                        # (with --site flag)
-    ├── index.html               # Interactive site entry
-    ├── styles.css
-    └── scripts.js
-```
-
-### Source Traceability Example
-
-Every architectural concept includes clickable source references:
-
-```markdown
-## Authentication Flow
-
-The authentication system uses JWT tokens for stateless auth.
-
-**Source:** [`src/auth/jwt-provider.ts:23-67`](../../../src/auth/jwt-provider.ts#L23-L67)
-
-```typescript
-export class JwtProvider {
-  async generateToken(user: User): Promise<string> {
-    // Token generation logic...
-  }
-}
-```
-```
+When the index exceeds 50k chunks, search automatically switches to fewer results and compact mode. Chunks are prioritized: core directories (`src/`, `lib/`, `app/`) and entry points score highest; tests and vendored code score lowest.
 
 ---
 
 ## Configuration (Optional)
 
-Create a `wiki.json` file in your project root to customize generation:
+Create a `wiki.json` in your project root to customize generation:
 
 ```json
 {
@@ -422,106 +259,46 @@ Create a `wiki.json` file in your project root to customize generation:
 
 ---
 
-## Technical Details
-
-### RAG & Hybrid Search System
-
-SemanticWiki uses a sophisticated retrieval system combining multiple strategies:
-
-- **Chunk size**: 1,500 characters with 200 character overlap
-- **Language-aware boundaries**: Chunks end at logical points (`}`, `};`, `end`)
-- **Embedding model**: `BGE-small-en-v1.5` (384 dimensions, runs locally)
-- **Hybrid search**: BM25 keyword + vector similarity with RRF fusion
-- **Vector search**: FAISS with `IndexFlatIP` for cosine similarity
-- **Incremental updates**: Only re-embeds changed files on subsequent runs
-
-### Chunk Prioritization
-
-For large codebases, chunks are prioritized by importance:
-- Core directories (`src/`, `lib/`, `app/`): +100 points
-- Entry points (`index.*`, `main.*`): +50 points
-- Config files: +30 points
-- Test files: -50 points
-- Vendor/generated code: -100 points
-
----
-
 ## How It Works
 
-SemanticWiki is built with:
-
-- **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)** - Orchestrates the AI agent workflow
-- **RAG (Retrieval Augmented Generation)** - Semantic code search using embeddings
-- **[Model Context Protocol (MCP)](https://modelcontextprotocol.io)** - Tool integration for file operations
-- **Mermaid** - Architecture diagram generation
-- **FAISS** - High-performance vector similarity search
+- **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)** or a hand-rolled tool-use loop (direct API / local modes) orchestrates the agent
+- **RAG system**: AST-aware chunking at logical code boundaries; `BGE-small-en-v1.5` embeddings computed locally via `@huggingface/transformers` (cached in `./.semanticwiki-models`); FAISS vector search with a pure-JS fallback; hybrid BM25 + vector search fused with Reciprocal Rank Fusion; optional cross-encoder reranking
+- **Incremental indexing**: only changed files are re-embedded on subsequent runs (index lives in `<wiki>/.semanticwiki-cache`)
+- **Verification loop**: checks all internal wiki links and generates missing pages
+- **[MCP](https://modelcontextprotocol.io)** for tool integration, **Mermaid** for diagrams
 
 ---
 
 ## Troubleshooting
 
-### "Credit balance is too low" error
-
-Use `--direct-api` to bypass Claude Code's billing check:
-```bash
-semanticwiki generate -r ./my-project --direct-api
-```
-
-### Out of memory on large repos
-
-Limit the indexed chunks:
-```bash
-semanticwiki generate -r ./large-project --max-chunks 5000 --batch-size 3000
-```
-
-### Slow re-runs during development
-
-Skip re-indexing with cached embeddings:
-```bash
-semanticwiki generate -r ./my-project --skip-index
-```
-
-### Missing pages / broken links
-
-Use the continue command to fix:
-```bash
-semanticwiki continue -r ./my-project -o ./wiki
-```
+| Problem | Fix |
+|---------|-----|
+| "Credit balance is too low" | Use `--direct-api` (your API credits) or `--full-local` (free) |
+| No API key and don't want one | Use `--full-local` — see [Local Mode Guide](./docs/local-mode.md) |
+| Out of memory on large repos | `--max-chunks 5000 --batch-size 3000` |
+| Slow re-runs while iterating | `--skip-index` to reuse cached embeddings |
+| Missing pages / broken links | `semanticwiki continue -r ./my-project -o ./wiki` |
+| Local mode issues | See [Local Mode Guide](./docs/local-mode.md#troubleshooting) |
 
 ---
 
 ## Development
 
 ```bash
-# Clone the repo
-git clone https://github.com/your-username/semanticwiki.git
+git clone https://github.com/GhostScientist/semanticwiki.git
 cd semanticwiki
-
-# Install dependencies
 npm install
-
-# Build
-npm run build
-
-# Run locally
-npm start -- generate -r ./my-project
-
-# Watch mode for development
-npm run dev
+npm run build            # compile to dist/
+npm test                 # run tests (vitest)
+npm start -- generate -r ./my-project --verbose
 ```
 
----
-
-## Built With
-
-This project was created using the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk) at the **Build an Agent Workshop**.
-
-**Learn to build your own AI agents at [buildanagentworkshop.com](https://buildanagentworkshop.com)**
+More docs live in [`docs/`](./docs/README.md).
 
 ---
 
 ## License
 
-MIT License - Copyright (c) 2025 Dakota Kim / reasoning.software (MadWatch LLC)
+MIT License — Copyright (c) 2025 Dakota Kim / reasoning.software (MadWatch LLC)
 
 See [LICENSE](./LICENSE) for full terms. Attribution to Dakota Kim as the original creator is required in all forks and derivative works.
