@@ -185,11 +185,15 @@ export class SiteGenerator {
    */
   private configureMarked(): void {
     const renderer = new marked.Renderer();
+    // Renderer methods are plain functions so `this` stays bound to the renderer,
+    // which is how marked exposes `this.parser` for rendering child tokens.
+    const self = this;
 
     // Enhanced code block rendering with copy button and source links
-    renderer.code = (code: string, language?: string) => {
+    renderer.code = function ({ text, lang: language }) {
+      const code = text;
       const lang = language || 'text';
-      const escapedCode = this.escapeHtml(code);
+      const escapedCode = self.escapeHtml(code);
 
       // Check for source reference in the code block
       const sourceMatch = code.match(/^\/\/\s*Source:\s*(.+)$/m) ||
@@ -214,8 +218,9 @@ export class SiteGenerator {
     };
 
     // Enhanced heading rendering with anchor links
-    renderer.heading = (text: string, level: number) => {
-      const id = this.slugify(text);
+    renderer.heading = function ({ tokens, depth: level }) {
+      const text = this.parser.parseInline(tokens);
+      const id = self.slugify(text);
       return `
         <h${level} id="${id}" class="heading-anchor">
           <a href="#${id}" class="anchor-link" aria-hidden="true">#</a>
@@ -225,7 +230,8 @@ export class SiteGenerator {
     };
 
     // Enhanced link rendering
-    renderer.link = (href: string, title: string | null | undefined, text: string) => {
+    renderer.link = function ({ href, title, tokens }) {
+      const text = this.parser.parseInline(tokens);
       const isExternal = href.startsWith('http://') || href.startsWith('https://');
       const isSourceLink = href.includes(':') && !isExternal && href.match(/\.(ts|js|py|go|rs|java|rb|php|c|cpp|swift):/);
 
@@ -243,7 +249,7 @@ export class SiteGenerator {
     };
 
     // Enhanced image rendering
-    renderer.image = (href: string, title: string | null, text: string) => {
+    renderer.image = function ({ href, title, text }) {
       return `
         <figure class="image-figure">
           <img src="${href}" alt="${text}" title="${title || ''}" loading="lazy" />
@@ -252,16 +258,35 @@ export class SiteGenerator {
       `;
     };
 
-    // Enhanced blockquote rendering (for callouts)
-    renderer.blockquote = (quote: string) => {
-      // Check for callout type markers
-      const calloutMatch = quote.match(/^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]/i);
+    // Enhanced blockquote rendering (for GitHub-style callouts)
+    renderer.blockquote = function ({ tokens }) {
+      // The `[!NOTE]` marker has to be detected on the tokens, before they are
+      // rendered: by the time the body is HTML the marker is wrapped in a `<p>`,
+      // so matching against the rendered string never fires.
+      const [first] = tokens;
+      const calloutMatch =
+        first?.type === 'paragraph'
+          ? first.raw.match(/^\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*/i)
+          : null;
+
       if (calloutMatch) {
-        const type = calloutMatch[1].toLowerCase();
-        const content = quote.replace(calloutMatch[0], '').trim();
-        return `<div class="callout callout-${type}"><div class="callout-title">${calloutMatch[1]}</div><div class="callout-content">${content}</div></div>`;
+        const label = calloutMatch[1].toUpperCase();
+        const type = label.toLowerCase();
+        // Re-parse the body with the marker stripped so inline markdown inside the
+        // callout (links, code, emphasis) still renders.
+        const body = first.raw.slice(calloutMatch[0].length);
+        const rest = tokens.slice(1);
+        const content = [
+          body.trim() ? (marked.parse(body, { async: false }) as string) : '',
+          rest.length ? this.parser.parse(rest) : ''
+        ]
+          .filter(Boolean)
+          .join('');
+
+        return `<div class="callout callout-${type}"><div class="callout-title">${label}</div><div class="callout-content">${content}</div></div>`;
       }
-      return `<blockquote>${quote}</blockquote>`;
+
+      return `<blockquote>${this.parser.parse(tokens)}</blockquote>`;
     };
 
     marked.use({ renderer });

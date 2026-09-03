@@ -27,9 +27,18 @@ npm start -- generate -r ./some-project --verbose
 
 There is no linter configured. Tests live in `tests/` and have a 30s timeout (some load ML models). `scripts/release.sh` handles version bump + publish.
 
+## CI
+
+`.github/workflows/ci.yml` runs on every push to `master` and every pull request:
+
+- **build-and-test** — `npm ci --ignore-scripts`, then `npm run build` and `npm test`, on Node 20.19 and 22.x. Install scripts are skipped because the native dependencies (`faiss-node`, `node-llama-cpp`, `onnxruntime-node`, `sharp`) download large prebuilt binaries that neither `tsc` nor the test suite needs.
+- **audit** — `npm audit --audit-level=critical`. The gate is set to `critical`, not `high`, because `@huggingface/transformers` pins `sharp@^0.34`, which carries an unfixed libvips advisory (GHSA-f88m-g3jw-g9cj). SemanticWiki only uses transformers for text embeddings and never decodes images.
+
+`.github/dependabot.yml` opens grouped weekly npm and Actions update PRs. Majors that need real code changes (`commander`, `chalk`, `inquirer`, `typescript`, `@huggingface/transformers`) are ignored there and upgraded deliberately.
+
 ## Architecture
 
-TypeScript ESM project (`"type": "module"`, Node >= 18). Local imports must use `.js` extensions (e.g. `import { RAGSystem } from './rag/index.js'`). Compiled with plain `tsc`, no bundler. CommonJS-only deps (e.g. `faiss-node`) are loaded via `createRequire(import.meta.url)`.
+TypeScript ESM project (`"type": "module"`, Node >= 20.19). Local imports must use `.js` extensions (e.g. `import { RAGSystem } from './rag/index.js'`). Compiled with plain `tsc`, no bundler. CommonJS-only deps (e.g. `faiss-node`) are loaded via `createRequire(import.meta.url)`.
 
 ### Entry point and commands
 
@@ -73,6 +82,8 @@ Powers both wiki generation and the `search`/`mcp-server` commands:
 ### Static site generator (`src/site-generator.ts` + `src/site/`)
 
 Converts the markdown wiki into a self-contained interactive site. The entire site's HTML/CSS/JS is embedded as template strings in `src/site/templates.ts`, `styles.ts`, and `scripts.ts` — editing the generated site means editing these TS files. The `--ai-chat` feature runs SmolLM2 client-side in the browser via transformers.js; most tests in `tests/` cover this site/chat generation.
+
+`configureMarked()` overrides marked's `code`, `heading`, `link`, `image`, and `blockquote` renderers. These use marked's object-argument API (v13+) and are declared as `function` expressions — not arrows — so `this` stays bound to the renderer and `this.parser` is available for rendering child tokens; the enclosing class is reached through the `self` alias. `tests/site-generator-markdown.test.ts` pins the emitted HTML so a future marked upgrade cannot silently break it.
 
 ### Supporting modules
 
