@@ -2,6 +2,7 @@
 
 import { config as loadEnv } from 'dotenv';
 import { resolve } from 'path';
+import { fileURLToPath } from 'url';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Command } from 'commander';
@@ -23,17 +24,31 @@ inquirer.registerPrompt('autocomplete', inquirerAutocomplete);
 
 // Load .env from current working directory (supports global installation)
 const workingDir = process.cwd();
-loadEnv({ path: resolve(workingDir, '.env') });
+// `quiet` suppresses the startup banner dotenv v17 prints on every load, which
+// would otherwise contaminate CLI output such as `--version` and MCP stdio traffic.
+loadEnv({ path: resolve(workingDir, '.env'), quiet: true });
 
 // Load Claude Code configuration (skills, commands, memory)
 const claudeConfig = loadClaudeConfig(workingDir);
+
+// Read the version from package.json rather than hardcoding it, so `--version`
+// cannot drift from the published release. Resolved relative to this module
+// (dist/cli.js -> ../package.json) so it works for global installs too.
+function readPackageVersion(): string {
+  try {
+    const pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    return JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
 
 const program = new Command();
 
 program
   .name('semanticwiki')
   .description('Generate architectural documentation wikis for code repositories with source traceability.')
-  .version('1.4.0');
+  .version(readPackageVersion());
 
 // Config command
 program

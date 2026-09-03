@@ -1,6 +1,6 @@
 # SemanticWiki — Feature Roadmap
 
-_Last updated: 2026-07-13_
+_Last updated: 2026-09-01_
 
 The "LLM wiki" pattern (DeepWiki-style auto-generated, chat-queryable repo docs) is
 gaining momentum. SemanticWiki already has the hard parts — agentic generation
@@ -69,16 +69,30 @@ milestone.
 
 ## 5. SQLite FTS for metadata
 
-`better-sqlite3` is already a dependency but unused; chunk metadata lives in a JSON
-blob (`metadata.json`). Move metadata (and optionally a full-text index) into
-SQLite FTS5 to speed up large-repo indexing and enable richer queries. Low-risk,
-self-contained, and it activates an existing dependency.
+Chunk metadata currently lives in a JSON blob (`metadata.json`). Move metadata (and
+optionally a full-text index) into SQLite FTS5 to speed up large-repo indexing and
+enable richer queries. Low-risk and self-contained.
+
+> `better-sqlite3` used to be declared as a dependency in anticipation of this work
+> but was never imported, so it was dropped to avoid a native build on every install.
+> Add it back (or use `node:sqlite`, available on the supported Node baseline) when
+> this item is actually picked up.
 
 ## 6. Local-mode roadmap items
 
 From `docs/plans/LOCAL_MODE_PLAN.md`, still unshipped: LoRA / fine-tuned adapters,
 quantization selection, model A/B comparison, and air-gapped bundled docs for
-fully offline environments.
+fully offline environments. `docs/plans/fine-tuning/` holds the detailed plan for
+the fine-tuned-adapter half of this.
+
+## 7. Evaluation harness
+
+`docs/plans/EVAL_PLAN.md` specifies a manual rubric, deterministic automated checks
+(link integrity, `file:line` validity, Mermaid parsing, stub detection), and an
+optional LLM-judge pass over a set of pinned fixture repositories. This is the
+measurement layer that makes every other item on this list verifiable — in
+particular it is how you would prove that #2 and the contextual-retrieval work in
+PR #7 actually improve output quality rather than just changing it.
 
 ---
 
@@ -87,4 +101,36 @@ fully offline environments.
 1. **#2 Incremental updates** (prerequisite, unblocks automation)
 2. **#1 GitHub Action** (headline "always-current" feature)
 3. **#3 Site search + knowledge graph** (quality/UX, independently shippable)
-4. Then **#4 hosted wiki** as a larger milestone; **#5** and **#6** as opportunistic wins.
+4. Then **#4 hosted wiki** as a larger milestone; **#5**, **#6**, and **#7** as opportunistic wins.
+
+Consider pulling **#7** forward if PR #7 is revived, since it is the only way to
+judge whether that branch's output is better.
+
+---
+
+## Repository baseline (as of 2026-09-01)
+
+Current state after the maintenance pass:
+
+- `master` builds clean and the suite is green (302 tests across 7 files).
+- CI runs build + tests on Node 20.19 and 22.x, plus a dependency audit
+  (`.github/workflows/ci.yml`); Dependabot proposes grouped weekly updates.
+- `npm audit` reports only the unfixable `sharp` advisory inherited through
+  `@huggingface/transformers`.
+- Minimum supported Node is 20.19.
+
+Known deferrals, all of which need real code changes rather than a version bump:
+
+| Deferred | Why |
+| --- | --- |
+| `commander` 15, `chalk` 6 | Require Node >= 22; revisit when the Node floor moves up |
+| `inquirer` 14 | Full API rewrite; also pins `inquirer-autocomplete-prompt` |
+| `typescript` 7 | Native compiler port; wants its own validation pass |
+| `@huggingface/transformers` 4 | New onnxruntime line; touches the embedding path |
+
+Open code debt worth tracking:
+
+- `src/cli.ts` still has the `update-docs` full-regeneration `TODO` that item #2 exists to fix.
+- Test coverage is concentrated on site/chat generation. The RAG system, the wiki
+  agent loop, and the LLM providers have little to no direct coverage (issue #11).
+

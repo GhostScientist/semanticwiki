@@ -52,7 +52,7 @@ npm install -g semanticwiki
 
 **Prerequisites:**
 
-- Node.js >= 18
+- Node.js >= 20.19
 - For cloud modes: an Anthropic API key from [console.anthropic.com](https://console.anthropic.com)
 - For local mode: see the [Local Mode Guide](./docs/local-mode.md)
 
