@@ -42,6 +42,19 @@ Notes on each mode:
 
 In every mode, embeddings and semantic search always run locally — the mode only changes which LLM writes the documentation.
 
+Code embeddings use [Google EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)
+through its [ONNX release](https://huggingface.co/onnx-community/embeddinggemma-2-ONNX).
+Only the text encoder is loaded, using 4-bit weights (~175 MB plus tokenizer files)
+and normalized 768-dimensional vectors. Model files are downloaded on first use
+and cached in `./.semanticwiki-models`; inference does not send source code to a server.
+Code chunks include filename titles, and queries use the model's code-retrieval prompt.
+
+Older code indexes are automatically rebuilt when loaded with the new model.
+To explicitly rebuild an existing wiki's index, including when no source files
+have changed, run `semanticwiki update-embeddings -r ./my-project -o ./wiki --full`.
+The in-browser wiki chat continues to use MiniLM so its generated document and
+browser query embeddings remain compatible.
+
 ---
 
 ## Installation
@@ -262,7 +275,7 @@ Create a `wiki.json` in your project root to customize generation:
 ## How It Works
 
 - **[Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk)** or a hand-rolled tool-use loop (direct API / local modes) orchestrates the agent
-- **RAG system**: AST-aware chunking at logical code boundaries; `BGE-small-en-v1.5` embeddings computed locally via `@huggingface/transformers` (cached in `./.semanticwiki-models`); FAISS vector search with a pure-JS fallback; hybrid BM25 + vector search fused with Reciprocal Rank Fusion; optional cross-encoder reranking
+- **RAG system**: AST-aware chunking at logical code boundaries; text-only `EmbeddingGemma 2` embeddings (4-bit weights, 768 dimensions) computed locally via `@huggingface/transformers` (cached in `./.semanticwiki-models`); FAISS vector search with a pure-JS fallback; hybrid BM25 + vector search fused with Reciprocal Rank Fusion; optional cross-encoder reranking
 - **Incremental indexing**: only changed files are re-embedded on subsequent runs (index lives in `<wiki>/.semanticwiki-cache`)
 - **Verification loop**: checks all internal wiki links and generates missing pages
 - **[MCP](https://modelcontextprotocol.io)** for tool integration, **Mermaid** for diagrams
