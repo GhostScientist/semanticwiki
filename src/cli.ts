@@ -586,19 +586,27 @@ program
 
       // Import RAGSystem and git
       const { RAGSystem } = await import('./rag/index.js');
+      const ragSystem = new RAGSystem({
+        storePath: cacheDir,
+        repoPath: path.resolve(options.repo)
+      });
+      const fullReindex = options.full || !ragSystem.isIndexCompatible(indexState);
+      if (fullReindex && !options.full) {
+        console.log(chalk.yellow('Embedding model changed; a full re-index is required.'));
+      }
       const git = (await import('simple-git')).simpleGit(options.repo);
 
       // Get current commit
       const currentLog = await git.log({ maxCount: 1 });
       const currentCommit = currentLog.latest?.hash || 'unknown';
 
-      if (currentCommit === indexState.commitHash && !options.full) {
+      if (currentCommit === indexState.commitHash && !fullReindex) {
         console.log(chalk.green('✓ Index is up to date. No changes since last index.'));
         return;
       }
 
       // Get changed files
-      const diffResult = await git.diff(['--name-only', indexState.commitHash, 'HEAD']);
+      const diffResult = fullReindex ? '' : await git.diff(['--name-only', indexState.commitHash, 'HEAD']);
       const changedFiles = diffResult.split('\n').filter(f => f.trim().length > 0);
 
       // Filter to only indexable files
@@ -615,7 +623,7 @@ program
         indexableExts.some(ext => f.endsWith(ext))
       );
 
-      if (relevantFiles.length === 0 && !options.full) {
+      if (relevantFiles.length === 0 && !fullReindex) {
         console.log(chalk.green('✓ No relevant source files changed.'));
 
         // Update index state to current commit anyway
@@ -649,7 +657,7 @@ program
       const { confirm } = await inquirer.prompt([{
         type: 'confirm',
         name: 'confirm',
-        message: options.full
+        message: fullReindex
           ? 'Perform full re-index?'
           : `Update embeddings for ${relevantFiles.length} changed files?`,
         default: true
@@ -662,17 +670,11 @@ program
 
       const spinner = ora('Updating embeddings...').start();
 
-      // Create RAG system
-      const ragSystem = new RAGSystem({
-        storePath: cacheDir,
-        repoPath: path.resolve(options.repo)
-      });
-
       try {
-        if (options.full) {
+        if (fullReindex) {
           // Full re-index
           spinner.text = 'Performing full re-index...';
-          await ragSystem.indexRepository();
+          await ragSystem.indexRepository({ force: true });
           spinner.succeed(chalk.green('Full re-index complete!'));
         } else {
           // Incremental update
