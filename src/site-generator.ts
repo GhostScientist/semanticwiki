@@ -104,6 +104,8 @@ export class SiteGenerator {
   private navigation: SiteNavigation = { sections: [] };
   private tours: GuidedTour[] = [];
   private mermaidPlaceholders: Map<string, string> = new Map();
+  private markdownPaths: Set<string> = new Set();
+  private currentPageRelativePath: string | null = null;
 
   constructor(options: SiteGenerationOptions) {
     // Extract codebase name from wiki directory or use provided title
@@ -237,8 +239,8 @@ export class SiteGenerator {
         return `<a href="${href}" title="${title || ''}" target="_blank" rel="noopener noreferrer" class="external-link">${text}<svg class="external-icon" width="12" height="12" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" stroke="currentColor" stroke-width="2" fill="none"/></svg></a>`;
       }
 
-      // Convert .md links to .html
-      const htmlHref = href.replace(/\.md(#.*)?$/, '.html$1');
+      // Convert wiki markdown links to page-relative HTML links.
+      const htmlHref = this.resolveInternalLink(href);
       return `<a href="${htmlHref}" title="${title || ''}" class="internal-link">${text}</a>`;
     };
 
@@ -310,6 +312,9 @@ export class SiteGenerator {
    */
   private async discoverPages(): Promise<void> {
     const files = this.findMarkdownFiles(this.options.wikiDir);
+    this.markdownPaths = new Set(
+      files.map(file => this.toPosixPath(path.relative(this.options.wikiDir, file)))
+    );
 
     for (const filePath of files) {
       const page = await this.parsePage(filePath);
@@ -361,6 +366,7 @@ export class SiteGenerator {
       const { data: frontmatter, content: markdownContent } = matter(content);
 
       const relativePath = path.relative(this.options.wikiDir, filePath);
+      this.currentPageRelativePath = relativePath;
 
       // Extract title from frontmatter or first H1
       const extractedTitle = this.extractTitle(markdownContent);
@@ -385,6 +391,7 @@ export class SiteGenerator {
 
       // Convert markdown to HTML
       const parsedHtml = await marked.parse(processedMarkdown);
+      this.currentPageRelativePath = null;
 
       // Restore mermaid diagrams after markdown processing to preserve their syntax
       const htmlContent = this.restoreMermaidBlocks(parsedHtml);
@@ -409,6 +416,7 @@ export class SiteGenerator {
         lastModified
       };
     } catch (error) {
+      this.currentPageRelativePath = null;
       console.error(`Failed to parse ${filePath}:`, error);
       return null;
     }
@@ -738,9 +746,8 @@ export class SiteGenerator {
       const htmlPath = page.relativePath.replace(/\.md$/, '.html');
       const outputPath = path.join(this.options.outputDir, htmlPath);
 
-      // Calculate relative path to root for asset links
-      const depth = page.relativePath.split(path.sep).length - 1;
-      const rootPath = depth > 0 ? '../'.repeat(depth) : './';
+      // Use a root-relative site base so links remain valid after SPA navigation.
+      const rootPath = this.getSiteRootPath();
 
       // Generate table of contents
       const toc = this.generateTOC(page.headings);
@@ -778,15 +785,16 @@ export class SiteGenerator {
     // Generate index.html (redirect to README.html or first page)
     const indexPage = this.pages.find(p => p.relativePath === 'README.md') || this.pages[0];
     if (indexPage) {
+      const indexHref = this.getSiteHref(indexPage.relativePath.replace(/\.md$/, '.html'));
       const indexHtml = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="0; url=${indexPage.relativePath.replace(/\.md$/, '.html')}">
+  <meta http-equiv="refresh" content="0; url=${indexHref}">
   <title>${this.options.title}</title>
 </head>
 <body>
-  <p>Redirecting to <a href="${indexPage.relativePath.replace(/\.md$/, '.html')}">${indexPage.title}</a>...</p>
+  <p>Redirecting to <a href="${indexHref}">${indexPage.title}</a>...</p>
 </body>
 </html>`;
       fs.writeFileSync(path.join(this.options.outputDir, 'index.html'), indexHtml);
@@ -825,13 +833,14 @@ export class SiteGenerator {
 
     let html = '<nav class="breadcrumbs" aria-label="Breadcrumb"><ol>';
     let currentPath = '';
+    const rootPath = this.getSiteRootPath();
 
     // Add home link
-    html += `<li><a href="${'../'.repeat(parts.length - 1)}index.html">Home</a></li>`;
+    html += `<li><a href="${rootPath}index.html">Home</a></li>`;
 
     for (let i = 0; i < parts.length - 1; i++) {
       currentPath += parts[i] + '/';
-      html += `<li><a href="${'../'.repeat(parts.length - 1 - i)}${currentPath}index.html">${this.formatSectionTitle(parts[i])}</a></li>`;
+      html += `<li><a href="${rootPath}${currentPath}index.html">${this.formatSectionTitle(parts[i])}</a></li>`;
     }
 
     // Current page (not a link)
@@ -885,15 +894,80 @@ export class SiteGenerator {
    * Get relative link between two pages
    */
   private getRelativeLink(fromPath: string, toPath: string): string {
-    const fromDir = path.dirname(fromPath);
-    const toHtml = toPath.replace(/\.md$/, '.html');
+    const toHtml = this.toPosixPath(toPath).replace(/\.md$/, '.html');
 
-    if (fromDir === '.') {
-      return toHtml;
+    return this.getSiteHref(toHtml);
+  }
+
+  /**
+   * Resolve markdown links inside wiki pages to correct page-relative HTML links.
+   *
+   * Wiki generation often emits links from the wiki root, e.g.
+   * `architecture/overview.md`. If that href is copied unchanged into
+   * `architecture/data-flow.html`, browsers resolve it as
+   * `architecture/architecture/overview.html`. Use the discovered markdown page
+   * set to distinguish root-relative wiki links from same-directory links.
+   */
+  private resolveInternalLink(href: string): string {
+    if (!href || href.startsWith('#')) {
+      return href;
     }
 
-    const depth = fromDir.split(path.sep).length;
-    return '../'.repeat(depth) + toHtml;
+    if (
+      href.startsWith('mailto:') ||
+      href.startsWith('tel:') ||
+      href.startsWith('javascript:')
+    ) {
+      return href;
+    }
+
+    const [rawPath, rawAnchor] = href.split('#', 2);
+    const anchor = rawAnchor ? `#${rawAnchor}` : '';
+
+    if (!rawPath.endsWith('.md')) {
+      return href;
+    }
+
+    const fromPath = this.currentPageRelativePath;
+    if (!fromPath) {
+      return rawPath.replace(/\.md$/, '.html') + anchor;
+    }
+
+    const fromDir = this.toPosixPath(path.dirname(fromPath));
+    const normalizedHref = this.toPosixPath(rawPath.replace(/^\/+/, ''));
+    const hrefIsExplicitRelative = rawPath.startsWith('./') || rawPath.startsWith('../');
+
+    let targetMarkdownPath: string;
+    if (hrefIsExplicitRelative) {
+      targetMarkdownPath = this.normalizePosixPath(path.posix.join(fromDir, rawPath));
+    } else {
+      const rootRelativeCandidate = this.normalizePosixPath(normalizedHref);
+      const pageRelativeCandidate = this.normalizePosixPath(path.posix.join(fromDir, rawPath));
+
+      targetMarkdownPath = this.markdownPaths.has(rootRelativeCandidate)
+        ? rootRelativeCandidate
+        : pageRelativeCandidate;
+    }
+
+    const targetHtmlPath = targetMarkdownPath.replace(/\.md$/, '.html');
+
+    return this.getSiteHref(targetHtmlPath) + anchor;
+  }
+
+  private getSiteRootPath(): string {
+    return `/${path.basename(this.options.outputDir).replace(/^\/+|\/+$/g, '')}/`;
+  }
+
+  private getSiteHref(siteRelativePath: string): string {
+    return this.getSiteRootPath() + this.normalizePosixPath(siteRelativePath);
+  }
+
+  private toPosixPath(filePath: string): string {
+    return filePath.split(path.sep).join('/');
+  }
+
+  private normalizePosixPath(filePath: string): string {
+    return path.posix.normalize(this.toPosixPath(filePath)).replace(/^\.\//, '');
   }
 
   /**

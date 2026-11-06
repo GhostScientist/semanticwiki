@@ -10,12 +10,14 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
+    "check": "npm run build && npm test && npm run check:cli",
+    "check:cli": "bash scripts/check-cli.sh",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "clean": "rm -rf dist",
     "prepare": "npm run build",
-    "prepublishOnly": "npm run build && npm test",
+    "prepublishOnly": "npm run check",
     "release": "./scripts/release.sh",
     "publish-npm": "npm publish"
   },
@@ -33,7 +35,7 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "files": [
     "dist/**/*",
@@ -48,6 +50,7 @@
     "@anthropic-ai/sdk": "^0.95.2",
     "@huggingface/transformers": "^3.8.1",
     "@lepion/mcp-server-mermaid": "^1.0.8",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@modelcontextprotocol/server-filesystem": "^2025.12.18",
     "axios": "^1.6.0",
     "better-sqlite3": "^9.0.0",

@@ -2,6 +2,20 @@
 
 All notable changes to semanticwiki will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- CLI version output now reads from `package.json`, preventing drift between the published package and `semanticwiki --version`.
+- `generate --site-only` now bypasses model selection and API-key validation because it only transforms existing Markdown.
+- The documented Node.js minimum is now 20, matching the local inference runtime.
+- README command examples and reference tables now match the implemented Commander options.
+- Running `semanticwiki` with no arguments now shows help instead of entering the legacy coding-agent mode.
+- Product guidance now treats API and local inference as interchangeable backends behind one workflow, with no silent fallback between them.
+
+### Added
+- `npm run check` for the build, test suite, and compiled CLI smoke checks.
+- Contributor workflow guidance and a product compatibility policy covering generated wiki migrations, provenance, and release contracts.
+
 ## [1.4.0] - 2026-05-11
 
 ### Changed

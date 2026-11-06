@@ -44,13 +44,9 @@ echo "$NOTES" | head -10
 echo "..."
 echo ""
 
-# Build
-echo -e "${YELLOW}Building...${NC}"
-npm run build
-
-# Run tests
-echo -e "${YELLOW}Running tests...${NC}"
-npm test
+# Run the same build, test, and compiled-CLI checks used during development.
+echo -e "${YELLOW}Running release checks...${NC}"
+npm run check
 
 # Confirm before publishing
 echo ""

@@ -867,10 +867,14 @@ export class ArchitecturalWikiAgent {
     let totalToolCalls = 0;
     let done = false;
 
-    // Token usage tracking for context window management
-    let cumulativeInputTokens = 0;
+    // Token usage tracking for context window management. Pruning is based on
+    // the prior request size, not cumulative billing tokens across the run.
+    let lastInputTokens = 0;
     let warnedAboutTokens = false;
     const logPrefix = options.fullLocal ? 'Local' : 'DirectAPI';
+    const maxResponseTokens = 8192;
+    const maxInputTokens = this.getMaxInputTokens(modelInfo.contextLength, maxResponseTokens);
+    const highTokenWarningThreshold = Math.floor(maxInputTokens * 0.85);
 
     try {
       while (!done && turnCount < maxTurns) {
@@ -883,30 +887,31 @@ export class ArchitecturalWikiAgent {
         }
 
         // Prune old messages if approaching token limit
-        const pruneResult = this.pruneMessagesIfNeeded(messages, cumulativeInputTokens);
+        const pruneResult = this.pruneMessagesIfNeeded(messages, lastInputTokens, maxInputTokens);
         if (pruneResult.pruned) {
           messages.length = 0;
           messages.push(...pruneResult.messages);
-          console.log(`[${logPrefix}] Pruned conversation history to ${messages.length} messages to stay within token limits`);
+          console.log(`[${logPrefix}] Pruned conversation history to ${messages.length} messages to stay within ${modelInfo.contextLength.toLocaleString()} token context`);
         }
 
         // Call the LLM provider
         const response = await provider.chat(messages, llmTools, {
-          maxTokens: 8192,
+          maxTokens: maxResponseTokens,
           systemPrompt: WIKI_SYSTEM_PROMPT,
           temperature: 0.7,
         });
 
-        // Track cumulative token usage
-        cumulativeInputTokens += response.usage.inputTokens;
-        if (cumulativeInputTokens > 150000 && !warnedAboutTokens) {
-          console.log(`[${logPrefix}] ⚠️  High token usage: ${cumulativeInputTokens.toLocaleString()} tokens. Context will be pruned if needed.`);
+        // Track current context size. Billing/cost is cumulative, but context
+        // pressure is the current request's input size.
+        lastInputTokens = response.usage.inputTokens;
+        if (lastInputTokens > highTokenWarningThreshold && !warnedAboutTokens) {
+          console.log(`[${logPrefix}] ⚠️  High token usage: ${lastInputTokens.toLocaleString()} input tokens in current request. Context will be pruned if needed.`);
           warnedAboutTokens = true;
         }
 
         if (options.verbose) {
           console.log(`[${logPrefix}] Stop reason: ${response.stopReason}`);
-          console.log(`[${logPrefix}] Usage: input=${response.usage.inputTokens}, output=${response.usage.outputTokens} (cumulative: ${cumulativeInputTokens.toLocaleString()})`);
+          console.log(`[${logPrefix}] Usage: input=${response.usage.inputTokens}, output=${response.usage.outputTokens}, context=${modelInfo.contextLength.toLocaleString()}`);
         }
 
         // Process response content - use explicit type for our content blocks
@@ -4214,6 +4219,11 @@ Remember: Every architectural concept MUST include file:line references to the s
       messages: [firstMessage, ...recentMessages],
       pruned: true
     };
+  }
+
+  private getMaxInputTokens(contextLength: number, maxResponseTokens: number): number {
+    const reserveTokens = maxResponseTokens + Math.max(10_000, Math.floor(contextLength * 0.05));
+    return Math.max(1, contextLength - reserveTokens);
   }
 
   /**

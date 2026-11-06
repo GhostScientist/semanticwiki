@@ -4,18 +4,15 @@
 
 > Generate architectural documentation wikis with source code traceability
 
-An AI-powered CLI that does two things:
-
-1. **Generates architectural wikis** with source code traceability (`file:line` references)
-2. **Works as an agentic coding assistant** like Claude Code
-
-**Built with [buildanagentworkshop.com](https://buildanagentworkshop.com)**
+SemanticWiki turns a codebase into source-grounded architectural documentation,
+then helps you verify, search, publish, and update that documentation as the code
+changes.
 
 ---
 
-## Two Ways to Use SemanticWiki
+## The core workflow
 
-### 1. Generate Documentation (`semanticwiki generate`)
+### Generate documentation
 
 Point SemanticWiki at any codebase and get a complete architectural wiki:
 
@@ -32,24 +29,16 @@ This creates:
 
 Every concept links directly to source code (`src/auth/jwt.ts:23-67`), so you can navigate from docs to implementation.
 
-### 2. Agentic Codebase Assistant
-
-Under the hood, SemanticWiki is a full agentic coding assistant powered by Claude. It doesn't just template docs—it:
-
-- **Explores your codebase** using filesystem tools
-- **Searches semantically** via RAG embeddings (FAISS + all-MiniLM-L6-v2)
-- **Reasons about architecture** to identify patterns and relationships
-- **Writes and verifies** documentation with automatic link checking
+### Keep it current
 
 ```bash
-# The agent runs autonomously, reading files, searching code, writing docs
-semanticwiki generate -r ./my-project --verbose
-
-# Continue where you left off—agent resumes with cached context
-semanticwiki continue -r ./my-project --skip-index
+semanticwiki update-docs -r ./my-project -o ./wiki
+semanticwiki verify -o ./wiki
+semanticwiki search "authentication flow" -o ./wiki
 ```
 
-The same RAG system that powers documentation generation gives the agent deep, semantic understanding of your codebase—like Claude Code, but with your entire project pre-indexed for instant retrieval.
+The CLI also retains a legacy coding-agent mode for existing installations, but it
+is not part of the primary product workflow.
 
 ---
 
@@ -61,8 +50,9 @@ npm install -g semanticwiki
 
 ## Prerequisites
 
-- **Node.js** >= 18.0.0
-- **Anthropic API key** - Get one at [console.anthropic.com](https://console.anthropic.com)
+- **Node.js** >= 20.0.0
+- Either an **Anthropic API key** for API generation, or a prepared local model for
+  local generation (`--full-local`)
 
 ---
 
@@ -121,7 +111,16 @@ semanticwiki generate -r ./my-project -v
 
 # Estimate time/cost before running (dry run)
 semanticwiki generate -r ./my-project -e
+
+# Current compatibility flags for execution choice
+semanticwiki generate -r ./my-project --direct-api   # Anthropic API
+semanticwiki generate -r ./my-project --full-local   # prepared local model
 ```
+
+Both backends produce the same kind of wiki and go through the same verification
+workflow. The provider changes cost, latency, hardware, and setup—not the meaning
+of the command. These flags will eventually converge on a simpler `--provider`
+setting while remaining compatible with existing scripts.
 
 ### Continue Command
 
@@ -144,10 +143,10 @@ Search your wiki from the command line:
 
 ```bash
 # Search wiki content
-semanticwiki search "authentication flow" -w ./wiki
+semanticwiki search "authentication flow" -o ./wiki
 
-# Hybrid search (keyword + semantic)
-semanticwiki search "how does login work" -w ./wiki --hybrid
+# Select hybrid search explicitly (the default)
+semanticwiki search "how does login work" -o ./wiki --mode hybrid
 ```
 
 ### MCP Server
@@ -156,10 +155,10 @@ Start an MCP server for AI assistant integration (Claude Desktop, Claude Code):
 
 ```bash
 # Start MCP server for a wiki
-semanticwiki mcp-server -w ./wiki
+semanticwiki mcp-server -o ./wiki
 
 # With code search (requires RAG index)
-semanticwiki mcp-server -w ./wiki -r ./my-project
+semanticwiki mcp-server -o ./wiki -r ./my-project
 ```
 
 Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
@@ -168,7 +167,7 @@ Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_deskt
   "mcpServers": {
     "my-wiki": {
       "command": "semanticwiki",
-      "args": ["mcp-server", "-w", "/path/to/wiki"]
+      "args": ["mcp-server", "-o", "/path/to/wiki"]
     }
   }
 }
@@ -180,13 +179,13 @@ Create portable wiki packages for sharing:
 
 ```bash
 # Create package (includes wiki + RAG index)
-semanticwiki pack -w ./wiki -o ./my-wiki.archiwiki
+semanticwiki pack -o ./wiki -f ./my-wiki.archiwiki
 
 # Extract package
-semanticwiki unpack -p ./my-wiki.archiwiki -o ./extracted
+semanticwiki unpack ./my-wiki.archiwiki -o ./extracted
 
 # Extract wiki only (no RAG index)
-semanticwiki unpack -p ./my-wiki.archiwiki -o ./extracted --wiki-only
+semanticwiki unpack ./my-wiki.archiwiki -o ./extracted --wiki-only
 ```
 
 ### Large Codebase Options
@@ -238,7 +237,7 @@ semanticwiki generate -r ./my-project --max-turns 50
 | `-o, --output <dir>` | Output directory for wiki | `./wiki` |
 | `-c, --config <file>` | Path to wiki.json config file | - |
 | `-t, --token <token>` | GitHub token for private repos | - |
-| `-m, --model <model>` | Claude model to use | `claude-sonnet-4-20250514` |
+| `-m, --model <model>` | Claude model to use | `claude-opus-4-7` |
 | `-p, --path <path>` | Focus on specific directory | - |
 | `-f, --force` | Force regeneration (ignore cache) | - |
 | `-v, --verbose` | Show detailed progress | - |
@@ -261,7 +260,7 @@ semanticwiki generate -r ./my-project --max-turns 50
 |--------|-------------|---------|
 | `-r, --repo <path>` | Repository path (required) | - |
 | `-o, --output <dir>` | Wiki output directory | `./wiki` |
-| `-m, --model <model>` | Claude model to use | `claude-sonnet-4-20250514` |
+| `-m, --model <model>` | Claude model to use | `claude-opus-4-7` |
 | `-v, --verbose` | Show detailed progress | - |
 | `--verify-only` | Only check, don't generate | - |
 | `--skip-index` | Use cached embeddings index | - |
@@ -273,23 +272,25 @@ semanticwiki generate -r ./my-project --max-turns 50
 | Option | Description | Default |
 |--------|-------------|---------|
 | `<query>` | Search query (required) | - |
-| `-w, --wiki <dir>` | Wiki directory | `./wiki` |
-| `-n, --limit <n>` | Max results | `10` |
-| `--hybrid` | Use hybrid search (keyword + semantic) | - |
+| `-o, --output <dir>` | Wiki directory | `./wiki` |
+| `-n, --max-results <n>` | Max results | `10` |
+| `-m, --mode <mode>` | `hybrid`, `vector`, or `keyword` | `hybrid` |
+| `--code` | Search the indexed code instead of wiki pages | - |
+| `--rerank` | Enable slower reranking for more accurate results | - |
 
 ### `mcp-server` - Start MCP server
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-w, --wiki <dir>` | Wiki directory (required) | - |
+| `-o, --output <dir>` | Wiki directory | `./wiki` |
 | `-r, --repo <path>` | Repository path (enables code search) | - |
 
 ### `pack` - Create wiki package
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-w, --wiki <dir>` | Wiki directory (required) | - |
-| `-o, --output <file>` | Output package path | `<name>.archiwiki` |
+| `-o, --output <dir>` | Wiki directory to package | `./wiki` |
+| `-f, --file <path>` | Output package path | `<name>.archiwiki` |
 | `-n, --name <name>` | Package name | wiki folder name |
 | `--no-rag` | Exclude RAG index | - |
 
@@ -297,7 +298,7 @@ semanticwiki generate -r ./my-project --max-turns 50
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-p, --package <file>` | Package file (required) | - |
+| `<package>` | Package file (required) | - |
 | `-o, --output <dir>` | Output directory | `.` |
 | `--wiki-only` | Extract wiki only (no RAG index) | - |
 

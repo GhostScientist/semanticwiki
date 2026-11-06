@@ -153,13 +153,32 @@ export class AnthropicProvider implements LLMProvider {
    * Get information about the current model
    */
   getModelInfo(): ModelInfo {
+    const contextLength = this.getContextLength();
+
     return {
       name: this.modelName,
-      contextLength: 200000, // Claude's context window
+      contextLength,
       supportsTools: true,
       supportsStreaming: true,
       isLocal: false,
     };
+  }
+
+  /**
+   * Return the known context window for Anthropic models used by this CLI.
+   * Claude 4.6+ model IDs are pinned, dateless IDs; Opus 4.7 and Sonnet 4.6
+   * currently expose a 1M-token context window through the API.
+   */
+  private getContextLength(): number {
+    if (
+      this.modelName === 'claude-opus-4-7' ||
+      this.modelName === 'claude-opus-4-6' ||
+      this.modelName === 'claude-sonnet-4-6'
+    ) {
+      return 1_000_000;
+    }
+
+    return 200_000;
   }
 
   /**

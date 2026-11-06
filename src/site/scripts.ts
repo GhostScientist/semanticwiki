@@ -312,10 +312,13 @@ export function getClientScripts(features: Features): string {
       const newTitle = doc.querySelector('title')?.textContent || 'Documentation';
       const newToc = doc.querySelector('.toc-list');
       const newBreadcrumbs = doc.querySelector('.breadcrumbs');
+      const newSidebar = doc.querySelector('.sidebar');
+      const newConfig = extractWikiConfig(html);
 
       const currentContent = document.querySelector('.page-content');
       const currentToc = document.querySelector('.toc-list');
       const currentBreadcrumbs = document.querySelector('.breadcrumbs');
+      const currentSidebar = document.querySelector('.sidebar');
 
       if (newContent && currentContent) {
         // Smooth transition
@@ -338,6 +341,14 @@ export function getClientScripts(features: Features): string {
           currentBreadcrumbs.innerHTML = newBreadcrumbs.innerHTML;
         }
 
+        // Replace sidebar navigation so relative links match the new page depth.
+        // Without this, links loaded from README.html such as ./architecture/x.html
+        // become /site/architecture/architecture/x.html after SPA navigation.
+        if (newSidebar && currentSidebar) {
+          currentSidebar.innerHTML = newSidebar.innerHTML;
+          currentSidebar.className = newSidebar.className;
+        }
+
         // Update title
         document.title = newTitle;
 
@@ -347,8 +358,13 @@ export function getClientScripts(features: Features): string {
         }
 
         // Update config.currentPath for other features
-        const urlPath = new URL(url).pathname;
-        config.currentPath = urlPath.replace(config.rootPath, '').replace(/^\\//, '');
+        if (newConfig.rootPath !== undefined) config.rootPath = newConfig.rootPath;
+        if (newConfig.currentPath !== undefined) {
+          config.currentPath = newConfig.currentPath;
+        } else {
+          const urlPath = new URL(url).pathname;
+          config.currentPath = urlPath.replace(config.rootPath, '').replace(/^\\//, '');
+        }
 
         // Scroll to top of main content, or to hash if present
         const hash = new URL(url).hash;
@@ -387,6 +403,8 @@ export function getClientScripts(features: Features): string {
 
         // Reinitialize TOC highlighting
         initTocHighlight();
+        initCopyButtons();
+        initSourceLinks();
 
         showToast('Navigated to: ' + newTitle.split(' | ')[0], 'success');
       }
@@ -399,6 +417,16 @@ export function getClientScripts(features: Features): string {
         linkElement.classList.remove('loading');
       }
     }
+  }
+
+  function extractWikiConfig(html) {
+    const rootPathMatch = html.match(/rootPath:\\s*'([^']*)'/);
+    const currentPathMatch = html.match(/currentPath:\\s*'([^']*)'/);
+
+    return {
+      rootPath: rootPathMatch ? rootPathMatch[1] : undefined,
+      currentPath: currentPathMatch ? currentPathMatch[1] : undefined
+    };
   }
 
   // ========================================

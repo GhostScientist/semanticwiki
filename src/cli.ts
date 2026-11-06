@@ -30,10 +30,23 @@ const claudeConfig = loadClaudeConfig(workingDir);
 
 const program = new Command();
 
+// Read the version from the package that is actually being executed. Keeping
+// this next to package.json means `semanticwiki --version` cannot silently
+// drift from the published artifact when the package version changes.
+const packageVersion = (() => {
+  try {
+    const packageUrl = new URL('../package.json', import.meta.url);
+    const packageJson = JSON.parse(fs.readFileSync(packageUrl, 'utf8')) as { version?: string };
+    return packageJson.version || '0.0.0-dev';
+  } catch {
+    return '0.0.0-dev';
+  }
+})();
+
 program
   .name('semanticwiki')
   .description('Generate architectural documentation wikis for code repositories with source traceability.')
-  .version('1.0.0');
+  .version(packageVersion);
 
 // Interactive model picker. Shown when the user didn't pass -m AND stdin is a TTY.
 // Non-interactive runs (CI, piped input, scripts) silently keep `defaultValue`.
@@ -169,6 +182,13 @@ program
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
+
+      // Site generation is a pure transformation of existing Markdown. It
+      // must not prompt for a model or require cloud credentials.
+      if (options.siteOnly) {
+        await generateStaticSite(options);
+        return;
+      }
 
       // First-run interactive picker: when no mode/model flag was passed and stdin is a
       // TTY, ask local vs API (and which model if API). This mutates options.fullLocal,
@@ -349,12 +369,6 @@ program
           throw error;
         }
 
-        return;
-      }
-
-      // Handle --site-only mode (generate site from existing markdown)
-      if (options.siteOnly) {
-        await generateStaticSite(options);
         return;
       }
 
@@ -1706,6 +1720,16 @@ program
   .option('-p, --plan', 'Planning mode - create plan before executing')
   .action(async (query?: string, options?: { interactive?: boolean; verbose?: boolean; plan?: boolean }) => {
     try {
+      // The bare command should be a fast, discoverable entry point. Keep the
+      // old coding-agent behavior available for existing users who explicitly
+      // pass a query or --interactive, but do not make it the product's default.
+      if (!query && !options?.interactive && !options?.plan) {
+        console.log(program.helpInformation());
+        return;
+      }
+
+      console.warn(chalk.yellow('Legacy coding-agent mode: prefer generate, update, verify, or search for SemanticWiki workflows.'));
+
       const configManager = new ConfigManager();
       const config = await configManager.load();
 
