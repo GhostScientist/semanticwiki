@@ -2,6 +2,8 @@
 
 Use Node 24+ (`.node-version`), npm, and TypeScript ESM imports with `.js` suffixes. Keep documentation maintenance as the primary workflow. Read [AGENTS.md](AGENTS.md) for module ownership and conventions.
 
+Volta users automatically select the tested Node 24 version pinned in `package.json` when working in this checkout. Other version managers can use `.node-version`.
+
 ## Checks
 
 ```bash

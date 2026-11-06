@@ -82,5 +82,8 @@
   },
   "optionalDependencies": {
     "faiss-node": "^0.5.1"
+  },
+  "volta": {
+    "node": "24.22.2"
   }
 }
