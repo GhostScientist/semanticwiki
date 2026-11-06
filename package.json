@@ -55,7 +55,6 @@
     "cheerio": "^1.2.0",
     "commander": "^12.0.0",
     "dotenv": "^17.4.2",
-    "faiss-node": "^0.5.1",
     "glob": "^13.0.6",
     "gray-matter": "^4.0.3",
     "inquirer": "^9.2.12",
@@ -72,5 +71,8 @@
     "@vitest/coverage-v8": "^4.1.11",
     "typescript": "^5.9.3",
     "vitest": "^4.1.11"
+  },
+  "optionalDependencies": {
+    "faiss-node": "^0.5.1"
   }
 }

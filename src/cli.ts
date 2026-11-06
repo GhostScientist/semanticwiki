@@ -193,6 +193,12 @@ program
   .option('--context-size <n>', 'Context window size for local models (default: 32768)', parseInt)
   .option('--threads <n>', 'CPU threads for local inference (default: auto)', parseInt)
   .option('--compact-search', 'Truncate search results to reduce token usage (auto-enabled for large codebases)')
+  // Contextual retrieval options
+  .option('--contextual', 'Enable contextual retrieval for better chunk understanding (uses Claude API)')
+  .option('--contextual-local', 'Use local LLM for contextual retrieval instead of Claude API')
+  .option('--contextual-model <model>', 'Claude model for contextual retrieval (default: claude-3-haiku-20240307)')
+  .option('--contextual-ollama-model <model>', 'Ollama model for local contextual retrieval (default: qwen2.5-coder:7b)')
+  .option('--contextual-preview [n]', 'Preview contextual enrichment on N sample chunks (default: 10)', parseInt)
   .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
@@ -416,8 +422,125 @@ program
         gpuLayers: options.gpuLayers,
         contextSize: options.contextSize,
         threads: options.threads,
-        compactSearch: options.compactSearch
+        compactSearch: options.compactSearch,
+        // Contextual retrieval options
+        useContextualRetrieval: options.contextual || options.contextualLocal,
+        contextualLocal: options.contextualLocal,
+        contextualUseOllama: options.contextualLocal && options.useOllama,  // Use Ollama if both flags set
+        contextualModel: options.contextualModel,
+        contextualOllamaHost: options.ollamaHost,  // Reuse Ollama host if set
+        contextualLocalModel: options.contextualOllamaModel
       };
+
+      // Handle --contextual-preview mode
+      if (options.contextualPreview !== undefined) {
+        spinner.stop();
+        console.log(chalk.cyan.bold('\n🔍 Contextual Retrieval Preview\n'));
+
+        const sampleSize = typeof options.contextualPreview === 'number' ? options.contextualPreview : 10;
+
+        // Import required modules
+        const { ASTChunker } = await import('./ast-chunker.js');
+        const { ContextualRetrieval } = await import('./rag/contextual-retrieval.js');
+        const simpleGit = await import('simple-git');
+        const { glob } = await import('glob');
+        const fsModule = await import('fs');
+
+        // Clone/prepare repo
+        const repoDir = options.repo.startsWith('http') || options.repo.includes('@')
+          ? `/tmp/semanticwiki-preview-${Date.now()}`
+          : path.resolve(options.repo);
+
+        if (options.repo.startsWith('http') || options.repo.includes('@')) {
+          console.log(chalk.gray('Cloning repository...'));
+          const git = simpleGit.simpleGit();
+          await git.clone(options.repo, repoDir, ['--depth', '1']);
+        }
+
+        // Find source files
+        console.log(chalk.gray('Finding source files...'));
+        const searchPath = options.path ? path.join(repoDir, options.path) : repoDir;
+        const files = await glob('**/*.{ts,tsx,js,jsx,py,java,go,rs,rb,php,cs,cpp,c,h}', {
+          cwd: searchPath,
+          ignore: ['**/node_modules/**', '**/dist/**', '**/build/**', '**/.git/**', '**/vendor/**'],
+        });
+
+        // Chunk files
+        console.log(chalk.gray('Chunking files...'));
+        const chunker = new ASTChunker();
+        const chunks: import('./ast-chunker.js').ASTChunk[] = [];
+
+        for (const file of files.slice(0, 50)) { // Limit files for preview
+          try {
+            const relativePath = options.path ? path.join(options.path, file) : file;
+            const fileChunks = await chunker.chunkFile(relativePath, repoDir);
+            chunks.push(...fileChunks);
+          } catch {
+            // Skip files that fail to chunk
+          }
+        }
+        console.log(chalk.gray(`  Found ${chunks.length} chunks from ${Math.min(files.length, 50)} files\n`));
+
+        // Initialize contextual retrieval
+        const contextualRetrieval = new ContextualRetrieval({
+          enabled: true,
+          useLocal: options.contextualLocal || options.fullLocal,
+          useOllama: options.useOllama,
+          apiKey: config.apiKey,
+          model: options.contextualModel,
+          ollamaHost: options.ollamaHost,
+          localModel: options.contextualOllamaModel,
+        });
+
+        console.log(chalk.gray('Initializing LLM...'));
+        await contextualRetrieval.initialize();
+
+        // Run preview
+        console.log(chalk.gray(`Generating context for ${sampleSize} sample chunks...\n`));
+        const preview = await contextualRetrieval.previewEnrichment(chunks, repoDir, sampleSize);
+
+        // Display results
+        console.log(chalk.white.bold('Mode:'), chalk.yellow(preview.mode));
+        console.log(chalk.white.bold('Total chunks:'), chalk.yellow(preview.totalChunks.toString()));
+        console.log(chalk.white.bold('Sample size:'), chalk.yellow(preview.sampleSize.toString()));
+        console.log();
+
+        // Count by status
+        const statusCounts = { success: 0, empty: 0, fallback: 0, error: 0 };
+        for (const sample of preview.samples) {
+          statusCounts[sample.status]++;
+        }
+
+        console.log(chalk.green(`  ✓ ${statusCounts.success} successful`));
+        if (statusCounts.empty > 0) console.log(chalk.yellow(`  ⚠ ${statusCounts.empty} empty responses`));
+        if (statusCounts.error > 0) console.log(chalk.red(`  ✗ ${statusCounts.error} errors`));
+        console.log();
+
+        // Show samples
+        console.log(chalk.cyan.bold('Sample Results:\n'));
+        for (let i = 0; i < preview.samples.length; i++) {
+          const sample = preview.samples[i];
+          const statusIcon = sample.status === 'success' ? '✓' : sample.status === 'empty' ? '⚠' : '✗';
+          const statusColor = sample.status === 'success' ? chalk.green : sample.status === 'empty' ? chalk.yellow : chalk.red;
+
+          console.log(statusColor(`[${i + 1}] ${statusIcon} ${sample.filePath}`));
+          if (sample.name) {
+            console.log(chalk.gray(`    ${sample.chunkType || 'chunk'}: ${sample.name}`));
+          }
+          console.log(chalk.white('    Context:'), chalk.cyan(sample.contextualPrefix || '(empty)'));
+          console.log();
+        }
+
+        // Cleanup
+        await contextualRetrieval.cleanup();
+
+        // Clean up temp dir if we cloned
+        if (options.repo.startsWith('http') || options.repo.includes('@')) {
+          fsModule.rmSync(repoDir, { recursive: true, force: true });
+        }
+
+        return;
+      }
 
       // Choose generator based on options
       let generator;
@@ -1550,9 +1673,9 @@ program
 // Package command - create portable wiki package
 program
   .command('pack')
-  .description('Create a portable .archiwiki package from wiki directory')
+  .description('Create a portable .semantics package from wiki directory')
   .option('-o, --output <dir>', 'Wiki directory to package', './wiki')
-  .option('-f, --file <path>', 'Output package file path (default: wiki name + .archiwiki)')
+  .option('-f, --file <path>', 'Output package file path (default: wiki name + .semantics)')
   .option('-n, --name <name>', 'Package name')
   .option('-d, --description <text>', 'Package description')
   .option('--source-repo <url>', 'Source repository URL')
@@ -1566,11 +1689,11 @@ program
         process.exit(1);
       }
 
-      console.log(chalk.cyan.bold('\n📦 Creating ArchiWiki Package\n'));
+      console.log(chalk.cyan.bold('\n📦 Creating SemanticWiki Package\n'));
 
       const { createPackage } = await import('./package-format.js');
 
-      const outputPath = options.file || path.join(path.dirname(wikiDir), `${path.basename(wikiDir)}.archiwiki`);
+      const outputPath = options.file || path.join(path.dirname(wikiDir), `${path.basename(wikiDir)}.semantics`);
 
       await createPackage({
         wikiPath: wikiDir,
@@ -1591,8 +1714,8 @@ program
 // Unpack command - extract portable wiki package
 program
   .command('unpack')
-  .description('Extract an .archiwiki package to a directory')
-  .argument('<package>', 'Path to .archiwiki package file')
+  .description('Extract a .semantics package to a directory')
+  .argument('<package>', 'Path to .semantics package file')
   .option('-o, --output <dir>', 'Output directory', '.')
   .option('--wiki-only', 'Extract only wiki files, skip RAG index')
   .option('--info', 'Show package info without extracting')
@@ -1642,7 +1765,7 @@ program
         return;
       }
 
-      console.log(chalk.cyan.bold('\n📦 Extracting ArchiWiki Package\n'));
+      console.log(chalk.cyan.bold('\n📦 Extracting SemanticWiki Package\n'));
 
       const manifest = await extractPackage({
         packagePath: pkgPath,

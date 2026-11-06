@@ -16,8 +16,10 @@ import type { HardwareProfile, ModelRecommendation, ProgressCallback } from './t
 
 /**
  * Model family type for filtering models
+ * - 'gpt-oss': Large agentic model with tool calling (for wiki generation)
+ * - 'completion': Small fast model for text completion tasks (for contextual retrieval)
  */
-export type ModelFamily = 'gpt-oss';
+export type ModelFamily = 'gpt-oss' | 'completion';
 
 /**
  * Extended model recommendation with family
@@ -42,6 +44,21 @@ const MODEL_REGISTRY: ModelRegistryEntry[] = [
     minRam: 32,
     contextLength: 32768,
     quality: 'excellent',
+  },
+
+  // Qwen2.5-Coder-1.5B - small fast model for text completion (contextual retrieval)
+  // Specifically designed for code understanding, no function-calling tokens
+  {
+    family: 'completion',
+    modelId: 'qwen2.5-coder-1.5b-q8',
+    ggufFile: 'qwen2.5-coder-1.5b-instruct-q8_0.gguf',
+    downloadUrl:
+      'https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q8_0.gguf',
+    fileSizeBytes: 1_680_000_000, // ~1.68 GB
+    minVram: 2,
+    minRam: 4,
+    contextLength: 32768,
+    quality: 'good',
   },
 ];
 
