@@ -70,9 +70,6 @@
     "@types/node": "^22.19.1",
     "@vitest/coverage-v8": "^4.1.11",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.11"
-  },
-  "optionalDependencies": {
-    "faiss-node": "^0.5.1"
+    "vitest": "^5.0.0"
   }
 }
