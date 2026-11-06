@@ -32,7 +32,7 @@ There is no linter configured. Tests live in `tests/` and have a 30s timeout (so
 `.github/workflows/ci.yml` runs on every push to `master` and every pull request:
 
 - **build-and-test** — `npm ci --ignore-scripts`, then `npm run build` and `npm test`, on Node 20.19 and 22.x. Install scripts are skipped because the native dependencies (`faiss-node`, `node-llama-cpp`, `onnxruntime-node`, `sharp`) download large prebuilt binaries that neither `tsc` nor the test suite needs.
-- **audit** — `npm audit --audit-level=critical`. The gate is set to `critical`, not `high`, because `@huggingface/transformers` pins `sharp@^0.34`, which carries an unfixed libvips advisory (GHSA-f88m-g3jw-g9cj). SemanticWiki only uses transformers for text embeddings and never decodes images.
+- **audit** — `npm audit --audit-level=critical`. SemanticWiki only uses transformers for text embeddings and never decodes images.
 
 `.github/dependabot.yml` opens grouped weekly npm and Actions update PRs. Majors that need real code changes (`commander`, `chalk`, `inquirer`, `typescript`, `@huggingface/transformers`) are ignored there and upgraded deliberately.
 
@@ -74,7 +74,7 @@ Modes 2 and 3 share the same code path (`generateWithDirectAPI` in `wiki-agent.t
 Powers both wiki generation and the `search`/`mcp-server` commands:
 
 - AST-aware chunking (`ASTChunker`) at logical code boundaries with business-domain hints
-- BGE-small-en-v1.5 embeddings via `@huggingface/transformers`, cached in `./.semanticwiki-models`
+- EmbeddingGemma 2 text embeddings via `@huggingface/transformers` v4 and `onnx-community/embeddinggemma-2-ONNX`, cached in `./.semanticwiki-models`. Loads only the text encoder with `q4` weights; uses the model's projected `sentence_embedding` output (768 dimensions), filename document titles, and code-retrieval query prefixes. Older vector indexes are rebuilt rather than searched with mismatched embeddings.
 - FAISS (`IndexFlatIP`) vector search with a JS fallback when faiss-node is unavailable
 - Hybrid search: BM25 + vector similarity fused with Reciprocal Rank Fusion; optional cross-encoder reranking
 - Incremental indexing (only re-embeds changed files) and chunk prioritization for large repos (`--max-chunks`, `--batch-size`)

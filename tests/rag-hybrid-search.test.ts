@@ -247,14 +247,6 @@ describe('RAG Hybrid Search', () => {
   });
 
   describe('Embedding Model Selection', () => {
-    it('should prefer bge-small-en-v1.5 as default', () => {
-      const defaultModel = 'Xenova/bge-small-en-v1.5';
-      const fallbackModel = 'Xenova/all-MiniLM-L6-v2';
-
-      expect(defaultModel).toBe('Xenova/bge-small-en-v1.5');
-      expect(defaultModel).not.toBe(fallbackModel);
-    });
-
     it('should allow custom embedding model', () => {
       const config = { embeddingModel: 'Xenova/custom-model' };
       expect(config.embeddingModel).toBe('Xenova/custom-model');

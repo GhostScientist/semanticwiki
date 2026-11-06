@@ -33,6 +33,7 @@ audit.log
 
 # Agent config directory (may contain cached API keys)
 .semanticwiki/
+.semanticwiki-models/
 
 # npm
 *.tgz
