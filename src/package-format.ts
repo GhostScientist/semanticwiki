@@ -15,6 +15,7 @@ import * as zlib from 'zlib';
 import { pipeline } from 'stream/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import { glob } from 'glob';
+import { listWikiMarkdown } from './wiki-catalog.js';
 
 // Package version for compatibility checking
 export const PACKAGE_VERSION = '1.0.0';
@@ -66,8 +67,9 @@ export async function createPackage(options: PackageOptions): Promise<string> {
   const files: Array<{ relativePath: string; absolutePath: string }> = [];
 
   // Add wiki markdown files
-  const mdFiles = await glob('**/*.md', { cwd: wikiPath });
+  const mdFiles = await glob('**/*.md', { cwd: wikiPath, nodir: true, follow: false, ignore: ['**/node_modules/**'] });
   for (const file of mdFiles) {
+    if (!isRegularWikiFile(wikiPath, file)) continue;
     files.push({
       relativePath: `wiki/${file}`,
       absolutePath: path.join(wikiPath, file)
@@ -75,11 +77,15 @@ export async function createPackage(options: PackageOptions): Promise<string> {
   }
 
   // Add wiki static assets
-  const assetPatterns = ['**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.svg', '**/*.css', '**/*.js'];
+  const assetPatterns = [
+    '**/*.png', '**/*.jpg', '**/*.jpeg', '**/*.gif', '**/*.svg', '**/*.webp', '**/*.pdf',
+    '**/*.css', '**/*.js', '**/*.html', 'llms.txt',
+    'knowledge/manifest.json', 'knowledge/.semanticwiki-knowledge.json', 'site/**/*.json', 'site/**/*.txt',
+  ];
   for (const pattern of assetPatterns) {
-    const assetFiles = await glob(pattern, { cwd: wikiPath });
+    const assetFiles = await glob(pattern, { cwd: wikiPath, nodir: true, follow: false, ignore: ['**/node_modules/**'] });
     for (const file of assetFiles) {
-      if (!file.includes('.semanticwiki-cache')) {
+      if (!file.includes('.semanticwiki-cache') && isRegularWikiFile(wikiPath, file)) {
         files.push({
           relativePath: `wiki/${file}`,
           absolutePath: path.join(wikiPath, file)
@@ -144,7 +150,7 @@ export async function createPackage(options: PackageOptions): Promise<string> {
     sourceRepo,
     sourceCommit,
     wikiStats: {
-      pageCount: mdFiles.length,
+      pageCount: listWikiMarkdown(wikiPath).length,
       totalSize: wikiTotalSize
     },
     ragStats
@@ -154,7 +160,7 @@ export async function createPackage(options: PackageOptions): Promise<string> {
   // Format: [manifest_length (4 bytes)][manifest JSON][file entries...]
   // Each file entry: [path_length (2 bytes)][path][content_length (4 bytes)][content]
 
-  const packagePath = outputPath.endsWith('.semantics') ? outputPath : `${outputPath}.semantics`;
+  const packagePath = /\.(semantics|archiwiki)$/.test(outputPath) ? outputPath : `${outputPath}.semantics`;
 
   // Build the package buffer
   const chunks: Buffer[] = [];
@@ -228,7 +234,7 @@ export async function extractPackage(options: ExtractOptions): Promise<PackageMa
 
   // Create output directories
   const wikiDir = path.join(outputPath, 'wiki');
-  const ragDir = path.join(outputPath, '.semanticwiki-cache');
+  const ragDir = path.join(wikiDir, '.semanticwiki-cache');
   fs.mkdirSync(wikiDir, { recursive: true });
   if (!wikiOnly) {
     fs.mkdirSync(ragDir, { recursive: true });
@@ -272,6 +278,19 @@ export async function extractPackage(options: ExtractOptions): Promise<PackageMa
       continue;
     }
 
+    // Existing symlinks must not redirect extraction outside the selected folder.
+    let current = resolvedOutput;
+    for (const part of path.relative(resolvedOutput, resolvedTarget).split(path.sep)) {
+      current = path.join(current, part);
+      let stat: fs.Stats | undefined;
+      try { stat = fs.lstatSync(current); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (stat?.isSymbolicLink()) {
+        throw new Error(`Cannot extract through a symbolic link: ${current}`);
+      }
+    }
+
     // Create directory and write file
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     fs.writeFileSync(targetPath, content);
@@ -283,6 +302,13 @@ export async function extractPackage(options: ExtractOptions): Promise<PackageMa
   console.log(`  Output directory: ${outputPath}`);
 
   return manifest;
+}
+
+function isRegularWikiFile(wikiPath: string, relativePath: string): boolean {
+  const fullPath = path.join(wikiPath, relativePath);
+  if (!fs.lstatSync(fullPath).isFile()) return false;
+  const relative = path.relative(fs.realpathSync(wikiPath), fs.realpathSync(fullPath));
+  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 /**

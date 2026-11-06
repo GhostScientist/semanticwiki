@@ -1,7 +1,7 @@
 /**
  * LLM Provider Types
  *
- * Shared types and interfaces for all LLM providers (Anthropic, Local, Ollama)
+ * Shared types and interfaces for Anthropic, OpenAI, local GGUF, and Ollama providers
  */
 
 // JSON Schema type for tool parameters
@@ -37,20 +37,31 @@ export interface ToolResultContentBlock {
   is_error?: boolean;
 }
 
-// Opus 4.7 / 4.6 with adaptive thinking + tool use returns thinking blocks that must be
-// passed back verbatim on subsequent turns. signature is the opaque encrypted thinking;
-// thinking text is empty on Opus 4.7 unless display: "summarized" is set.
+// Anthropic thinking blocks must be passed back verbatim with tool results.
+// Signatures are opaque; visible thinking text may be empty for some models.
 export interface ThinkingContentBlock {
   type: 'thinking';
   thinking: string;
   signature: string;
 }
 
+export interface RedactedThinkingContentBlock {
+  type: 'redacted_thinking';
+  data: string;
+}
+
+/** Provider-owned continuation items, including encrypted reasoning. Never render these. */
+export interface ProviderState {
+  provider: 'openai';
+  output: Array<Record<string, unknown>>;
+}
+
 export type ContentBlock =
   | TextContentBlock
   | ToolUseContentBlock
   | ToolResultContentBlock
-  | ThinkingContentBlock;
+  | ThinkingContentBlock
+  | RedactedThinkingContentBlock;
 
 /**
  * Message format for LLM conversations
@@ -60,6 +71,7 @@ export interface LLMMessage {
   content: string | ContentBlock[];
   toolCallId?: string;
   name?: string;
+  providerState?: ProviderState;
 }
 
 /**
@@ -89,7 +101,10 @@ export interface LLMResponse {
   // Thinking blocks returned by the provider. Must be round-tripped verbatim in the next
   // assistant message when adaptive thinking is combined with tool use (Anthropic API
   // requirement). Local/Ollama providers leave this undefined.
-  thinkingBlocks?: ThinkingContentBlock[];
+  thinkingBlocks?: Array<ThinkingContentBlock | RedactedThinkingContentBlock>;
+  /** Original assistant block order for providers with interleaved thinking/tool use. */
+  assistantContent?: ContentBlock[];
+  providerState?: ProviderState;
   stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'error';
   usage: {
     inputTokens: number;
@@ -208,31 +223,36 @@ export interface ModelRecommendation {
   minRam: number;
   contextLength: number;
   quality: 'excellent' | 'good' | 'acceptable';
+  sha256?: string;
 }
 
 /**
  * Model family type for local models
- * - 'gpt-oss': Large agentic model (21B) with tool calling for wiki generation
+ * - 'semanticwiki': Default Qwen-based SemanticWiki Coder 7B v2
+ * - 'gpt-oss': Legacy 20B model available by explicit selection
  * - 'completion': Small fast model (1.5B) for text completion tasks like contextual retrieval
  */
-export type ModelFamily = 'gpt-oss' | 'completion';
+export type ModelFamily = 'semanticwiki' | 'gpt-oss' | 'completion';
+
+export type ProviderName = 'anthropic' | 'openai' | 'local' | 'ollama';
 
 /**
  * Options for creating an LLM provider
  */
 export interface CreateProviderOptions {
   // Mode selection
+  provider?: ProviderName;
   fullLocal?: boolean;
   useOllama?: boolean;
 
-  // Anthropic options
+  // Cloud options (apiKey belongs to the selected provider)
   apiKey?: string;
   model?: string;
 
   // Local options
   modelPath?: string;
   localModel?: string;
-  modelFamily?: ModelFamily; // 'gpt-oss' (21B) or 'completion' (1.5B)
+  modelFamily?: ModelFamily;
   gpuLayers?: number;
   contextSize?: number;
   threads?: number;

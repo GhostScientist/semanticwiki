@@ -1,3 +1,9 @@
+import { modelProgressReporter } from './progress.js';
+import { containedPath, wikiPagePath } from './safe-path.js';
+import { createHash } from 'node:crypto';
+import { getRuntimePaths } from './runtime-paths.js';
+import { DEFAULT_ANTHROPIC_MODEL } from './llm/defaults.js';
+import type { WikiProvider } from './cli-options.js';
 import { query, tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
@@ -5,11 +11,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { simpleGit, SimpleGit } from 'simple-git';
 import matter from 'gray-matter';
+import { marked } from 'marked';
 import { PermissionManager } from './permissions.js';
 import { MCPConfigManager } from './mcp-config.js';
 import { RAGSystem } from './rag/index.js';
 import { WIKI_SYSTEM_PROMPT } from './prompts/wiki-system.js';
-import { createLLMProvider, type LLMProvider, type LLMMessage, type LLMTool } from './llm/index.js';
+import { assistantMessageFromResponse, createLLMProvider, type LLMProvider, type LLMMessage, type LLMTool } from './llm/index.js';
 import { CodebaseDiscovery, generateHierarchicalIndex, generateComponentTable, type DiscoveryResult, type DiscoveredDomain } from './discovery/index.js';
 
 export interface WikiGenerationOptions {
@@ -18,6 +25,7 @@ export interface WikiGenerationOptions {
   configPath?: string;
   accessToken?: string;
   model?: string;
+  provider?: WikiProvider;
   targetPath?: string;
   forceRegenerate?: boolean;
   verbose?: boolean;
@@ -63,9 +71,9 @@ export interface WikiGenerationOptions {
    */
   localModel?: string;
   /**
-   * Model family for local mode. Currently only 'gpt-oss' (21B) is supported.
+   * Model family; defaults to the SemanticWiki Coder 7B v2 registry entry.
    */
-  modelFamily?: 'gpt-oss';
+  modelFamily?: 'gpt-oss' | 'semanticwiki' | 'completion';
   /**
    * Path to a local GGUF model file.
    */
@@ -83,7 +91,7 @@ export interface WikiGenerationOptions {
    */
   gpuLayers?: number;
   /**
-   * Context window size for local models (default: 32768).
+   * Context window size for local models (default: 8192).
    */
   contextSize?: number;
   /**
@@ -123,7 +131,7 @@ export interface WikiGenerationOptions {
   contextualUseOllama?: boolean;
   /** Anthropic API key for contextual retrieval */
   contextualApiKey?: string;
-  /** Model for contextual retrieval (default: claude-3-haiku) */
+  /** Model for contextual retrieval (default: current Sonnet) */
   contextualModel?: string;
   /** Ollama host for contextual retrieval */
   contextualOllamaHost?: string;
@@ -132,6 +140,7 @@ export interface WikiGenerationOptions {
 }
 
 export interface WikiAgentConfig {
+  openaiApiKey?: string;
   verbose?: boolean;
   apiKey?: string;
   permissionManager?: PermissionManager;
@@ -203,6 +212,11 @@ export class ArchitecturalWikiAgent {
   private repoPath: string = '';
   private outputDir: string = '';
   private sessionId?: string;
+  private writerModel?: string;
+
+  getRunContext(): { repositoryPath: string; model?: string } {
+    return { repositoryPath: this.repoPath, model: this.writerModel };
+  }
 
   constructor(config: WikiAgentConfig = {}) {
     this.config = config;
@@ -840,6 +854,7 @@ export class ArchitecturalWikiAgent {
     let provider: LLMProvider;
     try {
       provider = await createLLMProvider({
+        onProgress: modelProgressReporter(),
         fullLocal: options.fullLocal,
         useOllama: options.useOllama,
         ollamaHost: options.ollamaHost,
@@ -850,16 +865,17 @@ export class ArchitecturalWikiAgent {
         contextSize: options.contextSize,
         threads: options.threads,
         model: options.model,
-        apiKey: this.config.apiKey,
+        provider: options.provider === 'claude-code' ? undefined : options.provider,
+        apiKey: options.provider === 'openai' ? this.config.openaiApiKey : this.config.apiKey,
         verbose: options.verbose,
       });
     } catch (error) {
       const err = error as Error;
-      yield { type: 'error', message: `Failed to initialize LLM provider: ${err.message}` };
-      return;
+      throw new Error(`Failed to initialize LLM provider: ${err.message}`, { cause: err });
     }
 
     const modelInfo = provider.getModelInfo();
+    this.writerModel = modelInfo.name;
     const maxTurns = options.maxTurns || 200;
     const prompt = this.buildGenerationPrompt(options);
 
@@ -904,7 +920,7 @@ export class ArchitecturalWikiAgent {
     let lastInputTokens = 0;
     let warnedAboutTokens = false;
     const logPrefix = options.fullLocal ? 'Local' : 'DirectAPI';
-    const maxResponseTokens = 8192;
+    const maxResponseTokens = Math.min(8192, Math.floor(modelInfo.contextLength / 4));
     const maxInputTokens = this.getMaxInputTokens(modelInfo.contextLength, maxResponseTokens);
     const highTokenWarningThreshold = Math.floor(maxInputTokens * 0.85);
 
@@ -946,26 +962,10 @@ export class ArchitecturalWikiAgent {
           console.log(`[${logPrefix}] Usage: input=${response.usage.inputTokens}, output=${response.usage.outputTokens}, context=${modelInfo.contextLength.toLocaleString()}`);
         }
 
-        // Process response content - use explicit type for our content blocks
-        type LocalContentBlock =
-          | { type: 'text'; text: string }
-          | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-          | { type: 'thinking'; thinking: string; signature: string };
-
-        const assistantContent: LocalContentBlock[] = [];
         const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
-
-        // Thinking blocks must come first in the assistant message when adaptive thinking
-        // is combined with tool use — the API requires them preserved between turns.
-        if (response.thinkingBlocks) {
-          for (const tb of response.thinkingBlocks) {
-            assistantContent.push({ type: 'thinking', thinking: tb.thinking, signature: tb.signature });
-          }
-        }
 
         // Handle text content
         if (response.content) {
-          assistantContent.push({ type: 'text', text: response.content });
           if (options.verbose) {
             console.log(`[${options.fullLocal ? 'Local' : 'DirectAPI'}] Text: ${response.content.slice(0, 200)}${response.content.length > 200 ? '...' : ''}`);
           }
@@ -979,14 +979,6 @@ export class ArchitecturalWikiAgent {
             console.log(`[${options.fullLocal ? 'Local' : 'DirectAPI'}] Tool call #${totalToolCalls}: ${toolCall.name}`);
             console.log(`[${options.fullLocal ? 'Local' : 'DirectAPI'}] Input: ${JSON.stringify(toolCall.arguments).slice(0, 200)}`);
           }
-
-          // Add tool use to assistant content
-          assistantContent.push({
-            type: 'tool_use',
-            id: toolCall.id,
-            name: toolCall.name,
-            input: toolCall.arguments as Record<string, unknown>
-          });
 
           // Execute the tool
           const result = await this.executeDirectApiTool(toolCall.name, toolCall.arguments as Record<string, any>);
@@ -1002,28 +994,7 @@ export class ArchitecturalWikiAgent {
           });
         }
 
-        // Add assistant message with thinking (if any), text, and tool uses
-        // Map to our ContentBlock types from ./llm/types
-        const mappedContent = assistantContent.map(block => {
-          if (block.type === 'text') {
-            return { type: 'text' as const, text: block.text };
-          } else if (block.type === 'thinking') {
-            return { type: 'thinking' as const, thinking: block.thinking, signature: block.signature };
-          } else {
-            return {
-              type: 'tool_use' as const,
-              id: block.id,
-              name: block.name,
-              input: block.input
-            };
-          }
-        });
-
-        const assistantMsg: LLMMessage = {
-          role: 'assistant',
-          content: mappedContent
-        };
-        messages.push(assistantMsg);
+        messages.push(assistantMessageFromResponse(response));
 
         // If there were tool uses, add results and continue
         if (toolResults.length > 0) {
@@ -1043,13 +1014,16 @@ export class ArchitecturalWikiAgent {
           done = true;
           console.log(`[${logPrefix}] Agent finished naturally after ${turnCount} turns`);
         } else if (response.stopReason === 'max_tokens') {
+          if (toolResults.length === 0) {
+            messages.push({ role: 'user', content: 'Your previous response reached the token limit. Continue from where you left off and finish the requested wiki work.' });
+          }
           console.log(`[${logPrefix}] Warning: Hit max_tokens, continuing...`);
         }
       }
 
       if (!done && turnCount >= maxTurns) {
         console.log(`[${logPrefix}] Warning: Reached max turns (${maxTurns})`);
-        yield { type: 'error', message: `Reached maximum turns (${maxTurns})` };
+        throw new Error(`Reached maximum turns (${maxTurns}). Resume with semanticwiki continue.`);
       }
 
       console.log('\n' + '='.repeat(60));
@@ -1082,7 +1056,7 @@ export class ArchitecturalWikiAgent {
         };
 
         // Get unique missing pages
-        const missingPages = [...new Set(verification.brokenLinks.map(l => l.target))];
+        const missingPages = [...new Set(verification.brokenLinks.map(l => l.resolvedTarget))];
         console.log(`[${logPrefix}] Missing pages: ${missingPages.join(', ')}`);
 
         // Generate missing pages
@@ -1111,7 +1085,7 @@ Create all ${missingPages.length} missing pages now.`;
           turnCount++;
 
           const response = await provider.chat(continuationMessages, llmTools, {
-            maxTokens: 8192,
+            maxTokens: maxResponseTokens,
             systemPrompt: WIKI_SYSTEM_PROMPT,
             temperature: 0.7,
           });
@@ -1120,35 +1094,11 @@ Create all ${missingPages.length} missing pages now.`;
             console.log(`[${logPrefix}] Continuation turn ${continuationTurns}: ${response.stopReason}`);
           }
 
-          const assistantContentBlocks: Array<
-            | { type: 'text'; text: string }
-            | { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> }
-            | { type: 'thinking'; thinking: string; signature: string }
-          > = [];
           const toolResults: Array<{ type: 'tool_result'; tool_use_id: string; content: string }> = [];
-
-          // Thinking blocks must come first in the assistant message when adaptive thinking
-          // is combined with tool use — the API requires them preserved between turns.
-          if (response.thinkingBlocks) {
-            for (const tb of response.thinkingBlocks) {
-              assistantContentBlocks.push({ type: 'thinking', thinking: tb.thinking, signature: tb.signature });
-            }
-          }
-
-          // Handle text content
-          if (response.content) {
-            assistantContentBlocks.push({ type: 'text', text: response.content });
-          }
 
           // Handle tool calls
           for (const toolCall of response.toolCalls) {
             totalToolCalls++;
-            assistantContentBlocks.push({
-              type: 'tool_use',
-              id: toolCall.id,
-              name: toolCall.name,
-              input: toolCall.arguments
-            });
 
             const result = await this.executeDirectApiTool(toolCall.name, toolCall.arguments as Record<string, any>);
             toolResults.push({
@@ -1162,7 +1112,7 @@ Create all ${missingPages.length} missing pages now.`;
             }
           }
 
-          continuationMessages.push({ role: 'assistant', content: assistantContentBlocks });
+          continuationMessages.push(assistantMessageFromResponse(response));
 
           if (toolResults.length > 0) {
             continuationMessages.push({
@@ -1177,6 +1127,8 @@ Create all ${missingPages.length} missing pages now.`;
 
           if (response.stopReason === 'end_turn' && toolResults.length === 0) {
             break;
+          } else if (response.stopReason === 'max_tokens' && toolResults.length === 0) {
+            continuationMessages.push({ role: 'user', content: 'Your previous response reached the token limit. Continue from where you left off and finish the missing wiki pages.' });
           }
         }
       }
@@ -1190,8 +1142,8 @@ Create all ${missingPages.length} missing pages now.`;
         }
       }
 
-      // Shutdown the provider
-      await provider.shutdown();
+      const completed = await this.verifyWikiCompleteness(this.outputDir);
+      if (!completed.isComplete) throw new Error(`Generation incomplete: ${completed.brokenLinks.length} broken links across ${completed.totalPages} pages.`);
 
       console.log('\n' + '='.repeat(60));
       console.log(`[${logPrefix}] GENERATION COMPLETE`);
@@ -1207,6 +1159,8 @@ Create all ${missingPages.length} missing pages now.`;
       }
       yield { type: 'error', message: err.message };
       throw err;
+    } finally {
+      await provider.shutdown();
     }
   }
 
@@ -1276,8 +1230,6 @@ Create all ${missingPages.length} missing pages now.`;
     yield { type: 'phase', message: 'Initializing local LLM', progress: 15 };
 
     let provider: LLMProvider | null = null;
-    let pagesSinceProviderInit = 0;
-    const PROVIDER_RESET_THRESHOLD = 15; // Reset before hitting 20 sequence limit
 
     // Helper to (re)initialize provider
     const initializeProvider = async (): Promise<LLMProvider> => {
@@ -1289,7 +1241,9 @@ Create all ${missingPages.length} missing pages now.`;
         }
       }
       const newProvider = await createLLMProvider({
+        onProgress: modelProgressReporter(),
         fullLocal: true,
+        model: options.model,
         useOllama: options.useOllama,
         ollamaHost: options.ollamaHost,
         localModel: options.localModel,
@@ -1301,7 +1255,6 @@ Create all ${missingPages.length} missing pages now.`;
         verbose: options.verbose,
       });
       provider = newProvider;
-      pagesSinceProviderInit = 0;
       return newProvider;
     };
 
@@ -1309,11 +1262,12 @@ Create all ${missingPages.length} missing pages now.`;
       provider = await initializeProvider();
     } catch (error) {
       const err = error as Error;
-      yield { type: 'error', message: `Failed to initialize local LLM: ${err.message}` };
-      return;
+      throw new Error(`Failed to initialize local LLM: ${err.message}`, { cause: err });
     }
 
+    try {
     const modelInfo = provider.getModelInfo();
+    this.writerModel = modelInfo.name;
     console.log('\n' + '='.repeat(60));
     console.log('[Local] Page-by-Page Generation Mode');
     console.log('[Local] Model:', modelInfo.name);
@@ -1331,7 +1285,7 @@ Create all ${missingPages.length} missing pages now.`;
     // Generate hierarchical index.md first
     console.log('[Local] Generating hierarchical index.md');
     const indexContent = this.generateEnhancedIndex(discoveryResult, pagesToGenerate);
-    fs.writeFileSync(path.join(this.outputDir, 'index.md'), indexContent, 'utf-8');
+    fs.writeFileSync(wikiPagePath(this.outputDir, 'index.md'), indexContent, 'utf-8');
     yield { type: 'file', message: 'index.md', detail: 'Hierarchical Index' };
 
     // Phase 5: Generate each page one at a time
@@ -1346,23 +1300,14 @@ Create all ${missingPages.length} missing pages now.`;
 
       console.log(`\n[Local] ─── Page ${pagesGenerated + 1}/${pagesToGenerate.length}: ${pageSpec.title} ───`);
 
-      // Check if we need to reinitialize provider before hitting sequence limit
-      if (pagesSinceProviderInit >= PROVIDER_RESET_THRESHOLD) {
-        console.log(`[Local] Resetting LLM provider (${pagesSinceProviderInit} pages since last reset)...`);
-        try {
-          await initializeProvider();
-        } catch (error) {
-          console.error(`[Local] Failed to reinitialize provider: ${(error as Error).message}`);
-        }
-      }
+
 
       try {
         const content = await this.generateSinglePage(provider, pageSpec, pagesToGenerate, options);
-        pagesSinceProviderInit++;
 
         if (content) {
           // Write the page
-          const pagePath = path.join(this.outputDir, pageSpec.filename);
+          const pagePath = wikiPagePath(this.outputDir, pageSpec.filename);
           const pageDir = path.dirname(pagePath);
           if (!fs.existsSync(pageDir)) {
             fs.mkdirSync(pageDir, { recursive: true });
@@ -1384,10 +1329,9 @@ Create all ${missingPages.length} missing pages now.`;
           try {
             await initializeProvider();
             const content = await this.generateSinglePage(provider, pageSpec, pagesToGenerate, options);
-            pagesSinceProviderInit++;
 
             if (content) {
-              const pagePath = path.join(this.outputDir, pageSpec.filename);
+              const pagePath = wikiPagePath(this.outputDir, pageSpec.filename);
               const pageDir = path.dirname(pagePath);
               if (!fs.existsSync(pageDir)) {
                 fs.mkdirSync(pageDir, { recursive: true });
@@ -1452,15 +1396,7 @@ Create all ${missingPages.length} missing pages now.`;
 
         console.log(`[Local] ─── Generating missing page: ${pageTitle} ───`);
 
-        // Check if we need to reinitialize provider
-        if (pagesSinceProviderInit >= PROVIDER_RESET_THRESHOLD) {
-          console.log(`[Local] Resetting LLM provider (${pagesSinceProviderInit} pages since last reset)...`);
-          try {
-            await initializeProvider();
-          } catch (error) {
-            console.error(`[Local] Failed to reinitialize provider: ${(error as Error).message}`);
-          }
-        }
+
 
         // Find broken links that reference this page to get context
         const referencingLinks = verification.brokenLinks.filter(l => l.resolvedTarget === missingFile);
@@ -1489,10 +1425,9 @@ Create all ${missingPages.length} missing pages now.`;
             [...pagesToGenerate, missingPageSpec],
             options
           );
-          pagesSinceProviderInit++;
 
           if (content) {
-            const pagePath = path.join(this.outputDir, missingFile);
+            const pagePath = wikiPagePath(this.outputDir, missingFile);
             const pageDir = path.dirname(pagePath);
             if (!fs.existsSync(pageDir)) {
               fs.mkdirSync(pageDir, { recursive: true });
@@ -1518,10 +1453,9 @@ Create all ${missingPages.length} missing pages now.`;
                 [...pagesToGenerate, missingPageSpec],
                 options
               );
-              pagesSinceProviderInit++;
 
               if (content) {
-                const pagePath = path.join(this.outputDir, missingFile);
+                const pagePath = wikiPagePath(this.outputDir, missingFile);
                 const pageDir = path.dirname(pagePath);
                 if (!fs.existsSync(pageDir)) {
                   fs.mkdirSync(pageDir, { recursive: true });
@@ -1559,15 +1493,15 @@ Create all ${missingPages.length} missing pages now.`;
     try {
       const indexContent = await this.generateIndexPage(provider, pagesToGenerate, options);
       if (indexContent) {
-        fs.writeFileSync(path.join(this.outputDir, 'index.md'), indexContent, 'utf-8');
+        fs.writeFileSync(wikiPagePath(this.outputDir, 'index.md'), indexContent, 'utf-8');
         console.log(`[Local] ✓ Generated: index.md`);
       }
     } catch (error) {
       console.error(`[Local] ✗ Failed to generate index page`);
     }
 
-    // Shutdown provider
-    await provider.shutdown();
+    const completed = await this.verifyWikiCompleteness(this.outputDir);
+    if (pagesFailed > 0 || !completed.isComplete) throw new Error(`Local generation incomplete: ${pagesFailed} failed pages, ${completed.brokenLinks.length} broken links.`);
 
     console.log('\n' + '='.repeat(60));
     console.log('[Local] GENERATION COMPLETE');
@@ -1576,6 +1510,9 @@ Create all ${missingPages.length} missing pages now.`;
     console.log('='.repeat(60) + '\n');
 
     yield { type: 'complete', message: `Local generation complete: ${pagesGenerated} pages`, progress: 100 };
+    } finally {
+      await provider?.shutdown();
+    }
   }
 
   /**
@@ -3143,11 +3080,12 @@ Return only the JSON, no markdown code blocks.`;
     allPages: Array<{ title: string; filename: string; type: string }>,
     options: WikiGenerationOptions
   ): Promise<string | null> {
-    console.log(`\n[Local] ════════════════════════════════════════════════════════`);
-    console.log(`[Local] generateSinglePage: ${pageSpec.title}`);
-    console.log(`[Local]   Type: ${pageSpec.type}`);
-    console.log(`[Local]   Filename: ${pageSpec.filename}`);
-    console.log(`[Local]   Source files: ${pageSpec.sourceFiles.slice(0, 5).join(', ')}${pageSpec.sourceFiles.length > 5 ? '...' : ''}`);
+    const log = (...values: unknown[]) => { if (options.verbose) console.log(...values); };
+    log(`\n[Local] ════════════════════════════════════════════════════════`);
+    log(`[Local] generateSinglePage: ${pageSpec.title}`);
+    log(`[Local]   Type: ${pageSpec.type}`);
+    log(`[Local]   Filename: ${pageSpec.filename}`);
+    log(`[Local]   Source files: ${pageSpec.sourceFiles.slice(0, 5).join(', ')}${pageSpec.sourceFiles.length > 5 ? '...' : ''}`);
 
     // Build cross-reference info for the model
     const otherPages = allPages
@@ -3158,7 +3096,7 @@ Return only the JSON, no markdown code blocks.`;
     // Use RAG to get semantically relevant code chunks
     let ragContext = '';
     if (this.ragSystem && this.ragSystem.getDocumentCount() > 0) {
-      console.log(`[Local]   RAG system: ${this.ragSystem.getDocumentCount()} chunks indexed`);
+      log(`[Local]   RAG system: ${this.ragSystem.getDocumentCount()} chunks indexed`);
 
       // Search for content relevant to this page's topic
       const searchQueries = [
@@ -3166,15 +3104,15 @@ Return only the JSON, no markdown code blocks.`;
         pageSpec.context,
         ...pageSpec.sourceFiles.slice(0, 3).map(f => path.basename(f, path.extname(f)))
       ];
-      console.log(`[Local]   Search queries: ${JSON.stringify(searchQueries)}`);
+      log(`[Local]   Search queries: ${JSON.stringify(searchQueries)}`);
 
       const seenChunks = new Set<string>();
       const chunkFiles: string[] = [];
       for (const query of searchQueries) {
         try {
-          console.log(`[Local]   Searching for: "${query.slice(0, 50)}..."`);
+          log(`[Local]   Searching for: "${query.slice(0, 50)}..."`);
           const results = await this.ragSystem.search(query, { maxResults: 5 });
-          console.log(`[Local]     Found ${results.length} results`);
+          log(`[Local]     Found ${results.length} results`);
 
           for (const result of results) {
             const chunkKey = `${result.filePath}:${result.startLine}`;
@@ -3198,17 +3136,17 @@ Return only the JSON, no markdown code blocks.`;
             if (ragContext.length > 12000) break; // Context budget - 21B model can handle more
           }
         } catch (err) {
-          console.log(`[Local]   RAG search error for "${query}": ${(err as Error).message}`);
+          log(`[Local]   RAG search error for "${query}": ${(err as Error).message}`);
         }
         if (ragContext.length > 12000) break;
       }
-      console.log(`[Local]   RAG context: ${ragContext.length} chars from ${seenChunks.size} chunks`);
-      console.log(`[Local]   Files in context: ${[...new Set(chunkFiles)].join(', ')}`);
+      log(`[Local]   RAG context: ${ragContext.length} chars from ${seenChunks.size} chunks`);
+      log(`[Local]   Files in context: ${[...new Set(chunkFiles)].join(', ')}`);
     }
 
     // Fallback: read source files directly if RAG didn't provide enough context
     if (ragContext.length < 500) {
-      console.log(`[Local]   Using file fallback (RAG context insufficient)`);
+      log(`[Local]   Using file fallback (RAG context insufficient)`);
       for (const file of pageSpec.sourceFiles.slice(0, 5)) {
         try {
           const fullPath = path.join(this.repoPath, file);
@@ -3274,18 +3212,18 @@ Generate the documentation now:`;
     const systemPrompt = `You are a senior technical writer creating internal documentation for a software development team. Your documentation is thorough, accurate, and always grounded in the actual source code. You explain not just WHAT the code does, but HOW it works and WHY it's designed that way. You include clickable source file references using this format: 📄 [path/file.ts:line](../path/file.ts#Lline)`;
 
     // Debug: show prompt stats
-    console.log(`[Local]   ─────────────────────────────────────────────────────`);
-    console.log(`[Local]   PROMPT STATS:`);
-    console.log(`[Local]     System prompt: ${systemPrompt.length} chars`);
-    console.log(`[Local]     User prompt: ${prompt.length} chars`);
-    console.log(`[Local]     RAG context portion: ${ragContext.length} chars`);
-    console.log(`[Local]     Total input: ~${Math.round((systemPrompt.length + prompt.length) / 4)} tokens (est.)`);
-    console.log(`[Local]   ─────────────────────────────────────────────────────`);
+    log(`[Local]   ─────────────────────────────────────────────────────`);
+    log(`[Local]   PROMPT STATS:`);
+    log(`[Local]     System prompt: ${systemPrompt.length} chars`);
+    log(`[Local]     User prompt: ${prompt.length} chars`);
+    log(`[Local]     RAG context portion: ${ragContext.length} chars`);
+    log(`[Local]     Total input: ~${Math.round((systemPrompt.length + prompt.length) / 4)} tokens (est.)`);
+    log(`[Local]   ─────────────────────────────────────────────────────`);
 
     // Try up to 2 times
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        console.log(`[Local]   Attempt ${attempt}: calling provider.chat()...`);
+        log(`[Local]   Attempt ${attempt}: calling provider.chat()...`);
 
         const response = await provider.chat(messages, [], {
           maxTokens: 4096,
@@ -3293,8 +3231,12 @@ Generate the documentation now:`;
           temperature: attempt === 1 ? 0.3 : 0.1, // Low temperature to reduce hallucination
         });
 
-        console.log(`[Local]   Response: ${response.content?.length || 0} chars, stopReason: ${response.stopReason}`);
+        log(`[Local]   Response: ${response.content?.length || 0} chars, stopReason: ${response.stopReason}`);
 
+        if (response.stopReason !== 'end_turn') {
+          messages[0] = { role: 'user', content: `${prompt}\n\nKeep the entire page under 800 words. Return a complete standalone page with all required sections and finish every sentence and code block.` };
+          throw new Error(`Page generation did not finish (${response.stopReason}); incomplete prose was discarded.`);
+        }
         if (response.content && response.content.length > 200) {
           // Post-process to ensure source references are clickable links
           const processedContent = this.makeSourceReferencesClickable(response.content);
@@ -3302,7 +3244,7 @@ Generate the documentation now:`;
         }
 
         if (attempt === 1) {
-          console.log(`[Local]   Content too short (${response.content?.length || 0} chars), retrying...`);
+          log(`[Local]   Content too short (${response.content?.length || 0} chars), retrying...`);
         }
       } catch (error) {
         console.error(`[Local]   Attempt ${attempt} error: ${(error as Error).message}`);
@@ -3312,7 +3254,7 @@ Generate the documentation now:`;
       }
     }
 
-    console.log(`[Local]   Failed to generate content after 2 attempts`);
+    log(`[Local]   Failed to generate content after 2 attempts`);
     return null;
   }
 
@@ -3327,6 +3269,7 @@ Generate the documentation now:`;
     const pageLinks = pages.map(p =>
       `- [${p.title}](./${p.filename}) - ${p.type}`
     ).join('\n');
+    const fallbackIndex = `# ${path.basename(this.repoPath)} Documentation\n\nWelcome to the documentation.\n\n## Pages\n\n${pageLinks}`;
 
     const prompt = `Generate an index page for a technical wiki documentation site.
 
@@ -3355,10 +3298,12 @@ Generate the complete Markdown content for the index page:`;
         temperature: 0.7,
       });
 
-      return response.content || null;
+      return response.stopReason === 'end_turn' && response.content.trim()
+        ? response.content
+        : fallbackIndex;
     } catch {
       // Fallback to a simple index
-      return `# ${path.basename(this.repoPath)} Documentation\n\nWelcome to the documentation.\n\n## Pages\n\n${pageLinks}`;
+      return fallbackIndex;
     }
   }
 
@@ -3451,6 +3396,11 @@ Generate the complete Markdown content for the index page:`;
         }
       },
       {
+        name: 'read_wiki_page',
+        description: 'Read an existing Markdown wiki page before updating it. Paths are relative to the wiki output directory.',
+        input_schema: { type: 'object', properties: { pagePath: { type: 'string' } }, required: ['pagePath'] }
+      },
+      {
         name: 'write_wiki_page',
         description: 'Write a wiki documentation page to the output directory',
         input_schema: {
@@ -3506,7 +3456,7 @@ Generate the complete Markdown content for the index page:`;
     try {
       switch (name) {
         case 'read_file': {
-          const filePath = path.join(this.repoPath, input.path);
+          const filePath = containedPath(this.repoPath, input.path);
           if (!fs.existsSync(filePath)) {
             return `Error: File not found: ${input.path}`;
           }
@@ -3515,7 +3465,7 @@ Generate the complete Markdown content for the index page:`;
         }
 
         case 'list_directory': {
-          const dirPath = path.join(this.repoPath, input.path || '');
+          const dirPath = containedPath(this.repoPath, input.path || '');
           if (!fs.existsSync(dirPath)) {
             return `Error: Directory not found: ${input.path}`;
           }
@@ -3528,7 +3478,7 @@ Generate the complete Markdown content for the index page:`;
         }
 
         case 'directory_tree': {
-          const dirPath = path.join(this.repoPath, input.path || '');
+          const dirPath = containedPath(this.repoPath, input.path || '');
           const maxDepth = input.depth || 3;
           const tree = this.buildDirectoryTree(dirPath, maxDepth, 0);
           return tree;
@@ -3586,8 +3536,12 @@ Generate the complete Markdown content for the index page:`;
           return `Found ${results.length} relevant code snippets:\n\n${formatted}`;
         }
 
+        case 'read_wiki_page': {
+          const fullPath = wikiPagePath(this.outputDir, input.pagePath);
+          return fs.readFileSync(fullPath, 'utf-8').slice(0, 64_000);
+        }
         case 'write_wiki_page': {
-          const fullPath = path.join(this.outputDir, input.pagePath);
+          const fullPath = wikiPagePath(this.outputDir, input.pagePath);
           const dir = path.dirname(fullPath);
 
           if (!fs.existsSync(dir)) {
@@ -3596,21 +3550,21 @@ Generate the complete Markdown content for the index page:`;
 
           const frontmatterData: Record<string, any> = {
             title: input.title,
-            generated: new Date().toISOString(),
+            generated: { by: `semanticwiki/${currentGenerationOptions?.provider || 'claude-code'}/${currentGenerationOptions?.model || 'default'}`, at: new Date().toISOString() },
             description: input.description,
             sources: input.sources
           };
 
           // Do NOT add H1 title - the site generator adds it from frontmatter
           // This prevents duplicate titles in the rendered output
-          const fullContent = matter.stringify(input.content, frontmatterData);
+          const fullContent = matter.stringify(input.content, Object.fromEntries(Object.entries(frontmatterData).filter(([, value]) => value !== undefined)));
 
           fs.writeFileSync(fullPath, fullContent, 'utf-8');
           return `Successfully wrote wiki page: ${input.pagePath}`;
         }
 
         case 'analyze_code_structure': {
-          const filePath = path.join(this.repoPath, input.filePath);
+          const filePath = containedPath(this.repoPath, input.filePath);
           if (!fs.existsSync(filePath)) {
             return `Error: File not found: ${input.filePath}`;
           }
@@ -3926,31 +3880,28 @@ Generate the complete Markdown content for the index page:`;
       return path.resolve(repoUrl);
     }
 
-    // Clone remote repository
-    const tempDir = path.join(process.cwd(), '.semanticwiki-repos');
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
+    if (!/^(https?:\/\/|git@|ssh:\/\/)/.test(repoUrl)) {
+      throw new Error(`Repository directory does not exist: ${repoUrl}`);
     }
-
-    // Extract repo name from URL
-    const repoName = repoUrl.split('/').pop()?.replace('.git', '') || 'repo';
-    const clonePath = path.join(tempDir, repoName);
-
-    // If already cloned, pull latest
-    if (fs.existsSync(clonePath)) {
-      const git: SimpleGit = simpleGit(clonePath);
-      await git.pull();
-      return clonePath;
+    const cloneRoot = getRuntimePaths().reposDir;
+    fs.mkdirSync(cloneRoot, { recursive: true });
+    const repoName = (repoUrl.split('/').pop()?.replace(/\.git$/, '') || 'repo').replace(/[^a-zA-Z0-9._-]/g, '-');
+    const identity = createHash('sha256').update(repoUrl).digest('hex').slice(0, 12);
+    const clonePath = path.join(cloneRoot, `${repoName}-${identity}`);
+    // Authentication is supplied as transient Git configuration, never persisted in origin URLs.
+    const gitOptions: string[] = [];
+    if (accessToken && repoUrl.startsWith('https://github.com/')) {
+      gitOptions.push('-c', `http.https://github.com/.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${accessToken}`).toString('base64')}`);
     }
-
-    // Clone with auth if token provided
-    let cloneUrl = repoUrl;
-    if (accessToken && repoUrl.includes('github.com')) {
-      cloneUrl = repoUrl.replace('https://', `https://${accessToken}@`);
+    try {
+      if (fs.existsSync(path.join(clonePath, '.git'))) {
+        await simpleGit(clonePath).raw([...gitOptions, 'pull', '--ff-only']);
+      } else {
+        await simpleGit().raw([...gitOptions, 'clone', '--depth', '1', '--', repoUrl, clonePath]);
+      }
+    } catch {
+      throw new Error('Could not clone or refresh the repository. Check the URL, network, and access token.');
     }
-
-    const git: SimpleGit = simpleGit();
-    await git.clone(cloneUrl, clonePath, ['--depth', '1']);
 
     return clonePath;
   }
@@ -3960,7 +3911,7 @@ Generate the complete Markdown content for the index page:`;
    */
   private buildAgentOptions(wikiOptions: WikiGenerationOptions): any {
     return {
-      model: wikiOptions.model || 'claude-sonnet-5',
+      model: wikiOptions.model || DEFAULT_ANTHROPIC_MODEL,
       cwd: this.repoPath,
       systemPrompt: WIKI_SYSTEM_PROMPT,
       mcpServers: {
@@ -3976,7 +3927,6 @@ Generate the complete Markdown content for the index page:`;
         // Filesystem tools
         'mcp__filesystem__read_file',
         'mcp__filesystem__read_multiple_files',
-        'mcp__filesystem__write_file',
         'mcp__filesystem__list_directory',
         'mcp__filesystem__directory_tree',
         'mcp__filesystem__search_files',
@@ -3987,6 +3937,12 @@ Generate the complete Markdown content for the index page:`;
         'mcp__semanticwiki__analyze_code_structure',
         'mcp__semanticwiki__verify_wiki_completeness',
         'mcp__semanticwiki__list_wiki_pages'
+      ],
+      disallowedTools: [
+        'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash',
+        'mcp__filesystem__write_file', 'mcp__filesystem__edit_file',
+        'mcp__filesystem__move_file', 'mcp__filesystem__delete_file',
+        'mcp__filesystem__create_directory',
       ],
       maxTurns: wikiOptions.maxTurns || 200,
       permissionMode: 'acceptEdits',
@@ -4045,7 +4001,7 @@ ${pagesToCreateList}
 
 **For Modified Files:**
 1. Use \`mcp__semanticwiki__search_codebase\` to understand what changed in the modified files
-2. Read the affected wiki pages with \`mcp__filesystem__read_file\`
+2. Read the affected wiki pages with the available wiki-reading tool (read_wiki_page in direct API mode)
 3. Update the specific sections that reference the changed code
 4. Preserve all other content - only change what's necessary
 5. Update any outdated code snippets, line numbers, or function references
@@ -4225,7 +4181,7 @@ Remember: Every architectural concept MUST include file:line references to the s
         },
         async (args) => {
           try {
-            const fullPath = path.join(this.outputDir, args.pagePath);
+            const fullPath = wikiPagePath(this.outputDir, args.pagePath);
             const dir = path.dirname(fullPath);
 
             // Create directory if needed
@@ -4238,7 +4194,7 @@ Remember: Every architectural concept MUST include file:line references to the s
             // This prevents duplicate titles in the rendered output
             const frontmatterData: Record<string, any> = {
               title: args.title,
-              generated: new Date().toISOString(),
+              generated: { by: `semanticwiki/${currentGenerationOptions?.provider || 'claude-code'}/${currentGenerationOptions?.model || 'default'}`, at: new Date().toISOString() },
               ...args.frontmatter
             };
 
@@ -4492,74 +4448,22 @@ Remember: Every architectural concept MUST include file:line references to the s
         },
         async (args) => {
           try {
-            const wikiFiles = this.findAllWikiFiles(this.outputDir);
-            const existingPages = new Set(wikiFiles.map(f =>
-              path.relative(this.outputDir, f).replace(/\\/g, '/')
-            ));
-
-            const brokenLinks: Array<{
-              sourcePage: string;
-              targetLink: string;
-              linkText: string;
-            }> = [];
-
-            const allReferencedPages = new Set<string>();
-
-            // Scan all wiki files for internal links
-            for (const file of wikiFiles) {
-              const content = fs.readFileSync(file, 'utf-8');
-              const relativePath = path.relative(this.outputDir, file).replace(/\\/g, '/');
-              const fileDir = path.dirname(file);
-
-              // Find all markdown links
-              const linkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-              let match;
-
-              while ((match = linkRegex.exec(content)) !== null) {
-                const linkText = match[1];
-                const linkPath = match[2];
-
-                // Skip external links, anchors, and source code references
-                if (linkPath.startsWith('http://') ||
-                    linkPath.startsWith('https://') ||
-                    linkPath.startsWith('#') ||
-                    linkPath.includes('github.com') ||
-                    linkPath.match(/\.(ts|js|py|go|rs|java|tsx|jsx)[:L#]/)) {
-                  continue;
-                }
-
-                // Resolve internal markdown links
-                if (linkPath.endsWith('.md') || linkPath.includes('.md#')) {
-                  const cleanPath = linkPath.split('#')[0];
-                  const resolvedPath = path.resolve(fileDir, cleanPath);
-                  const relativeResolved = path.relative(this.outputDir, resolvedPath).replace(/\\/g, '/');
-
-                  allReferencedPages.add(relativeResolved);
-
-                  if (!fs.existsSync(resolvedPath)) {
-                    brokenLinks.push({
-                      sourcePage: relativePath,
-                      targetLink: cleanPath,
-                      linkText
-                    });
-                  }
-                }
-              }
-            }
-
-            // Find missing pages (referenced but not created)
-            const missingPages = [...allReferencedPages].filter(p => !existingPages.has(p));
+            const verification = await this.verifyWikiCompleteness(this.outputDir);
+            const brokenLinks = verification.brokenLinks.map(link => ({
+              sourcePage: link.source, targetLink: link.resolvedTarget, linkText: link.linkText,
+            }));
+            const missingPages = verification.missingPages;
 
             // Build response
             let response = `# Wiki Completeness Report\n\n`;
-            response += `**Total pages:** ${existingPages.size}\n`;
-            response += `**Referenced pages:** ${allReferencedPages.size}\n`;
+            response += `**Total pages:** ${verification.totalPages}\n`;
             response += `**Missing pages:** ${missingPages.length}\n`;
             response += `**Broken links:** ${brokenLinks.length}\n\n`;
 
-            if (brokenLinks.length === 0) {
+            if (verification.isComplete) {
               response += `✅ **All internal links are valid!** The wiki is complete.\n`;
             } else {
+              if (verification.totalPages === 0) response += 'The wiki has no pages. Create an index and the planned documentation first.\n\n';
               response += `## ❌ Missing Pages (MUST CREATE)\n\n`;
               response += `The following pages are referenced but do not exist. You MUST create these pages:\n\n`;
 
@@ -4667,7 +4571,7 @@ Remember: Every architectural concept MUST include file:line references to the s
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory() && !entry.name.startsWith('.')) {
+      if (entry.isDirectory() && !entry.name.startsWith('.') && !['knowledge', 'site', 'node_modules'].includes(entry.name)) {
         files.push(...this.findAllWikiFiles(fullPath));
       } else if (entry.isFile() && entry.name.endsWith('.md')) {
         files.push(fullPath);
@@ -4716,7 +4620,7 @@ Remember: Every architectural concept MUST include file:line references to the s
   /**
    * Verify wiki completeness and return missing pages
    */
-  async verifyWikiCompleteness(wikiDir: string): Promise<{
+  async verifyWikiCompleteness(wikiDir: string, options: { repoPath?: string } = {}): Promise<{
     totalPages: number;
     brokenLinks: Array<{ source: string; target: string; linkText: string; resolvedTarget: string }>;
     missingPages: string[];
@@ -4724,6 +4628,27 @@ Remember: Every architectural concept MUST include file:line references to the s
   }> {
     const wikiFiles = this.findAllWikiFiles(wikiDir);
     const absoluteWikiDir = path.resolve(wikiDir);
+    // CLI verification creates a fresh agent. Retain the source identity recorded by
+    // generation so absolute README/source citations are not treated as wiki pages.
+    let sourceRoot = options.repoPath || this.repoPath;
+    if (!sourceRoot) {
+      try {
+        const run = JSON.parse(fs.readFileSync(path.join(absoluteWikiDir, '.semanticwiki-run.json'), 'utf8'));
+        if (run.formatVersion === 1 && typeof run.sourcePath === 'string' && path.isAbsolute(run.sourcePath) && !run.sourcePath.includes('\0')) {
+          sourceRoot = run.sourcePath;
+        }
+      } catch { /* Imported and older wikis may not have run metadata. */ }
+    }
+    const sourceRoots = new Set<string>();
+    if (sourceRoot && path.isAbsolute(sourceRoot)) {
+      const resolved = path.resolve(sourceRoot);
+      // A filesystem root cannot be a useful repository identity. Do not let it
+      // suppress every root-relative wiki link through malformed run metadata.
+      if (resolved !== path.parse(resolved).root && resolved !== absoluteWikiDir) {
+        sourceRoots.add(resolved);
+        try { sourceRoots.add(fs.realpathSync(resolved)); } catch { /* Portable wiki: original source may be absent. */ }
+      }
+    }
 
     // Build set of existing pages using normalized absolute paths
     const existingPagesAbsolute = new Set(wikiFiles.map(f => path.resolve(f)));
@@ -4736,31 +4661,33 @@ Remember: Every architectural concept MUST include file:line references to the s
     const seenBrokenTargets = new Set<string>(); // Track unique broken targets by resolved path
 
     for (const file of wikiFiles) {
-      const content = fs.readFileSync(file, 'utf-8');
+      const content = matter(fs.readFileSync(file, 'utf-8')).content;
       const relativePath = path.relative(wikiDir, file).replace(/\\/g, '/');
       const fileDir = path.dirname(file);
 
-      // Match markdown links: [text](path) and also wiki-style [[links]]
-      const mdLinkRegex = /\[([^\]]+)\]\(([^)]+)\)/g;
-      const wikiLinkRegex = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
-
       const processLink = (linkText: string, linkPath: string) => {
         // Skip external links, anchors, and source code references
-        if (linkPath.startsWith('http://') ||
-            linkPath.startsWith('https://') ||
+        if (/^[a-z][a-z\d+.-]*:/i.test(linkPath) || linkPath.startsWith('//') ||
             linkPath.startsWith('#') ||
-            linkPath.startsWith('mailto:') ||
             linkPath.includes('github.com') ||
             linkPath.match(/\.(ts|js|py|go|rs|java|tsx|jsx|cbl|cob|cpy|jcl)[:L#]/i)) {
           return;
         }
 
         // Handle .md links
-        if (linkPath.endsWith('.md') || linkPath.includes('.md#')) {
-          const cleanPath = linkPath.split('#')[0];
+        const rawPath = linkPath.split(/[?#]/, 1)[0];
+        let cleanPath: string;
+        try { cleanPath = decodeURIComponent(rawPath); } catch { return; }
+        if (/\.md$/i.test(cleanPath)) {
+          // Absolute filesystem source citations are not wiki-root links.
+          if ([...sourceRoots].some(root => cleanPath.startsWith(root + path.sep)) && !cleanPath.startsWith(absoluteWikiDir + path.sep)) return;
+          // Older exports have no recorded source root. An absolute #L citation
+          // whose visible label also identifies a Markdown file and line is a
+          // source reference, not an invitation to create an absolute wiki path.
+          if (path.isAbsolute(cleanPath) && !cleanPath.startsWith(absoluteWikiDir + path.sep) &&
+              /#L\d+(?:-L?\d+)?$/i.test(linkPath) && /\.md:\d+/i.test(linkText)) return;
 
-          // Resolve the path relative to the source file's directory
-          const resolvedPath = path.resolve(fileDir, cleanPath);
+          const resolvedPath = cleanPath.startsWith('/') ? path.resolve(absoluteWikiDir, cleanPath.slice(1)) : path.resolve(fileDir, cleanPath);
 
           // Normalize to relative path from wiki root
           const relativeResolved = path.relative(absoluteWikiDir, resolvedPath).replace(/\\/g, '/');
@@ -4788,19 +4715,16 @@ Remember: Every architectural concept MUST include file:line references to the s
         }
       };
 
-      // Process markdown links
-      let match;
-      while ((match = mdLinkRegex.exec(content)) !== null) {
-        processLink(match[1], match[2]);
-      }
-
-      // Process wiki-style links [[Page Name]] or [[path/to/page|Display Name]]
-      while ((match = wikiLinkRegex.exec(content)) !== null) {
-        const linkTarget = match[1].trim();
-        // Convert wiki-style to .md path if needed
-        const linkPath = linkTarget.endsWith('.md') ? linkTarget : `${linkTarget}.md`;
-        processLink(linkTarget, linkPath);
-      }
+      // The Markdown parser resolves reference links and ignores fenced/inline examples.
+      marked.walkTokens(marked.lexer(content), token => {
+        if (token.type === 'link') processLink(token.text, token.href);
+        if (token.type === 'text' && !('tokens' in token && token.tokens)) {
+          for (const match of token.text.matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)) {
+            const target = match[1].trim();
+            processLink(target, target.endsWith('.md') ? target : `${target}.md`);
+          }
+        }
+      });
     }
 
     // Missing pages are referenced pages that don't exist
@@ -4810,7 +4734,7 @@ Remember: Every architectural concept MUST include file:line references to the s
       totalPages: existingPagesRelative.size,
       brokenLinks,
       missingPages,
-      isComplete: brokenLinks.length === 0
+      isComplete: existingPagesRelative.size > 0 && brokenLinks.length === 0
     };
   }
 }

@@ -44,3 +44,10 @@ audit.log
 
 # Claude Code local settings
 .claude/
+
+# Runtime artifacts and launch checks
+*.gguf
+*.gguf.partial*
+.semanticwiki-repos/
+coverage/
+.firecrawl/

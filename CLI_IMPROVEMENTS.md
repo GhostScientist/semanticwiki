@@ -1,3 +1,5 @@
+> Historical working notes. See README.md and docs/LAUNCH_BASELINE.md for shipped behavior.
+
 # SemanticWiki CLI: competitive improvement plan
 
 Reviewed 2026-09-16 against checkout `252cfd42790165523dde6fa5a0dca18620e15979`, including the pre-existing working changes in `anthropic-provider.ts`, `wiki-agent.ts`, `site-generator.ts`, and `site/scripts.ts`. Those changes were preserved. This document proposes future work; it does not claim the fixes below have been implemented. Model plan: [MODEL.md](MODEL.md).

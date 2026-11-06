@@ -236,7 +236,7 @@ describe('Chat Client Scripts', () => {
     });
 
     it('should score based on heading matches', () => {
-      expect(scripts).toContain('page.headings.some');
+      expect(scripts).toContain('headings.includes(term)');
     });
   });
 

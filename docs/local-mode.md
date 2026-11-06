@@ -1,99 +1,50 @@
-# Local Mode Guide
+# Local generation
 
-`--full-local` runs SemanticWiki entirely on your machine: no API key, no cloud calls, no per-token cost. Embeddings already run locally in every mode — local mode additionally replaces the cloud LLM with a local one.
+SemanticWiki uses the fine-tuned [SemanticWiki Coder 7B v2 GGUF](https://huggingface.co/GhostScientist/semanticwiki-coder-7b-v2-gguf), based on Qwen2.5-Coder-7B. The default Q4_K_M file is 4,683,073,920 bytes. The exact revision and checksum are in the model registry and [model guide](models.md).
 
-```bash
-semanticwiki generate -r ./my-project --full-local
-```
+## Prepare and run
 
-There are two local backends:
-
-1. **Bundled inference (default)** — in-process llama.cpp via `node-llama-cpp`. No extra software; the model is downloaded automatically on first run.
-2. **Ollama** (`--use-ollama`) — use an [Ollama](https://ollama.com) server you already run, with any model it hosts.
-
-## Bundled Inference (default)
-
-On first run, SemanticWiki detects your hardware and downloads the bundled model:
-
-| | |
-|---|---|
-| Model | `gpt-oss-20b-semanticwiki` — a GPT-OSS 20B fine-tune for architectural wiki generation |
-| Format / size | Q8 GGUF, ~22.3 GB (one-time download) |
-| Recommended hardware | 24 GB VRAM (GPU) or 32 GB RAM (CPU/Apple Silicon unified memory) |
-| Context window | 32,768 tokens |
-| Cache location | `~/.semanticwiki/models/` |
-
-GPU support (CUDA, Metal, Vulkan) is auto-detected. Check what local mode will do before committing to a run:
+Use Node 24 or newer. Install normally (`npm install -g semanticwiki`) for native inference. Maintainer installs with `--ignore-scripts` are suitable for unit tests; native inference may need its runtime installed or rebuilt separately.
 
 ```bash
-semanticwiki generate -r ./my-project --full-local --estimate
+semanticwiki doctor
+semanticwiki models list
+semanticwiki models prepare
+semanticwiki models verify
+semanticwiki generate -r ./project --provider local --site
 ```
 
-This prints detected hardware, the recommended model, whether it's already downloaded, and estimated indexing/generation time and disk usage.
+Preparation uses a temporary partial file, verifies the expected size and SHA-256, then atomically renames it. Reuse the same weight file across repositories. It lives in `~/.semanticwiki/models/`, not the source repository.
 
-### Options
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--local-model <model>` | Model ID from the registry | auto-selected for your hardware |
-| `--model-path <path>` | Use a specific GGUF file instead of the registry | — |
-| `--gpu-layers <n>` | Layers to offload to GPU | auto |
-| `--context-size <n>` | Context window size | `32768` |
-| `--threads <n>` | CPU threads for inference | auto |
-
-## Ollama Backend
-
-If you already run Ollama and prefer managing models yourself:
+The 8,192-token default context is a conservative starting point. Allow at least 8 GB of system memory, with additional headroom for embeddings and the OS; available hardware and input size determine practical limits. Apple Metal, CUDA and CPU execution depend on node-llama-cpp's available backend. Automatic GPU-layer selection is the default. `--gpu-layers 0` selects CPU execution.
 
 ```bash
-ollama pull qwen2.5-coder:14b
-semanticwiki generate -r ./my-project --full-local --use-ollama
-
-# Custom host and model
-semanticwiki generate -r ./my-project --full-local --use-ollama \
-  --ollama-host http://192.168.1.50:11434 --local-model codestral:22b
+semanticwiki generate -r . --provider local --context-size 8192 --max-chunks 3000
+semanticwiki generate -r . --provider local --model-path /absolute/path/custom.gguf
 ```
 
-The default Ollama model is `qwen2.5-coder:14b`. Any Ollama model with tool-calling support should work; coder-tuned models give the best results.
+Local generation processes pages separately. The runtime releases its context sequence between requests and preserves conversation history in the tool loop. More memory does not guarantee documentation quality: review source citations, relationships and diagrams.
 
-## Expectations vs Cloud Modes
+## Storage and offline use
 
-Local generation is slower than the cloud modes and quality depends on the model and hardware. Rough guidance:
+`SEMANTICWIKI_HOME=/absolute/path` moves all shared state. `SEMANTICWIKI_MODELS_DIR=/absolute/path` overrides only GGUF storage. Embedding models are downloaded separately under the shared embedding cache. The default retrieval model is EmbeddingGemma 2 via Transformers.js.
 
-| | Cloud (`--direct-api`) | Local (GPU) | Local (CPU) |
-|---|---|---|---|
-| Small repo (<500 files) | minutes | ~10–20 min | ~30–60 min |
-| Large repo (2000+ files) | ~30 min | hours | many hours |
-| Cost | API charges | free | free |
-| Privacy | cloud | 100% local | 100% local |
+Preparing GGUF weights alone does not make the entire workflow offline-ready. Run indexing once with network access to populate the embedding cache, then test the intended command offline. `--skip-index` uses an existing index; `search --code --mode keyword` uses its cached text without embedding inference. Optional reranking, contextual retrieval and browser AI each have separate model requirements.
 
-For large repos, combine local mode with `--max-chunks` and `-p/--path` to bound the work.
+Local providers never silently invoke a cloud writer. `--contextual` deliberately uses Anthropic and is rejected with a local provider unless `--contextual-local` is selected. Browser chat is separate from the CLI writer.
+
+## Ollama
+
+```bash
+semanticwiki generate -r . --provider ollama --local-model your-installed-model
+```
+
+SemanticWiki connects to `http://localhost:11434` by default; override with `--ollama-host`. It does not imply that the official GGUF has already been imported into Ollama. Install/import the model there first and use its Ollama name. `--full-local --use-ollama` is retained as an alias.
 
 ## Troubleshooting
 
-**Model download fails or is interrupted** — re-run the command (the download restarts), or download manually:
-
-```bash
-mkdir -p ~/.semanticwiki/models
-wget -O ~/.semanticwiki/models/gpt-oss-20b-semanticwiki-q8_0.gguf \
-  "https://huggingface.co/GhostScientist/gpt-oss-20b-semanticwiki-gguf/resolve/main/gpt-oss-20b-semanticwiki-q8_0.gguf"
-```
-
-**Out of memory** — reduce the context window or GPU offload, or limit indexing:
-
-```bash
-semanticwiki generate -r <repo> --full-local --context-size 16384
-semanticwiki generate -r <repo> --full-local --gpu-layers 20
-semanticwiki generate -r <repo> --full-local --max-chunks 2000
-```
-
-If your machine can't fit the bundled 20B model, use `--use-ollama` with a smaller model (e.g. `qwen2.5-coder:7b`).
-
-**Slow performance** — run with `--verbose` to confirm the GPU is being used; try forcing more GPU layers with `--gpu-layers 40`.
-
-**Cannot connect to Ollama** — make sure `ollama serve` is running, or drop `--use-ollama` to use bundled inference instead.
-
-## See Also
-
-- [Local mode test repositories](./LOCAL_ONLY_TESTING.md) — repos of varying sizes/stacks for exercising local mode (maintainer testing guide)
-- [Original design plan](./plans/LOCAL_MODE_PLAN.md) — historical
+- **Download interrupted or hash mismatch:** rerun `models prepare`. Incomplete downloads are not accepted as weights.
+- **Not enough memory:** close other applications, reduce `--context-size` / `--max-chunks`, or choose CPU offload settings that fit your hardware.
+- **Native runtime unavailable:** check Node version and platform compatibility, reinstall with scripts enabled, then run `doctor` and a small generation.
+- **Old weights in a repository:** `doctor` reports legacy directories. Move an intentionally retained GGUF to shared storage and use `--model-path`, or prepare the new default. Never rename old weights to the new model filename.
+- **Incomplete wiki:** inspect generated files and `verify`, then use `continue --provider local --yes`. A successful link check is not a semantic-quality evaluation.

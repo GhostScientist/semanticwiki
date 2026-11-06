@@ -1,576 +1,260 @@
-/**
- * MCP Server for querying SemanticWiki generated documentation
- *
- * This server exposes tools for:
- * - Searching wiki pages by keyword or semantic similarity
- * - Getting wiki page content
- * - Asking questions about the codebase using RAG
- * - Getting codebase structure overview
- */
-
+/** Read-only, model-free wiki discovery for MCP coding harnesses. */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
+  CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema,
+  ReadResourceRequestSchema, ErrorCode, McpError,
 } from '@modelcontextprotocol/sdk/types.js';
-import * as fs from 'fs';
-import * as path from 'path';
-import { glob } from 'glob';
-import matter from 'gray-matter';
-import { RAGSystem, type SearchResult, type SearchOptions } from './rag/index.js';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
+import type { RAGSystem } from './rag/index.js';
+import { documentSummary, loadWikiCatalog, type WikiDocument } from './wiki-catalog.js';
 
-interface WikiPage {
-  path: string;
-  title: string;
-  description?: string;
-  category?: string;
-  content: string;
-  headings: string[];
-  frontmatter: Record<string, any>;
+export interface WikiServerConfig { wikiPath: string; ragStorePath?: string; repoPath?: string; }
+type Args = Record<string, unknown>;
+type ToolResult = { content: Array<{ type: 'text'; text: string }>; structuredContent?: Record<string, unknown>; isError?: boolean };
+const version = createRequire(import.meta.url)('../package.json').version as string;
+const annotations = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const formatProperty = { type: 'string', enum: ['text', 'json'], description: 'Response presentation. Structured results are always included.' };
+const filters = {
+  category: { type: 'string', description: 'Exact category filter (case-insensitive).' },
+  type: { type: 'string', description: 'Exact OKF concept type filter (case-insensitive).' },
+  tag: { type: 'string', description: 'Filter by a single tag (case-insensitive).' },
+};
+const tools = [
+  {
+    name: 'get_knowledge_manifest',
+    description: 'Start here: discover the wiki, OKF export, entry points, categories, and available query operations. No model or API key required.',
+    inputSchema: { type: 'object', properties: { format: formatProperty } },
+  },
+  {
+    name: 'search_wiki',
+    description: 'Search wiki concepts by keyword, title, headings, and content. Returns ranked matches with excerpts, section IDs, and trust metadata.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 2000 }, maxResults: { type: 'integer', minimum: 1, maximum: 50, default: 10 }, ...filters, format: formatProperty }, required: ['query'] },
+  },
+  {
+    name: 'get_wiki_page',
+    description: 'Read a bounded part of a page by path or concept ID. Optionally select a heading ID; use nextStartLine for subsequent chunks. Line numbers refer to the Markdown body, excluding frontmatter.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, section: { type: 'string', description: 'Heading ID or exact heading title from search/list results.' }, startLine: { type: 'integer', minimum: 1 }, maxLines: { type: 'integer', minimum: 1, maximum: 400, default: 120 }, format: formatProperty }, required: ['path'] },
+  },
+  {
+    name: 'list_wiki_pages',
+    description: 'Browse concepts with headings and metadata, with pagination and optional category/type/tag filters.',
+    inputSchema: { type: 'object', properties: { ...filters, offset: { type: 'integer', minimum: 0, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 25 }, format: formatProperty } },
+  },
+  {
+    name: 'get_related_pages',
+    description: 'Follow outgoing wiki links and backlinks to navigate related concepts without reading every page.',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' }, maxResults: { type: 'integer', minimum: 1, maximum: 50, default: 20 }, format: formatProperty }, required: ['path'] },
+  },
+  {
+    name: 'search_code',
+    description: 'Search a previously indexed source repository. Keyword mode needs no embedding model; vector and hybrid modes can initialize local embeddings.',
+    inputSchema: { type: 'object', properties: { query: { type: 'string', minLength: 1, maxLength: 2000 }, maxResults: { type: 'integer', minimum: 1, maximum: 50, default: 5 }, mode: { type: 'string', enum: ['hybrid', 'vector', 'keyword'], default: 'hybrid' }, format: formatProperty }, required: ['query'] },
+  },
+  {
+    name: 'get_architecture_overview',
+    description: 'Read the first 120 lines of the best architecture overview; use get_wiki_page to continue.',
+    inputSchema: { type: 'object', properties: { format: formatProperty } },
+  },
+].map(tool => ({ ...tool, annotations }));
+
+function stringArg(args: Args, key: string, required = false): string | undefined {
+  const value = args[key];
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== 'string' || !value.trim() || value.length > 2000) throw new Error(`${key} must be a nonempty string of at most 2000 characters.`);
+  return value.trim();
 }
 
-interface WikiServerConfig {
-  wikiPath: string;
-  ragStorePath?: string;
-  repoPath?: string;
+function integerArg(args: Args, key: string, fallback: number, minimum: number, maximum: number): number {
+  const value = args[key];
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < minimum || value > maximum) throw new Error(`${key} must be an integer from ${minimum} to ${maximum}.`);
+  return value;
+}
+
+function response(data: Record<string, unknown>, text: string, args: Args): ToolResult {
+  if (args.format !== undefined && args.format !== 'text' && args.format !== 'json') throw new Error('format must be text or json.');
+  return { content: [{ type: 'text', text: args.format === 'json' ? JSON.stringify(data, null, 2) : text }], structuredContent: data };
+}
+
+function resourceUri(pagePath: string): string {
+  return `wiki://${pagePath.split('/').map(encodeURIComponent).join('/')}`;
 }
 
 export class WikiMCPServer {
-  private server: Server;
-  private config: WikiServerConfig;
-  private wikiPages: Map<string, WikiPage> = new Map();
+  private readonly server: Server;
+  private pages: WikiDocument[] = [];
   private ragSystem: RAGSystem | null = null;
-  private searchIndex: Map<string, Set<string>> = new Map(); // keyword -> page paths
 
-  constructor(config: WikiServerConfig) {
-    this.config = config;
-    this.server = new Server(
-      {
-        name: 'semanticwiki',
-        version: '1.0.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-          resources: {},
-        },
-      }
-    );
-
-    this.setupHandlers();
-  }
-
-  private async loadWikiPages(): Promise<void> {
-    const wikiPath = this.config.wikiPath;
-
-    if (!fs.existsSync(wikiPath)) {
-      console.error(`Wiki path does not exist: ${wikiPath}`);
-      return;
-    }
-
-    const mdFiles = await glob('**/*.md', { cwd: wikiPath });
-
-    for (const file of mdFiles) {
-      const fullPath = path.join(wikiPath, file);
-      const content = fs.readFileSync(fullPath, 'utf-8');
-      const { data: frontmatter, content: body } = matter(content);
-
-      // Extract headings
-      const headings: string[] = [];
-      const headingRegex = /^#{1,6}\s+(.+)$/gm;
-      let match;
-      while ((match = headingRegex.exec(body)) !== null) {
-        headings.push(match[1]);
-      }
-
-      const page: WikiPage = {
-        path: file,
-        title: frontmatter.title || path.basename(file, '.md'),
-        description: frontmatter.description,
-        category: frontmatter.category,
-        content: body,
-        headings,
-        frontmatter,
-      };
-
-      this.wikiPages.set(file, page);
-
-      // Build search index
-      const keywords = this.extractKeywords(page);
-      for (const keyword of keywords) {
-        if (!this.searchIndex.has(keyword)) {
-          this.searchIndex.set(keyword, new Set());
-        }
-        this.searchIndex.get(keyword)!.add(file);
-      }
-    }
-
-    console.error(`Loaded ${this.wikiPages.size} wiki pages`);
-  }
-
-  private extractKeywords(page: WikiPage): string[] {
-    const text = `${page.title} ${page.description || ''} ${page.content}`.toLowerCase();
-    // Extract words, remove common stop words
-    const words = text.match(/\b[a-z][a-z0-9_]{2,}\b/g) || [];
-    const stopWords = new Set(['the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'has', 'have', 'been', 'this', 'that', 'with', 'from', 'they', 'will', 'would', 'there', 'their', 'what', 'about', 'which', 'when', 'make', 'like', 'time', 'just', 'know', 'take', 'into', 'year', 'your', 'some', 'could', 'them', 'than', 'then', 'look', 'only', 'come', 'over', 'such', 'also', 'back', 'after', 'well', 'most', 'made', 'where', 'being', 'does', 'here', 'much', 'these', 'each', 'other']);
-    return [...new Set(words.filter(w => !stopWords.has(w)))];
-  }
-
-  private async initRAG(): Promise<void> {
-    if (this.config.ragStorePath && this.config.repoPath) {
+  constructor(private readonly config: WikiServerConfig) {
+    this.server = new Server({ name: 'semanticwiki', version }, { capabilities: { tools: {}, resources: {} } });
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+    this.server.setRequestHandler(CallToolRequestSchema, async request => {
+      try { return await this.callTool(request.params.name, (request.params.arguments || {}) as Args); }
+      catch (error) { return { content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }], isError: true }; }
+    });
+    this.server.setRequestHandler(ListResourcesRequestSchema, async request => {
+      const cursor = request.params?.cursor;
+      if (cursor !== undefined && !/^\d+$/.test(cursor)) throw new McpError(ErrorCode.InvalidParams, 'Invalid resource cursor.');
+      const offset = Number(cursor || 0);
+      if (!Number.isSafeInteger(offset) || offset > this.pages.length) throw new McpError(ErrorCode.InvalidParams, 'Invalid resource cursor.');
+      const resources = this.pages.slice(offset, offset + 100).map(page => ({ uri: resourceUri(page.path), name: page.title, description: page.description, mimeType: 'text/markdown' }));
+      return { resources, ...(offset + 100 < this.pages.length ? { nextCursor: String(offset + 100) } : {}) };
+    });
+    this.server.setRequestHandler(ReadResourceRequestSchema, async request => {
+      let requestedPath: string;
       try {
-        this.ragSystem = new RAGSystem({
-          storePath: this.config.ragStorePath,
-          repoPath: this.config.repoPath,
-          useHybridSearch: true,
-          useReranking: false, // Can be slow, disable by default for MCP
-        });
-
-        // Check if index exists (either FAISS or metadata-only)
-        const metadataPath = path.join(this.config.ragStorePath, 'metadata.json');
-        if (fs.existsSync(metadataPath)) {
-          await this.ragSystem.loadMetadataOnly();
-          console.error('Loaded RAG index for semantic code search');
-        } else {
-          console.error('No RAG index found - code search will be limited to wiki pages');
-          this.ragSystem = null;
-        }
-      } catch (error) {
-        console.error('Failed to initialize RAG system:', error);
-        this.ragSystem = null;
-      }
-    }
-  }
-
-  private setupHandlers(): void {
-    // List available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      return {
-        tools: [
-          {
-            name: 'search_wiki',
-            description: 'Search wiki documentation pages by keyword. Returns matching pages with titles and descriptions.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                query: {
-                  type: 'string',
-                  description: 'Search query (keywords to search for)',
-                },
-                maxResults: {
-                  type: 'number',
-                  description: 'Maximum number of results to return (default: 10)',
-                },
-                category: {
-                  type: 'string',
-                  description: 'Filter by category (e.g., "Architecture", "Components")',
-                },
-              },
-              required: ['query'],
-            },
-          },
-          {
-            name: 'get_wiki_page',
-            description: 'Get the full content of a wiki page by its path.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                path: {
-                  type: 'string',
-                  description: 'Path to the wiki page (e.g., "overview.md" or "components/auth.md")',
-                },
-              },
-              required: ['path'],
-            },
-          },
-          {
-            name: 'list_wiki_pages',
-            description: 'List all wiki pages, optionally filtered by category.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                category: {
-                  type: 'string',
-                  description: 'Filter by category',
-                },
-              },
-            },
-          },
-          {
-            name: 'search_code',
-            description: 'Search the codebase using semantic similarity (if RAG index is available). Returns relevant code snippets.',
-            inputSchema: {
-              type: 'object',
-              properties: {
-                query: {
-                  type: 'string',
-                  description: 'Natural language query about the code',
-                },
-                maxResults: {
-                  type: 'number',
-                  description: 'Maximum number of results (default: 5)',
-                },
-                mode: {
-                  type: 'string',
-                  enum: ['hybrid', 'vector', 'keyword'],
-                  description: 'Search mode: hybrid (default), vector (semantic only), or keyword (BM25 only)',
-                },
-              },
-              required: ['query'],
-            },
-          },
-          {
-            name: 'get_architecture_overview',
-            description: 'Get a high-level overview of the codebase architecture from the wiki.',
-            inputSchema: {
-              type: 'object',
-              properties: {},
-            },
-          },
-        ],
-      };
-    });
-
-    // Handle tool calls
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-
-      switch (name) {
-        case 'search_wiki':
-          return this.handleSearchWiki(args as { query: string; maxResults?: number; category?: string });
-        case 'get_wiki_page':
-          return this.handleGetWikiPage(args as { path: string });
-        case 'list_wiki_pages':
-          return this.handleListWikiPages(args as { category?: string });
-        case 'search_code':
-          return this.handleSearchCode(args as { query: string; maxResults?: number; mode?: 'hybrid' | 'vector' | 'keyword' });
-        case 'get_architecture_overview':
-          return this.handleGetArchitectureOverview();
-        default:
-          return {
-            content: [{ type: 'text', text: `Unknown tool: ${name}` }],
-            isError: true,
-          };
-      }
-    });
-
-    // List resources (wiki pages as resources)
-    this.server.setRequestHandler(ListResourcesRequestSchema, async () => {
-      const resources = Array.from(this.wikiPages.entries()).map(([pagePath, page]) => ({
-        uri: `wiki://${pagePath}`,
-        name: page.title,
-        description: page.description,
-        mimeType: 'text/markdown',
-      }));
-
-      return { resources };
-    });
-
-    // Read resource content
-    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-      const uri = request.params.uri;
-
-      if (uri.startsWith('wiki://')) {
-        const pagePath = uri.replace('wiki://', '');
-        const page = this.wikiPages.get(pagePath);
-
-        if (page) {
-          return {
-            contents: [
-              {
-                uri,
-                mimeType: 'text/markdown',
-                text: page.content,
-              },
-            ],
-          };
-        }
-      }
-
-      return {
-        contents: [
-          {
-            uri,
-            mimeType: 'text/plain',
-            text: `Resource not found: ${uri}`,
-          },
-        ],
-      };
+        if (!request.params.uri.startsWith('wiki://')) throw new Error('Unknown URI scheme');
+        requestedPath = decodeURIComponent(request.params.uri.slice('wiki://'.length));
+      } catch { throw new McpError(ErrorCode.InvalidParams, 'Invalid wiki resource URI.'); }
+      const page = this.pages.find(candidate => candidate.path === requestedPath);
+      if (!page) throw new McpError(ErrorCode.InvalidParams, `Wiki resource not found: ${requestedPath}`);
+      return { contents: [{ uri: request.params.uri, mimeType: 'text/markdown', text: page.raw }] };
     });
   }
 
-  private handleSearchWiki(args: { query: string; maxResults?: number; category?: string }): { content: Array<{ type: string; text: string }> } {
-    const { query, maxResults = 10, category } = args;
-    const queryKeywords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-
-    // Score each page based on keyword matches
-    const scored: Array<{ page: WikiPage; score: number }> = [];
-
-    for (const page of this.wikiPages.values()) {
-      if (category && page.category !== category) continue;
-
-      let score = 0;
-      const titleLower = page.title.toLowerCase();
-      const contentLower = page.content.toLowerCase();
-      const descLower = (page.description || '').toLowerCase();
-
-      for (const kw of queryKeywords) {
-        // Title matches are most important
-        if (titleLower.includes(kw)) score += 10;
-        // Description matches
-        if (descLower.includes(kw)) score += 5;
-        // Heading matches
-        if (page.headings.some(h => h.toLowerCase().includes(kw))) score += 3;
-        // Content matches
-        if (contentLower.includes(kw)) score += 1;
-      }
-
-      if (score > 0) {
-        scored.push({ page, score });
-      }
-    }
-
-    // Sort by score and limit results
-    scored.sort((a, b) => b.score - a.score);
-    const results = scored.slice(0, maxResults);
-
-    if (results.length === 0) {
-      return {
-        content: [{ type: 'text', text: `No wiki pages found matching "${query}"` }],
-      };
-    }
-
-    const resultText = results.map(({ page, score }) => {
-      return `## ${page.title}\n**Path:** ${page.path}\n${page.description ? `**Description:** ${page.description}\n` : ''}${page.category ? `**Category:** ${page.category}\n` : ''}**Relevance Score:** ${score}`;
-    }).join('\n\n---\n\n');
-
-    return {
-      content: [{ type: 'text', text: `Found ${results.length} matching wiki pages:\n\n${resultText}` }],
-    };
+  private filterPages(args: Args): WikiDocument[] {
+    const category = stringArg(args, 'category')?.toLowerCase();
+    const type = stringArg(args, 'type')?.toLowerCase();
+    const tag = stringArg(args, 'tag')?.toLowerCase();
+    return this.pages.filter(page => (!category || page.category?.toLowerCase() === category) && (!type || page.type.toLowerCase() === type) && (!tag || page.tags.some(value => value.toLowerCase() === tag)));
   }
 
-  private handleGetWikiPage(args: { path: string }): { content: Array<{ type: string; text: string }>; isError?: boolean } {
-    const { path: pagePath } = args;
-
-    // Try exact match first
-    let page = this.wikiPages.get(pagePath);
-
-    // Try with .md extension
-    if (!page && !pagePath.endsWith('.md')) {
-      page = this.wikiPages.get(pagePath + '.md');
-    }
-
-    // Try case-insensitive search
-    if (!page) {
-      const lowerPath = pagePath.toLowerCase();
-      for (const [p, pg] of this.wikiPages.entries()) {
-        if (p.toLowerCase() === lowerPath || p.toLowerCase() === lowerPath + '.md') {
-          page = pg;
-          break;
-        }
-      }
-    }
-
-    if (!page) {
-      return {
-        content: [{ type: 'text', text: `Wiki page not found: ${pagePath}\n\nAvailable pages:\n${Array.from(this.wikiPages.keys()).slice(0, 20).join('\n')}${this.wikiPages.size > 20 ? '\n...' : ''}` }],
-        isError: true,
-      };
-    }
-
-    const header = `# ${page.title}\n${page.description ? `> ${page.description}\n` : ''}\n**Category:** ${page.category || 'Uncategorized'}\n\n---\n\n`;
-
-    return {
-      content: [{ type: 'text', text: header + page.content }],
-    };
+  private findPage(value: string): WikiDocument {
+    const normalized = value.replace(/^\//, '').toLowerCase();
+    const page = this.pages.find(candidate => candidate.path.toLowerCase() === normalized || candidate.id.toLowerCase() === normalized);
+    if (!page) throw new Error(`Wiki page not found: ${value}. Use search_wiki or list_wiki_pages to discover valid paths.`);
+    return page;
   }
 
-  private handleListWikiPages(args: { category?: string }): { content: Array<{ type: string; text: string }> } {
-    const { category } = args;
-
-    const pages = Array.from(this.wikiPages.values())
-      .filter(p => !category || p.category === category)
-      .sort((a, b) => a.title.localeCompare(b.title));
-
-    if (pages.length === 0) {
-      return {
-        content: [{ type: 'text', text: category ? `No pages found in category "${category}"` : 'No wiki pages found' }],
-      };
-    }
-
-    // Group by category
-    const byCategory = new Map<string, WikiPage[]>();
-    for (const page of pages) {
-      const cat = page.category || 'Uncategorized';
-      if (!byCategory.has(cat)) byCategory.set(cat, []);
-      byCategory.get(cat)!.push(page);
-    }
-
-    let text = `# Wiki Pages (${pages.length} total)\n\n`;
-
-    for (const [cat, catPages] of byCategory.entries()) {
-      text += `## ${cat}\n`;
-      for (const page of catPages) {
-        text += `- **${page.title}** (${page.path})${page.description ? ` - ${page.description}` : ''}\n`;
-      }
-      text += '\n';
-    }
-
-    return {
-      content: [{ type: 'text', text }],
-    };
+  private readPage(args: Args): ToolResult {
+    const page = this.findPage(stringArg(args, 'path', true)!);
+    const section = stringArg(args, 'section');
+    const heading = section ? page.headings.find(value => value.id === section || value.title.toLowerCase() === section.toLowerCase()) : undefined;
+    if (section && !heading) throw new Error(`Section not found: ${section}. Available heading IDs: ${page.headings.map(value => value.id).join(', ')}`);
+    const lines = page.content.split('\n');
+    const firstLine = heading?.startLine || 1;
+    const lastLine = heading?.endLine || lines.length;
+    const startLine = integerArg(args, 'startLine', firstLine, 1, Math.max(1, lines.length));
+    const maxLines = integerArg(args, 'maxLines', 120, 1, 400);
+    if (startLine < firstLine || startLine > lastLine) throw new Error(`startLine must be within the selected section (${firstLine}-${lastLine}).`);
+    let endLine = Math.min(startLine + maxLines - 1, lastLine);
+    let content = lines.slice(startLine - 1, endLine).join('\n');
+    let longLineTruncated = false;
+    while (content.length > 32000 && endLine > startLine) { endLine--; content = lines.slice(startLine - 1, endLine).join('\n'); }
+    if (content.length > 32000) { content = content.slice(0, 32000); longLineTruncated = true; }
+    const nextStartLine = endLine < lastLine ? endLine + 1 : null;
+    const data = { ...documentSummary(page), metadata: page.metadata, startLine, endLine, totalLines: lines.length, nextStartLine, truncated: nextStartLine !== null || longLineTruncated, longLineTruncated, content };
+    const hint = nextStartLine ? `\n\nContinue with get_wiki_page(path=${JSON.stringify(page.path)}, startLine=${nextStartLine}${section ? `, section=${JSON.stringify(section)}` : ''}).` : '';
+    const longLineHint = longLineTruncated ? '\n\nA line exceeded 32,000 characters. Read the wiki resource to obtain the complete document.' : '';
+    return response(data, `# ${page.title}\nPath: ${page.path} | Lines: ${startLine}-${endLine} | Trust: ${data.trust}\n\n${content}${hint}${longLineHint}`, args);
   }
 
-  private async handleSearchCode(args: { query: string; maxResults?: number; mode?: 'hybrid' | 'vector' | 'keyword' }): Promise<{ content: Array<{ type: string; text: string }> }> {
-    const { query, maxResults = 5, mode = 'hybrid' } = args;
-
-    if (!this.ragSystem) {
-      return {
-        content: [{ type: 'text', text: 'Code search is not available. RAG index has not been initialized. Generate the wiki with indexing enabled first.' }],
-      };
-    }
-
-    try {
-      const searchOptions: SearchOptions = {
-        maxResults,
-        mode,
-      };
-
-      const results = await this.ragSystem.search(query, searchOptions);
-
-      if (results.length === 0) {
-        return {
-          content: [{ type: 'text', text: `No code matches found for "${query}"` }],
-        };
+  private async callTool(name: string, args: Args): Promise<ToolResult> {
+    switch (name) {
+      case 'get_knowledge_manifest': {
+        const exportAvailable = fs.existsSync(path.join(this.config.wikiPath, 'knowledge', 'manifest.json'));
+        const entries = this.pages.filter(page => /^(README|index|overview|architecture)\.md$/i.test(page.path) || page.path === 'architecture/overview.md').map(documentSummary);
+        const data = { name: 'SemanticWiki', version, pageCount: this.pages.length, entrypoints: entries, categories: [...new Set(this.pages.map(page => page.category).filter(Boolean))].sort(), types: [...new Set(this.pages.map(page => page.type))].sort(), codeSearchAvailable: this.ragSystem !== null, export: exportAvailable ? { format: 'OKF', version: '0.2', index: 'knowledge/index.md', catalog: 'knowledge/manifest.json', discovery: 'llms.txt' } : null, workflow: ['list_wiki_pages or search_wiki', 'get_wiki_page with path and optional section', 'get_related_pages', 'search_code if an index is available'], trustNote: 'Generated documentation is unverified unless explicit verification metadata says otherwise. Check source code before making changes.' };
+        return response(data, JSON.stringify(data, null, 2), args);
       }
-
-      const resultText = results.map((result: SearchResult, i: number) => {
-        const scoreInfo = [
-          `Combined: ${result.score.toFixed(3)}`,
-          result.vectorScore !== undefined ? `Vector: ${result.vectorScore.toFixed(3)}` : null,
-          result.bm25Score !== undefined ? `BM25: ${result.bm25Score.toFixed(3)}` : null,
-        ].filter(Boolean).join(', ');
-
-        return `### ${i + 1}. ${result.filePath}:${result.startLine}-${result.endLine}\n**Type:** ${result.chunkType || 'code'}${result.name ? ` | **Name:** ${result.name}` : ''}\n**Scores:** ${scoreInfo}\n\n\`\`\`${result.language}\n${result.content.slice(0, 1000)}${result.content.length > 1000 ? '\n// ... truncated' : ''}\n\`\`\``;
-      }).join('\n\n---\n\n');
-
-      return {
-        content: [{ type: 'text', text: `Found ${results.length} code matches for "${query}":\n\n${resultText}` }],
-      };
-    } catch (error) {
-      return {
-        content: [{ type: 'text', text: `Error searching code: ${error instanceof Error ? error.message : String(error)}` }],
-      };
+      case 'search_wiki': {
+        const query = stringArg(args, 'query', true)!;
+        const keywords = [...new Set(query.toLowerCase().match(/[\p{L}\p{N}_.-]+/gu) || [])];
+        const maxResults = integerArg(args, 'maxResults', 10, 1, 50);
+        const matches = this.filterPages(args).map(page => {
+          const lower = page.content.toLowerCase();
+          let score = 0;
+          for (const keyword of keywords) {
+            if (page.title.toLowerCase().includes(keyword)) score += 10;
+            if (page.description.toLowerCase().includes(keyword)) score += 5;
+            if (page.headings.some(heading => heading.title.toLowerCase().includes(keyword))) score += 3;
+            if (lower.includes(keyword)) score++;
+          }
+          const positions = keywords.map(keyword => lower.indexOf(keyword)).filter(position => position >= 0);
+          const start = Math.max(0, (positions.length ? Math.min(...positions) : 0) - 100);
+          return { ...documentSummary(page), score, excerpt: page.content.slice(start, start + 360), sources: page.metadata.sources || [] };
+        }).filter(result => result.score > 0).sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+        const results = matches.slice(0, maxResults);
+        return response({ query, total: matches.length, results }, results.length ? results.map(page => `## ${page.title}\nPath: ${page.path} | Score: ${page.score} | Trust: ${page.trust}\n${page.excerpt}\nSections: ${page.headings.map(heading => heading.id).join(', ')}`).join('\n\n') : `No wiki pages found matching "${query}".`, args);
+      }
+      case 'get_wiki_page': return this.readPage(args);
+      case 'list_wiki_pages': {
+        const offset = integerArg(args, 'offset', 0, 0, Number.MAX_SAFE_INTEGER);
+        const limit = integerArg(args, 'limit', 25, 1, 100);
+        const all = this.filterPages(args);
+        const pages = all.slice(offset, offset + limit).map(documentSummary);
+        const nextOffset = offset + limit < all.length ? offset + limit : null;
+        return response({ total: all.length, offset, nextOffset, pages }, `# Wiki pages (${all.length} total)\n\n${pages.map(page => `- ${page.title} (${page.path})${page.description ? ` — ${page.description}` : ''}`).join('\n')}${nextOffset !== null ? `\n\nNext offset: ${nextOffset}` : ''}`, args);
+      }
+      case 'get_related_pages': {
+        const page = this.findPage(stringArg(args, 'path', true)!);
+        const maxResults = integerArg(args, 'maxResults', 20, 1, 50);
+        const outgoingPaths = new Set(page.links.map(link => link.path).filter(Boolean));
+        const related = this.pages.filter(candidate => candidate.path !== page.path && (outgoingPaths.has(candidate.path) || candidate.links.some(link => link.path === page.path))).map(candidate => ({ ...documentSummary(candidate), direction: outgoingPaths.has(candidate.path) ? candidate.links.some(link => link.path === page.path) ? 'both' : 'outgoing' : 'incoming' }));
+        const results = related.slice(0, maxResults);
+        return response({ path: page.path, total: related.length, results }, `# Related to ${page.title}\n\n${results.map(result => `- ${result.title} (${result.path}) — ${result.direction}`).join('\n') || 'No related pages found.'}`, args);
+      }
+      case 'search_code': {
+        const query = stringArg(args, 'query', true)!;
+        const maxResults = integerArg(args, 'maxResults', 5, 1, 50);
+        const mode = args.mode || 'hybrid';
+        if (mode !== 'hybrid' && mode !== 'vector' && mode !== 'keyword') throw new Error('mode must be hybrid, vector, or keyword.');
+        if (!this.ragSystem) throw new Error('Code search is unavailable. Start the MCP server with a repository and an existing index; wiki search remains available without a model.');
+        const results = (await this.ragSystem.search(query, { maxResults, mode })).map(result => ({ ...result, content: result.content.slice(0, 4000), contentTruncated: result.content.length > 4000 }));
+        return response({ query, mode, results }, results.map(result => `## ${result.filePath}:${result.startLine}-${result.endLine}\n\n\`\`\`${result.language}\n${result.content}\n\`\`\``).join('\n\n') || `No code matches for "${query}".`, args);
+      }
+      case 'get_architecture_overview': {
+        const candidates = ['architecture/overview.md', 'overview.md', 'architecture.md', 'README.md', 'index.md'];
+        const page = candidates.map(candidate => this.pages.find(page => page.path === candidate)).find(Boolean) || this.pages.find(page => /architecture|overview/i.test(page.title));
+        if (!page) return response({ pageCount: this.pages.length, pages: this.pages.slice(0, 25).map(documentSummary) }, 'No dedicated architecture overview found. Use list_wiki_pages to browse documented concepts.', args);
+        return this.readPage({ ...args, path: page.path });
+      }
+      default: throw new Error(`Unknown tool: ${name}`);
     }
   }
 
-  private handleGetArchitectureOverview(): { content: Array<{ type: string; text: string }> } {
-    // Look for overview/architecture pages
-    const overviewPaths = ['overview.md', 'index.md', 'architecture.md', 'README.md', 'architecture/overview.md'];
-
-    for (const pagePath of overviewPaths) {
-      const page = this.wikiPages.get(pagePath);
-      if (page) {
-        return {
-          content: [{ type: 'text', text: `# ${page.title}\n\n${page.content}` }],
-        };
-      }
+  /** Connect to any MCP transport; useful to embedders and protocol integration tests. */
+  async connect(transport: Transport): Promise<void> {
+    this.pages = loadWikiCatalog(path.resolve(this.config.wikiPath));
+    if (this.config.ragStorePath && this.config.repoPath && fs.existsSync(path.join(this.config.ragStorePath, 'metadata.json'))) {
+      try {
+        const { RAGSystem } = await import('./rag/index.js');
+        const rag = new RAGSystem({ storePath: this.config.ragStorePath, repoPath: this.config.repoPath, useHybridSearch: true, useReranking: false, logToStderr: true });
+        await rag.loadMetadataOnly({ migrateEmbeddings: false });
+        this.ragSystem = rag;
+      } catch (error) { console.error('Code index unavailable; wiki tools remain available:', error instanceof Error ? error.message : String(error)); }
     }
-
-    // Try to find any page with "overview" or "architecture" in the title
-    for (const page of this.wikiPages.values()) {
-      const titleLower = page.title.toLowerCase();
-      if (titleLower.includes('overview') || titleLower.includes('architecture')) {
-        return {
-          content: [{ type: 'text', text: `# ${page.title}\n\n${page.content}` }],
-        };
-      }
-    }
-
-    // Fallback: generate a summary from categories
-    const categories = new Map<string, number>();
-    for (const page of this.wikiPages.values()) {
-      const cat = page.category || 'Uncategorized';
-      categories.set(cat, (categories.get(cat) || 0) + 1);
-    }
-
-    let summary = '# Architecture Overview\n\nNo dedicated overview page found. Here is a summary of documented areas:\n\n';
-    for (const [cat, count] of categories.entries()) {
-      summary += `- **${cat}**: ${count} page${count > 1 ? 's' : ''}\n`;
-    }
-    summary += `\n**Total Documentation:** ${this.wikiPages.size} pages\n\nUse \`list_wiki_pages\` to see all available pages, or \`search_wiki\` to find specific topics.`;
-
-    return {
-      content: [{ type: 'text', text: summary }],
-    };
+    await this.server.connect(transport);
   }
 
   async start(): Promise<void> {
-    await this.loadWikiPages();
-    await this.initRAG();
-
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('SemanticWiki MCP Server started');
+    await this.connect(new StdioServerTransport());
+    console.error(`SemanticWiki MCP server ready (${this.pages.length} pages).`);
   }
+
+  async close(): Promise<void> { await this.server.close(); }
 }
 
-// CLI entry point
 async function main() {
   const args = process.argv.slice(2);
-
-  // Parse arguments
-  let wikiPath = './wiki';
-  let ragStorePath: string | undefined;
-  let repoPath: string | undefined;
-
+  const config: WikiServerConfig = { wikiPath: './wiki' };
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--wiki' && args[i + 1]) {
-      wikiPath = args[++i];
-    } else if (args[i] === '--rag-store' && args[i + 1]) {
-      ragStorePath = args[++i];
-    } else if (args[i] === '--repo' && args[i + 1]) {
-      repoPath = args[++i];
-    } else if (args[i] === '--help' || args[i] === '-h') {
-      console.log(`
-SemanticWiki MCP Server
-
-Usage: npx ts-node src/mcp-wiki-server.ts [options]
-
-Options:
-  --wiki <path>       Path to wiki directory (default: ./wiki)
-  --rag-store <path>  Path to RAG index store (enables code search)
-  --repo <path>       Path to repository (required with --rag-store)
-  --help, -h          Show this help message
-
-The server exposes the following tools:
-  - search_wiki: Search wiki documentation pages
-  - get_wiki_page: Get full content of a wiki page
-  - list_wiki_pages: List all wiki pages
-  - search_code: Search codebase using semantic search (if RAG enabled)
-  - get_architecture_overview: Get high-level architecture overview
-`);
-      process.exit(0);
-    }
+    if (args[i] === '--wiki' && args[i + 1]) config.wikiPath = args[++i];
+    else if (args[i] === '--rag-store' && args[i + 1]) config.ragStorePath = args[++i];
+    else if (args[i] === '--repo' && args[i + 1]) config.repoPath = args[++i];
+    else if (args[i] === '--help' || args[i] === '-h') {
+      console.log('SemanticWiki MCP Server\n\nUsage: semanticwiki mcp-server -o /path/to/wiki [-r /path/to/repository]\n\nTools: get_knowledge_manifest, search_wiki, get_wiki_page, list_wiki_pages, get_related_pages, search_code, get_architecture_overview');
+      return;
+    } else throw new Error(`Unknown or incomplete option: ${args[i]}`);
   }
-
-  const config: WikiServerConfig = {
-    wikiPath: path.resolve(wikiPath),
-    ragStorePath: ragStorePath ? path.resolve(ragStorePath) : undefined,
-    repoPath: repoPath ? path.resolve(repoPath) : undefined,
-  };
-
-  const server = new WikiMCPServer(config);
-  await server.start();
+  await new WikiMCPServer(config).start();
 }
 
-// Export for use as module
-export type { WikiServerConfig };
-
-// Run if executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch(console.error);
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch(error => { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; });
 }

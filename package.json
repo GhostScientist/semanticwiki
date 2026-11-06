@@ -1,6 +1,6 @@
 {
   "name": "semanticwiki",
-  "version": "1.5.0",
+  "version": "2.0.0",
   "description": "Generate comprehensive architectural documentation wikis for code repositories with source traceability.",
   "main": "dist/cli.js",
   "bin": {
@@ -11,7 +11,7 @@
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
     "check": "npm run build && npm test && npm run check:cli",
-    "check:cli": "bash scripts/check-cli.sh",
+    "check:cli": "node scripts/check-cli.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -19,7 +19,8 @@
     "prepare": "npm run build",
     "prepublishOnly": "npm run check",
     "release": "./scripts/release.sh",
-    "publish-npm": "npm publish"
+    "publish-npm": "npm publish",
+    "check:providers": "node scripts/check-providers.mjs"
   },
   "keywords": [
     "ai-agent",
@@ -35,12 +36,17 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=24.0.0"
   },
   "files": [
     "dist/**/*",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "MODEL.md",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "docs/*.md"
   ],
   "publishConfig": {
     "access": "public"
@@ -49,13 +55,14 @@
     "@anthropic-ai/claude-agent-sdk": "^0.3.316",
     "@anthropic-ai/sdk": "^0.122.0",
     "@huggingface/transformers": "^4.3.1",
-    "@modelcontextprotocol/server-filesystem": "^2026.8.31",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/server-filesystem": "^2.2.0",
     "axios": "^1.21.0",
     "chalk": "^5.3.0",
     "cheerio": "^1.2.0",
     "commander": "^12.0.0",
     "dotenv": "^17.4.2",
-    "glob": "^13.0.6",
+    "glob": "^14.0.4",
     "gray-matter": "^4.0.3",
     "inquirer": "^9.2.12",
     "inquirer-autocomplete-prompt": "^3.0.1",
@@ -63,13 +70,13 @@
     "node-llama-cpp": "^3.22.3",
     "ollama": "^0.6.4",
     "ora": "^9.4.1",
-    "simple-git": "^3.36.0",
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "simple-git": "^4.0.2"
   },
   "devDependencies": {
     "@types/inquirer": "^9.0.10",
-    "@types/node": "^22.19.1",
+    "@types/node": "^24.19.2",
     "@vitest/coverage-v8": "^5.0.0",
+    "happy-dom": "^21.0.4",
     "typescript": "^5.9.3",
     "vitest": "^5.0.0"
   },

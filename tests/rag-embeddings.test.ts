@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { execFileSync } from 'node:child_process';
 import { Tensor } from '@huggingface/transformers';
 import type { CodeChunk, RAGSystem } from '../src/rag/index.js';
 
 const mocks = vi.hoisted(() => ({
+  nativeAvailable: true,
   config: vi.fn(),
   model: vi.fn(),
   tokenizer: vi.fn(),
@@ -33,7 +35,9 @@ vi.mock('@huggingface/transformers', async () => {
 });
 
 vi.mock('module', () => ({
-  createRequire: () => () => ({
+  createRequire: () => () => {
+    if (!mocks.nativeAvailable) throw new Error('Native index unavailable');
+    return {
     IndexFlatIP: Object.assign(class {
       constructor(private dimension: number) {
         mocks.constructIndex(dimension);
@@ -43,7 +47,8 @@ vi.mock('module', () => ({
       write(file: string) { mocks.write(file); }
       search(vector: number[], count: number) { return mocks.search(vector, count); }
     }, { read: mocks.readIndex })
-  })
+    };
+  }
 }));
 
 describe('EmbeddingGemma 2 code embeddings', () => {
@@ -92,6 +97,7 @@ describe('EmbeddingGemma 2 code embeddings', () => {
   beforeEach(async () => {
     vi.resetModules();
     vi.resetAllMocks();
+    mocks.nativeAvailable = true;
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'semanticwiki-embeddings-'));
     store = path.join(root, 'store');
     mocks.config.mockResolvedValue({ vision_config: {}, audio_config: {} });
@@ -208,13 +214,153 @@ describe('EmbeddingGemma 2 code embeddings', () => {
   });
 
   it('reuses a compatible cache and searches with a matching query vector', async () => {
-    seedCache();
+    fs.mkdirSync(path.join(root, 'src'));
+    fs.writeFileSync(path.join(root, chunk.filePath), chunk.content);
+    await rag.indexRepository();
+    mocks.model.mockClear();
+    mocks.readIndex.mockReturnValue({ getDimension: () => 768, search: mocks.search });
+    rag = new RAG({ storePath: store, repoPath: root });
     await rag.indexRepository();
     expect(mocks.readIndex).toHaveBeenCalledTimes(1);
     expect(mocks.model).not.toHaveBeenCalled();
     const results = await rag.search('authenticate', { mode: 'vector' });
     expect(results[0].filePath).toBe(chunk.filePath);
     expect(mocks.search.mock.calls[0][0]).toHaveLength(768);
+  });
+
+  it('rebuilds legacy caches with no source identity even when their model is compatible', async () => {
+    seedCache();
+    fs.writeFileSync(path.join(root, 'auth.ts'), chunk.content);
+    await rag.indexRepository();
+    expect(mocks.readIndex).not.toHaveBeenCalled();
+    expect(rag.getIndexState()?.sourceFingerprint).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('invalidates source edits even when file size, modification time, and Git commit are unchanged', async () => {
+    const source = path.join(root, 'auth.ts');
+    fs.writeFileSync(source, chunk.content);
+    const stat = fs.statSync(source);
+    await rag.indexRepository();
+    const previous = rag.getIndexState()?.sourceFingerprint;
+    fs.writeFileSync(source, chunk.content.replace('token', 'value'));
+    fs.utimesSync(source, stat.atime, stat.mtime);
+    mocks.constructIndex.mockClear();
+    await rag.indexRepository();
+    expect(mocks.readIndex).not.toHaveBeenCalled();
+    expect(mocks.constructIndex).toHaveBeenCalled();
+    expect(rag.getIndexState()?.sourceFingerprint).not.toBe(previous);
+    expect((await rag.search('value', { mode: 'keyword' }))[0].content).toContain('value');
+  });
+
+  it('reindexes added and removed files, including non-Git repositories, and clears an empty index', async () => {
+    fs.writeFileSync(path.join(root, 'auth.ts'), chunk.content);
+    await rag.indexRepository();
+    fs.writeFileSync(path.join(root, 'new.ts'), 'export function newFeature() { return "A newly discovered code path in an untracked source file"; }');
+    await rag.indexRepository();
+    expect(rag.getIndexedFiles()).toContain('new.ts');
+    fs.unlinkSync(path.join(root, 'auth.ts'));
+    fs.unlinkSync(path.join(root, 'new.ts'));
+    await rag.indexRepository();
+    expect(rag.getDocumentCount()).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(store, 'metadata.json'), 'utf8'))).toEqual({});
+    expect(fs.existsSync(path.join(store, 'index.faiss'))).toBe(false);
+  });
+
+  it('removes stale cached metadata when an incremental update deletes every source file', async () => {
+    seedCache();
+    const result = await rag.updateIndex([chunk.filePath]);
+    expect(result).toMatchObject({ chunksRemoved: 1, chunksAdded: 0 });
+    expect(rag.getDocumentCount()).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(store, 'metadata.json'), 'utf8'))).toEqual({});
+    expect(fs.existsSync(path.join(store, 'index.faiss'))).toBe(false);
+    expect(await rag.search('authenticate', { mode: 'keyword' })).toEqual([]);
+    expect(mocks.model).not.toHaveBeenCalled();
+  });
+
+  it('does not reuse another checkout or different indexing settings in the same output directory', async () => {
+    fs.writeFileSync(path.join(root, 'auth.ts'), chunk.content);
+    await rag.indexRepository();
+    const previous = rag.getIndexState()?.repositoryId;
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'semanticwiki-other-'));
+    try {
+      fs.writeFileSync(path.join(other, 'auth.ts'), chunk.content);
+      const otherRag = new RAG({ storePath: store, repoPath: other });
+      await otherRag.indexRepository();
+      expect(otherRag.getIndexState()?.repositoryId).not.toBe(previous);
+      expect(mocks.readIndex).not.toHaveBeenCalled();
+      const previousConfiguration = otherRag.getIndexState()?.indexConfiguration;
+      const changedConfig = new RAG({ storePath: store, repoPath: other, chunkSize: 900 });
+      await changedConfig.indexRepository();
+      expect(changedConfig.getIndexState()?.indexConfiguration).not.toBe(previousConfiguration);
+      expect(mocks.readIndex).not.toHaveBeenCalled();
+    } finally { fs.rmSync(other, { recursive: true, force: true }); }
+  });
+
+  it('detects committed, dirty, and untracked changes in a Git checkout', async () => {
+    const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=SemanticWiki Test', '-c', 'user.email=test@example.invalid', ...args], { cwd: root, stdio: 'ignore' });
+    git('init', '-q');
+    fs.writeFileSync(path.join(root, 'auth.ts'), chunk.content);
+    git('add', 'auth.ts');
+    git('commit', '-qm', 'Initial fixture');
+    await rag.indexRepository();
+    const firstCommit = rag.getIndexState()?.commitHash;
+    fs.writeFileSync(path.join(root, 'auth.ts'), chunk.content.replace('token', 'other'));
+    await rag.indexRepository();
+    expect(rag.getIndexState()?.commitHash).toBe(firstCommit);
+    fs.writeFileSync(path.join(root, 'untracked.ts'), 'export function untrackedFeature() { return "New code that has not yet been committed to Git"; }');
+    await rag.indexRepository();
+    expect(rag.getIndexedFiles()).toContain('untracked.ts');
+    git('add', 'auth.ts', 'untracked.ts');
+    git('commit', '-qm', 'Changed fixture');
+    await rag.indexRepository();
+    expect(rag.getIndexState()?.commitHash).not.toBe(firstCommit);
+    expect(mocks.readIndex).not.toHaveBeenCalled();
+  });
+
+  it('omits generated wiki output and internal cache files from source discovery', async () => {
+    const wiki = path.join(root, 'docs', 'architecture');
+    const cache = path.join(wiki, '.semanticwiki-cache');
+    const nestedRag = new RAG({ storePath: cache, repoPath: root });
+    fs.writeFileSync(path.join(wiki, 'README.md'), '# Generated wiki');
+    fs.writeFileSync(path.join(cache, 'metadata.json'), '{}');
+    fs.writeFileSync(path.join(root, 'auth.ts'), chunk.content);
+    expect(await nestedRag['discoverFiles']()).toEqual(['auth.ts']);
+  });
+
+  it('keeps explicit metadata-only loading available even after source files change', async () => {
+    seedCache();
+    fs.writeFileSync(path.join(root, 'different.ts'), 'export const sourceHasChanged = true;');
+    await rag.loadMetadataOnly();
+    expect(mocks.readIndex).toHaveBeenCalledTimes(1);
+    expect(rag.getIndexedFiles()).toEqual([chunk.filePath]);
+  });
+
+  it('keeps keyword-only loading model-free and routes diagnostics away from stdout', async () => {
+    seedCache('Xenova/bge-small-en-v1.5', 384);
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const loggingRag = new RAG({ storePath: store, repoPath: root, logToStderr: true });
+    await loggingRag.loadMetadataOnly({ migrateEmbeddings: false });
+    expect(mocks.model).not.toHaveBeenCalled();
+    expect(mocks.pipeline).not.toHaveBeenCalled();
+    expect(mocks.readIndex).not.toHaveBeenCalled();
+    expect(console.log).not.toHaveBeenCalled();
+    expect(stderr).toHaveBeenCalled();
+    expect((await loggingRag.search('authenticate', { mode: 'keyword' }))[0].filePath).toBe(chunk.filePath);
+  });
+
+  it('builds and reuses keyword indexes without downloading embeddings when FAISS is unavailable', async () => {
+    mocks.nativeAvailable = false;
+    vi.resetModules();
+    const { RAGSystem: WithoutNative } = await import('../src/rag/index.js');
+    const keywordRag = new WithoutNative({ storePath: store, repoPath: root });
+    fs.writeFileSync(path.join(root, 'auth.ts'), chunk.content);
+    await keywordRag.indexRepository();
+    expect(mocks.model).not.toHaveBeenCalled();
+    expect(mocks.pipeline).not.toHaveBeenCalled();
+    const chunkSpy = vi.spyOn(keywordRag as any, 'chunkFile');
+    await keywordRag.indexRepository();
+    expect(chunkSpy).not.toHaveBeenCalled();
+    expect((await keywordRag.search('authenticate', { mode: 'keyword' }))[0].filePath).toBe('auth.ts');
   });
 
   it('rebuilds an old cache from source instead of loading incompatible vectors', async () => {

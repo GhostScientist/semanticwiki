@@ -3,6 +3,7 @@
  *
  * Unified interface for multiple LLM backends:
  * - AnthropicProvider: Cloud-based Claude API (default)
+ * - OpenAIProvider: OpenAI Responses API
  * - LocalLlamaProvider: Self-contained local inference via node-llama-cpp
  * - OllamaProvider: External Ollama server for power users
  */
@@ -10,7 +11,8 @@
 import { AnthropicProvider } from './anthropic-provider.js';
 import { LocalLlamaProvider } from './local-llama-provider.js';
 import { OllamaProvider } from './ollama-provider.js';
-import type { LLMProvider, CreateProviderOptions } from './types.js';
+import { OpenAIProvider } from './openai-provider.js';
+import type { LLMProvider, CreateProviderOptions, LLMMessage, LLMResponse, ContentBlock } from './types.js';
 
 /**
  * Create an LLM provider based on the given options
@@ -20,7 +22,7 @@ import type { LLMProvider, CreateProviderOptions } from './types.js';
  *
  * @example
  * // Use Claude API (default)
- * const provider = await createLLMProvider({ model: 'claude-sonnet-5' });
+ * const provider = await createLLMProvider({ model: 'claude-sonnet-5-5' });
  *
  * @example
  * // Use local mode (self-contained)
@@ -36,63 +38,57 @@ import type { LLMProvider, CreateProviderOptions } from './types.js';
  * });
  */
 export async function createLLMProvider(options: CreateProviderOptions = {}): Promise<LLMProvider> {
+  const providerName = options.provider ?? (options.useOllama ? 'ollama' : options.fullLocal ? 'local' : 'anthropic');
   let provider: LLMProvider;
-
-  console.log('[createLLMProvider] Options:', {
-    fullLocal: options.fullLocal,
-    useOllama: options.useOllama,
-    modelFamily: options.modelFamily,
-    verbose: options.verbose,
-    localModel: options.localModel
-  });
-
-  if (options.fullLocal) {
-    if (options.useOllama) {
-      // Use external Ollama server
-      console.log('🔌 Using Ollama backend...\n');
-      provider = new OllamaProvider({
-        host: options.ollamaHost,
-        model: options.localModel || 'qwen2.5-coder:14b',
-        onProgress: options.onProgress,
-      });
-      console.log('[createLLMProvider] Created OllamaProvider');
-    } else {
-      // Use bundled node-llama-cpp (default for --full-local)
-      const family = options.modelFamily || 'gpt-oss';
-      const familyNames: Record<string, string> = {
-        'gpt-oss': 'GPT-OSS (21B)',
-        'completion': 'Qwen2.5-Coder (1.5B)',
-        'qwen': 'Qwen',
-        'lfm': 'LFM (LiquidAI)',
-      };
-      const familyName = familyNames[family] || family;
-      console.log(`🏠 Using self-contained local mode with ${familyName} models...\n`);
+  switch (providerName) {
+    case 'local':
       provider = new LocalLlamaProvider({
         modelPath: options.modelPath,
         modelId: options.localModel,
-        modelFamily: family,
+        modelFamily: options.modelFamily ?? 'semanticwiki',
         gpuLayers: options.gpuLayers,
         contextSize: options.contextSize,
         threads: options.threads,
         onProgress: options.onProgress,
         verbose: options.verbose,
       });
-      console.log('[createLLMProvider] Created LocalLlamaProvider with family:', family);
-    }
-  } else {
-    // Use cloud Anthropic API
-    provider = new AnthropicProvider({
-      apiKey: options.apiKey,
-      model: options.model || 'claude-sonnet-5',
-      onProgress: options.onProgress,
-    });
-    console.log('[createLLMProvider] Created AnthropicProvider');
+      break;
+    case 'ollama':
+      provider = new OllamaProvider({
+        host: options.ollamaHost,
+        model: options.localModel ?? options.model ?? 'semanticwiki-coder-7b-v2',
+        onProgress: options.onProgress,
+      });
+      break;
+    case 'openai':
+      provider = new OpenAIProvider({ apiKey: options.apiKey, model: options.model, onProgress: options.onProgress });
+      break;
+    case 'anthropic':
+      provider = new AnthropicProvider({ apiKey: options.apiKey, model: options.model, onProgress: options.onProgress });
+      break;
+    default:
+      throw new Error(`Unknown provider: ${providerName}. Choose anthropic, openai, local, or ollama.`);
   }
+  try {
+    await provider.initialize();
+    return provider;
+  } catch (error) {
+    await provider.shutdown().catch(() => {});
+    throw error;
+  }
+}
 
-  console.log('[createLLMProvider] Calling provider.initialize()...');
-  await provider.initialize();
-  console.log('[createLLMProvider] Provider initialized, returning');
-  return provider;
+/** Preserve provider continuation state as well as every tool call across turns. */
+export function assistantMessageFromResponse(response: LLMResponse): LLMMessage {
+  if (response.assistantContent) {
+    return { role: 'assistant', content: response.assistantContent, providerState: response.providerState };
+  }
+  const content: ContentBlock[] = [...(response.thinkingBlocks ?? [])];
+  if (response.content) content.push({ type: 'text', text: response.content });
+  content.push(...response.toolCalls.map(call => ({
+    type: 'tool_use' as const, id: call.id, name: call.name, input: call.arguments,
+  })));
+  return { role: 'assistant', content, providerState: response.providerState };
 }
 
 /**
@@ -109,10 +105,10 @@ export async function isLocalModeAvailable(): Promise<{
     const hardware = await manager.detectHardware();
 
     // Check minimum requirements
-    if (hardware.gpuVram < 2 && hardware.systemRam < 4) {
+    if (hardware.gpuVram < 6 && hardware.systemRam < 8) {
       return {
         available: false,
-        reason: 'Insufficient hardware: need at least 2GB VRAM or 4GB RAM',
+        reason: 'Insufficient hardware: need at least 6GB VRAM or 8GB RAM for the default 7B model',
         hardware,
       };
     }
@@ -165,6 +161,8 @@ export async function listDownloadedModels(): Promise<
 
 // Re-export types and providers
 export * from './types.js';
+export * from './defaults.js';
+export { OpenAIProvider } from './openai-provider.js';
 export { AnthropicProvider } from './anthropic-provider.js';
 export { LocalLlamaProvider } from './local-llama-provider.js';
 export { OllamaProvider } from './ollama-provider.js';

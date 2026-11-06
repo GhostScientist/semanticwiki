@@ -1,3 +1,4 @@
+import { getRuntimePaths } from '../runtime-paths.js';
 /**
  * RAG (Retrieval Augmented Generation) System for ArchitecturalWiki
  *
@@ -14,6 +15,7 @@ import * as path from 'path';
 import { glob } from 'glob';
 import { simpleGit, SimpleGit } from 'simple-git';
 import { createRequire } from 'module';
+import { createHash } from 'node:crypto';
 import { AutoConfig, AutoModel, AutoTokenizer, Tensor, pipeline, env } from '@huggingface/transformers';
 import {
   ASTChunker,
@@ -29,7 +31,7 @@ import {
 } from './contextual-retrieval.js';
 
 // Configure transformers.js to use local cache
-env.cacheDir = './.semanticwiki-models';
+env.cacheDir = getRuntimePaths().embeddingsDir;
 
 // FAISS types (faiss-node) - use createRequire for CommonJS module in ESM context
 let faiss: any;
@@ -37,7 +39,7 @@ try {
   const require = createRequire(import.meta.url);
   faiss = require('faiss-node');
 } catch (e) {
-  console.warn('Warning: faiss-node not available, using fallback similarity search');
+  console.warn('Warning: faiss-node not available; using BM25 keyword search without embedding downloads');
 }
 
 type EmbeddingExtractor = (text: string) => Promise<Tensor>;
@@ -48,6 +50,8 @@ let rerankPipeline: any = null;
 export interface RAGConfig {
   storePath: string;
   repoPath: string;
+  /** Reserve stdout for MCP or machine-readable command output. */
+  logToStderr?: boolean;
   chunkSize?: number;
   chunkOverlap?: number;
   embeddingModel?: string;
@@ -171,6 +175,10 @@ interface IndexState {
   embeddingDimension?: number;
   /** Whether hybrid search index is available */
   hasHybridIndex?: boolean;
+  /** Bind automatic reuse to the exact checkout, content, and indexing options. */
+  repositoryId?: string;
+  sourceFingerprint?: string;
+  indexConfiguration?: string;
 }
 
 /**
@@ -255,6 +263,11 @@ export class RAGSystem {
   private embeddingModelName: string;
   private contextualRetrieval: ContextualRetrieval | null = null;
 
+  private log(...values: unknown[]): void {
+    if (this.config.logToStderr) console.error(...values);
+    else console.log(...values);
+  }
+
   constructor(config: RAGConfig) {
     this.config = {
       chunkSize: 1500,
@@ -323,7 +336,7 @@ export class RAGSystem {
   }
 
   private async loadEmbeddingPipeline(): Promise<EmbeddingExtractor> {
-    console.log(`  Loading embedding model: ${this.embeddingModelName}...`);
+    this.log(`  Loading embedding model: ${this.embeddingModelName}...`);
     let extractor: EmbeddingExtractor;
     if (this.usesEmbeddingGemma()) {
       const [modelConfig, tokenizer] = await Promise.all([
@@ -356,7 +369,7 @@ export class RAGSystem {
       const model = await pipeline('feature-extraction', this.embeddingModelName);
       extractor = text => model(text, { pooling: 'mean', normalize: true });
     }
-    console.log(`  ✓ Loaded ${this.embeddingModelName}`);
+    this.log(`  ✓ Loaded ${this.embeddingModelName}`);
     return extractor;
   }
 
@@ -382,18 +395,39 @@ export class RAGSystem {
       (!this.usesEmbeddingGemma() || state.embeddingDimension === 768);
   }
 
+  private async sourceIdentity(files: string[]): Promise<Pick<IndexState, 'repositoryId' | 'sourceFingerprint' | 'indexConfiguration'>> {
+    const digest = createHash('sha256');
+    for (const file of [...files].sort()) {
+      const bytes = await fs.promises.readFile(path.join(this.config.repoPath, file));
+      digest.update(file).update('\0').update(createHash('sha256').update(bytes).digest('hex')).update('\n');
+    }
+    const configuration = {
+      version: 1, chunkSize: this.config.chunkSize, chunkOverlap: this.config.chunkOverlap,
+      maxChunks: this.config.maxChunks || null, useASTChunking: this.config.useASTChunking,
+      extractDomainHints: this.config.extractDomainHints,
+      useContextualRetrieval: this.config.useContextualRetrieval,
+      contextualModel: this.config.contextualModel, contextualLocal: this.config.contextualLocal,
+      contextualUseOllama: this.config.contextualUseOllama, contextualLocalModel: this.config.contextualLocalModel,
+    };
+    return {
+      repositoryId: createHash('sha256').update(fs.realpathSync(this.config.repoPath)).digest('hex'),
+      sourceFingerprint: digest.digest('hex'),
+      indexConfiguration: createHash('sha256').update(JSON.stringify(configuration)).digest('hex'),
+    };
+  }
+
   /**
    * Initialize the reranking model (lazy loading)
    * Uses a cross-encoder for more accurate relevance scoring
    */
   private async getRerankPipeline(): Promise<any> {
     if (!rerankPipeline) {
-      console.log('  Loading reranking model...');
+      this.log('  Loading reranking model...');
       try {
         // Use a text-classification pipeline for reranking
         // This model scores query-document pairs for relevance
         rerankPipeline = await pipeline('text-classification', 'Xenova/ms-marco-MiniLM-L-6-v2');
-        console.log('  ✓ Loaded reranking model');
+        this.log('  ✓ Loaded reranking model');
       } catch (err) {
         console.warn('  Reranking model not available, skipping reranking');
         rerankPipeline = null;
@@ -420,6 +454,13 @@ export class RAGSystem {
    */
   getIndexState(): IndexState | null {
     return this.indexState;
+  }
+
+  /** Inspect the same source files as indexing, without loading models or changing the index. */
+  async getSourceSnapshot(): Promise<{ files: string[]; sourceFingerprint: string }> {
+    const files = await this.discoverFiles(false);
+    const identity = await this.sourceIdentity(files);
+    return { files, sourceFingerprint: identity.sourceFingerprint! };
   }
 
   /**
@@ -621,15 +662,31 @@ export class RAGSystem {
     const indexStatePath = path.join(this.config.storePath, 'index-state.json');
     const bm25IndexPath = path.join(this.config.storePath, 'bm25-index.json');
 
-    // Get current commit hash
+    // Inspect source before considering reuse. Commit IDs alone miss uncommitted
+    // and untracked changes, and non-Git directories have no useful commit ID.
     const currentCommit = await this.getCurrentCommitHash();
-    this.indexState = fs.existsSync(indexStatePath)
-      ? JSON.parse(fs.readFileSync(indexStatePath, 'utf-8'))
-      : null;
+    this.log('  Checking source files...');
+    const files = await this.discoverFiles();
+    const sourceIdentity = await this.sourceIdentity(files);
+    try {
+      this.indexState = fs.existsSync(indexStatePath) ? JSON.parse(fs.readFileSync(indexStatePath, 'utf-8')) : null;
+    } catch { this.indexState = null; }
     const compatible = this.isIndexCompatible(this.indexState);
+    const sourceMatches = this.indexState?.commitHash === currentCommit &&
+      this.indexState?.repositoryId === sourceIdentity.repositoryId &&
+      this.indexState?.sourceFingerprint === sourceIdentity.sourceFingerprint &&
+      this.indexState?.indexConfiguration === sourceIdentity.indexConfiguration;
+
+    // Reuse a verified keyword-only cache without repeatedly downloading vectors.
+    if (!options.force && compatible && sourceMatches && fs.existsSync(cachedMetaPath) && (!faiss || this.indexState?.chunkCount === 0)) {
+      try {
+        await this.loadMetadataOnly();
+        return;
+      } catch { console.warn('Could not load cached metadata, rebuilding...'); }
+    }
 
     // Try to load cached index
-    if (!options.force && compatible && fs.existsSync(cachedIndexPath) && fs.existsSync(cachedMetaPath) && faiss) {
+    if (!options.force && compatible && sourceMatches && fs.existsSync(cachedIndexPath) && fs.existsSync(cachedMetaPath) && faiss) {
       try {
         // faiss-node API: IndexFlatIP.read(path) to load index
         this.index = faiss.IndexFlatIP.read(cachedIndexPath);
@@ -644,9 +701,9 @@ export class RAGSystem {
         // Load index state if available
         if (fs.existsSync(indexStatePath)) {
           this.indexState = JSON.parse(fs.readFileSync(indexStatePath, 'utf-8'));
-          console.log(`Loaded cached index with ${this.documentCount} chunks (indexed at commit ${this.indexState?.commitHash?.slice(0, 7) || 'unknown'})`);
+          this.log(`Loaded cached index with ${this.documentCount} chunks (indexed at commit ${this.indexState?.commitHash?.slice(0, 7) || 'unknown'})`);
         } else {
-          console.log(`Loaded cached index with ${this.documentCount} chunks`);
+          this.log(`Loaded cached index with ${this.documentCount} chunks`);
         }
 
         // Build or load BM25 index for hybrid search
@@ -665,13 +722,13 @@ export class RAGSystem {
                 avgDocLength: bm25Data.avgDocLength,
                 docCount: bm25Data.docCount
               };
-              console.log('  ✓ Loaded BM25 index for hybrid search');
+              this.log('  ✓ Loaded BM25 index for hybrid search');
             } catch {
-              console.log('  Building BM25 index...');
+              this.log('  Building BM25 index...');
               this.buildBM25Index();
             }
           } else {
-            console.log('  Building BM25 index...');
+            this.log('  Building BM25 index...');
             this.buildBM25Index();
           }
         }
@@ -683,7 +740,7 @@ export class RAGSystem {
     }
 
     if (this.indexState && !compatible) {
-      console.log(`  Rebuilding index for ${this.embeddingModelName} (previous model: ${this.indexState.embeddingModel || 'unknown'})...`);
+      this.log(`  Rebuilding index for ${this.embeddingModelName} (previous model: ${this.indexState.embeddingModel || 'unknown'})...`);
     }
     this.index = null;
     this.metadata.clear();
@@ -691,10 +748,7 @@ export class RAGSystem {
     this.documentCount = 0;
     this.embeddingDimension = this.usesEmbeddingGemma() ? 768 : null;
 
-    // Discover files
-    console.log('  Discovering files...');
-    const files = await this.discoverFiles();
-    console.log(`  Found ${files.length} files to index`);
+    this.log(`  Found ${files.length} files to index`);
 
     // Chunk files with progress
     const chunks: CodeChunk[] = [];
@@ -711,7 +765,7 @@ export class RAGSystem {
       // Show progress every 5%
       const progress = Math.floor((i + 1) / files.length * 100);
       if (progress >= lastProgress + 5) {
-        console.log(`  Chunking... ${i + 1}/${files.length} (${progress}%)`);
+        this.log(`  Chunking... ${i + 1}/${files.length} (${progress}%)`);
         lastProgress = progress;
       }
 
@@ -722,24 +776,35 @@ export class RAGSystem {
         // Skip files that fail to chunk
       }
     }
-    console.log(`  Chunking complete: ${chunks.length} chunks from ${files.length} files`);
+    this.log(`  Chunking complete: ${chunks.length} chunks from ${files.length} files`);
 
     if (chunks.length === 0) {
       console.warn('No code chunks to index');
+      // Clearing all source files must not leave the previous repository searchable.
+      fs.writeFileSync(cachedMetaPath, '{}', 'utf8');
+      for (const obsolete of [cachedIndexPath, bm25IndexPath]) {
+        if (fs.existsSync(obsolete)) fs.unlinkSync(obsolete);
+      }
+      this.indexState = {
+        ...sourceIdentity, commitHash: currentCommit, indexedAt: new Date().toISOString(),
+        fileCount: files.length, chunkCount: 0, embeddingModel: this.embeddingModelName,
+        embeddingDimension: this.embeddingDimension ?? undefined, hasHybridIndex: false,
+      };
+      fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf8');
       return;
     }
 
     // Apply maxChunks limit if configured (for large codebases)
     let chunksToIndex = chunks;
     if (this.config.maxChunks && chunks.length > this.config.maxChunks) {
-      console.log(`  ⚠️  Limiting to ${this.config.maxChunks} chunks (was ${chunks.length}) to manage memory`);
+      this.log(`  ⚠️  Limiting to ${this.config.maxChunks} chunks (was ${chunks.length}) to manage memory`);
       // Prioritize chunks from smaller files and main source directories
       chunksToIndex = this.prioritizeChunks(chunks, this.config.maxChunks);
     }
 
     // Apply contextual retrieval if enabled
     if (this.contextualRetrieval && this.config.useContextualRetrieval) {
-      console.log(`  Enriching chunks with contextual retrieval...`);
+      this.log(`  Enriching chunks with contextual retrieval...`);
       try {
         await this.contextualRetrieval.initialize();
         const enrichedChunks = await this.contextualRetrieval.enrichChunks(
@@ -754,23 +819,23 @@ export class RAGSystem {
           content: ec.enrichedContent || ec.content,
         }));
         const stats = this.contextualRetrieval.getStats();
-        console.log(`  ✓ Contextual enrichment complete (${stats.cacheHits} cached)`);
+        this.log(`  ✓ Contextual enrichment complete (${stats.cacheHits} cached)`);
       } catch (err) {
         console.warn(`  ⚠️  Contextual retrieval failed, continuing without: ${(err as Error).message}`);
       }
     }
 
     // Generate embeddings
-    console.log(`  Generating embeddings for ${chunksToIndex.length} chunks...`);
-    const embeddings = await this.generateEmbeddings(chunksToIndex);
+    if (faiss) this.log(`  Generating embeddings for ${chunksToIndex.length} chunks...`);
+    const embeddings = faiss ? await this.generateEmbeddings(chunksToIndex) : [];
 
     // Build FAISS index
-    console.log(`  Building search index...`);
+    this.log(`  Building search index...`);
     if (faiss && embeddings.length > 0) {
       // Get actual dimension from first embedding
       const actualDimension = embeddings[0].length;
       if (actualDimension !== this.embeddingDimension) {
-        console.log(`  Adjusting dimension: expected ${this.embeddingDimension}, got ${actualDimension}`);
+        this.log(`  Adjusting dimension: expected ${this.embeddingDimension}, got ${actualDimension}`);
         this.embeddingDimension = actualDimension;
       }
 
@@ -825,7 +890,7 @@ export class RAGSystem {
 
         // Build and save BM25 index for hybrid search
         if (this.config.useHybridSearch) {
-          console.log('  Building BM25 index for hybrid search...');
+          this.log('  Building BM25 index for hybrid search...');
           this.bm25Index = this.buildBM25Index();
 
           // Save BM25 index
@@ -846,12 +911,13 @@ export class RAGSystem {
               docCount: this.bm25Index.docCount
             };
             fs.writeFileSync(bm25IndexPath, JSON.stringify(bm25Data), 'utf-8');
-            console.log('  ✓ BM25 index built and saved');
+            this.log('  ✓ BM25 index built and saved');
           }
         }
 
         // Save index state with commit hash
         this.indexState = {
+          ...sourceIdentity,
           commitHash: currentCommit,
           indexedAt: new Date().toISOString(),
           fileCount: files.length,
@@ -863,7 +929,7 @@ export class RAGSystem {
         fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
         this.documentCount = chunksToIndex.length;
-        console.log(`  ✓ Indexed ${this.documentCount} chunks with FAISS + BM25 (commit ${currentCommit.slice(0, 7)})`);
+        this.log(`  ✓ Indexed ${this.documentCount} chunks with FAISS + BM25 (commit ${currentCommit.slice(0, 7)})`);
         return;
       }
     }
@@ -903,11 +969,12 @@ export class RAGSystem {
     );
 
     // Build BM25 index even in fallback mode
-    console.log('  Building BM25 index...');
+    this.log('  Building BM25 index...');
     this.buildBM25Index();
 
     // Save index state with commit hash (even in fallback mode)
     this.indexState = {
+      ...sourceIdentity,
       commitHash: currentCommit,
       indexedAt: new Date().toISOString(),
       fileCount: files.length,
@@ -919,14 +986,22 @@ export class RAGSystem {
     fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
     this.documentCount = chunksToIndex.length;
-    console.log(`  ✓ Indexed ${this.documentCount} chunks (keyword search mode, commit ${currentCommit.slice(0, 7)})`);
+    this.log(`  ✓ Indexed ${this.documentCount} chunks (keyword search mode, commit ${currentCommit.slice(0, 7)})`);
   }
 
   /**
    * Discover all indexable files in the repository
    */
-  private async discoverFiles(): Promise<string[]> {
+  private async discoverFiles(logProgress = true): Promise<string[]> {
     const files: string[] = [];
+    const excludedRoots = [this.config.storePath, getRuntimePaths().homeDir];
+    // Generated wiki output may live inside its source checkout. Do not index it
+    // back into itself, including the exported knowledge concepts and site.
+    if (path.basename(this.config.storePath) === '.semanticwiki-cache') excludedRoots.push(path.dirname(this.config.storePath));
+    const dynamicExcludes = excludedRoots.flatMap(root => {
+      const relative = path.relative(path.resolve(this.config.repoPath), path.resolve(root)).replace(/\\/g, '/');
+      return relative && relative !== '..' && !relative.startsWith('../') && !path.isAbsolute(relative) ? [`${relative}/**`] : [];
+    });
 
     // Process extensions one at a time with event loop yields
     for (let i = 0; i < INDEXABLE_EXTENSIONS.length; i++) {
@@ -938,21 +1013,23 @@ export class RAGSystem {
       try {
         const matches = await glob(`**/*${ext}`, {
           cwd: this.config.repoPath,
-          ignore: EXCLUDE_PATTERNS,
-          absolute: false
+          ignore: [...EXCLUDE_PATTERNS, ...dynamicExcludes],
+          absolute: false,
+          nodir: true,
+          follow: false,
         });
-        files.push(...matches);
+        files.push(...matches.filter(file => fs.lstatSync(path.join(this.config.repoPath, file)).isFile()));
 
         // Show progress for large repos
-        if (matches.length > 0) {
-          console.log(`    Found ${matches.length} ${ext} files`);
+        if (logProgress && matches.length > 0) {
+          this.log(`    Found ${matches.length} ${ext} files`);
         }
       } catch (err) {
         // Skip on error, continue with other extensions
       }
     }
 
-    return [...new Set(files)];  // Remove duplicates
+    return [...new Set(files)].sort();
   }
 
   /**
@@ -1096,10 +1173,10 @@ export class RAGSystem {
 
       const processed = Math.min(i + batchSize, chunks.length);
       const percent = Math.floor(processed / chunks.length * 100);
-      console.log(`  Embedding... ${processed}/${chunks.length} (${percent}%)`);
+      this.log(`  Embedding... ${processed}/${chunks.length} (${percent}%)`);
     }
 
-    console.log(`  Embedding complete: ${embeddings.length} vectors generated`);
+    this.log(`  Embedding complete: ${embeddings.length} vectors generated`);
     return embeddings;
   }
 
@@ -1425,7 +1502,7 @@ export class RAGSystem {
     const batchStatePath = path.join(this.config.storePath, `batch-${batchNumber}-state.json`);
 
     // Discover all files and chunks
-    console.log(`  [Batch ${batchNumber}] Discovering files...`);
+    this.log(`  [Batch ${batchNumber}] Discovering files...`);
     const files = await this.discoverFiles();
 
     // Chunk all files
@@ -1457,11 +1534,13 @@ export class RAGSystem {
 
     // Get chunks for this batch
     const batchChunks = allChunks.slice(batchStart, batchEnd);
-    console.log(`  [Batch ${batchNumber}] Processing chunks ${batchStart + 1}-${batchEnd} of ${totalChunks}`);
+    this.log(`  [Batch ${batchNumber}] Processing chunks ${batchStart + 1}-${batchEnd} of ${totalChunks}`);
 
     // Generate embeddings for batch (validates chunks are processable)
-    console.log(`  [Batch ${batchNumber}] Generating embeddings for ${batchChunks.length} chunks...`);
-    await this.generateEmbeddings(batchChunks);
+    if (faiss) {
+      this.log(`  [Batch ${batchNumber}] Generating embeddings for ${batchChunks.length} chunks...`);
+      await this.generateEmbeddings(batchChunks);
+    }
 
     // Store metadata for this batch (append to main metadata)
     const mainMetaPath = path.join(this.config.storePath, 'metadata.json');
@@ -1495,7 +1574,7 @@ export class RAGSystem {
     this.metadata = new Map(Object.entries(existingMeta).map(([k, v]) => [parseInt(k), v as StoredMetadata]));
     this.documentCount = this.metadata.size;
 
-    console.log(`  [Batch ${batchNumber}] ✓ Indexed ${batchChunks.length} chunks (total: ${this.documentCount})`);
+    this.log(`  [Batch ${batchNumber}] ✓ Indexed ${batchChunks.length} chunks (total: ${this.documentCount})`);
 
     return {
       totalChunks,
@@ -1511,7 +1590,7 @@ export class RAGSystem {
    * Load metadata only (for batched mode - metadata was already saved during batches)
    * This avoids regenerating embeddings which is expensive and was causing the issue.
    */
-  async loadMetadataOnly(): Promise<void> {
+  async loadMetadataOnly(options: { migrateEmbeddings?: boolean } = {}): Promise<void> {
     const mainMetaPath = path.join(this.config.storePath, 'metadata.json');
     const cachedIndexPath = path.join(this.config.storePath, 'index.faiss');
     const bm25IndexPath = path.join(this.config.storePath, 'bm25-index.json');
@@ -1534,25 +1613,32 @@ export class RAGSystem {
     // Try to load FAISS index if it exists
     if (fs.existsSync(cachedIndexPath) && faiss) {
       if (!this.isIndexCompatible(this.indexState)) {
-        console.log(`  Migrating cached embeddings to ${this.embeddingModelName}...`);
-        await this.finalizeIndex();
-        return;
-      }
-      try {
-        this.index = faiss.IndexFlatIP.read(cachedIndexPath);
-        this.embeddingDimension = this.index.getDimension();
-        if (this.usesEmbeddingGemma() && this.embeddingDimension !== 768) {
-          throw new Error('Cached EmbeddingGemma index has an invalid dimension.');
+        if (options.migrateEmbeddings !== false) {
+          this.log(`  Migrating cached embeddings to ${this.embeddingModelName}...`);
+          await this.finalizeIndex();
+          return;
         }
-        console.log(`  Loaded FAISS index with ${this.documentCount} chunks`);
-      } catch (e) {
-        console.warn(`  Could not load FAISS index, rebuilding: ${e}`);
-        this.index = null;
-        await this.finalizeIndex();
-        return;
+        this.log('  Cached embeddings need a rebuild; using existing keyword metadata.');
+      } else {
+        try {
+          this.index = faiss.IndexFlatIP.read(cachedIndexPath);
+          this.embeddingDimension = this.index.getDimension();
+          if (this.usesEmbeddingGemma() && this.embeddingDimension !== 768) {
+            throw new Error('Cached EmbeddingGemma index has an invalid dimension.');
+          }
+          this.log(`  Loaded FAISS index with ${this.documentCount} chunks`);
+        } catch (e) {
+          this.index = null;
+          if (options.migrateEmbeddings !== false) {
+            console.warn(`  Could not load FAISS index, rebuilding: ${e}`);
+            await this.finalizeIndex();
+            return;
+          }
+          this.log('  Cached vectors could not be read; using existing keyword metadata.');
+        }
       }
     } else {
-      console.log(`  Loaded ${this.documentCount} chunks (keyword search mode)`);
+      this.log(`  Loaded ${this.documentCount} chunks (keyword search mode)`);
     }
 
     // Load or build BM25 index
@@ -1571,7 +1657,7 @@ export class RAGSystem {
             avgDocLength: bm25Data.avgDocLength,
             docCount: bm25Data.docCount
           };
-          console.log('  ✓ Loaded BM25 index');
+          this.log('  ✓ Loaded BM25 index');
         } catch {
           this.buildBM25Index();
         }
@@ -1599,10 +1685,10 @@ export class RAGSystem {
     this.metadata = new Map(Object.entries(metaData).map(([k, v]) => [parseInt(k), v as StoredMetadata]));
     this.documentCount = this.metadata.size;
 
-    console.log(`  Finalizing index with ${this.documentCount} chunks...`);
+    this.log(`  Finalizing index with ${this.documentCount} chunks...`);
 
     // Build BM25 index
-    console.log('  Building BM25 index...');
+    this.log('  Building BM25 index...');
     this.buildBM25Index();
     if (this.bm25Index) {
       const bm25Data = {
@@ -1624,13 +1710,13 @@ export class RAGSystem {
     }
 
     if (!faiss || this.documentCount === 0) {
-      console.log('  Using keyword search mode (FAISS not available or no chunks)');
+      this.log('  Using keyword search mode (FAISS not available or no chunks)');
       return;
     }
 
     // Regenerate embeddings for FAISS index
     const chunks = Array.from(this.metadata.values());
-    console.log(`  Generating embeddings for final index...`);
+    this.log(`  Generating embeddings for final index...`);
     this.embeddingDimension = this.usesEmbeddingGemma() ? 768 : null;
     const embeddings = await this.generateEmbeddings(chunks);
 
@@ -1649,6 +1735,7 @@ export class RAGSystem {
 
       const currentCommit = this.indexState?.commitHash ?? await this.getCurrentCommitHash();
       this.indexState = {
+        ...this.indexState,
         commitHash: currentCommit,
         indexedAt: new Date().toISOString(),
         fileCount: new Set(chunks.map(c => c.filePath)).size,
@@ -1659,7 +1746,7 @@ export class RAGSystem {
       };
       fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
-      console.log(`  ✓ Finalized FAISS + BM25 index with ${this.documentCount} chunks`);
+      this.log(`  ✓ Finalized FAISS + BM25 index with ${this.documentCount} chunks`);
     } catch (err) {
       this.index = null;
       if (fs.existsSync(cachedIndexPath)) {
@@ -1700,7 +1787,7 @@ export class RAGSystem {
       changedFiles.map(f => f.replace(/^\.\//, ''))
     );
 
-    console.log(`  Updating index for ${normalizedChangedFiles.size} changed files...`);
+    this.log(`  Updating index for ${normalizedChangedFiles.size} changed files...`);
 
     // Find chunks to remove (from changed files)
     const chunksToRemove = new Set<number>();
@@ -1715,7 +1802,7 @@ export class RAGSystem {
       }
     }
 
-    console.log(`  Found ${chunksToRemove.size} chunks to update from changed files`);
+    this.log(`  Found ${chunksToRemove.size} chunks to update from changed files`);
 
     // Re-chunk the changed files
     const newChunks: CodeChunk[] = [];
@@ -1726,7 +1813,7 @@ export class RAGSystem {
 
       // Skip files that no longer exist (deleted files)
       if (!fs.existsSync(fullPath)) {
-        console.log(`    Skipping deleted file: ${filePath}`);
+        this.log(`    Skipping deleted file: ${filePath}`);
         continue;
       }
 
@@ -1734,13 +1821,13 @@ export class RAGSystem {
         const fileChunks = await this.chunkFile(filePath);
         newChunks.push(...fileChunks);
         filesProcessed++;
-        console.log(`    Chunked ${filePath}: ${fileChunks.length} chunks`);
+        this.log(`    Chunked ${filePath}: ${fileChunks.length} chunks`);
       } catch (err) {
         console.warn(`    Failed to chunk ${filePath}: ${err}`);
       }
     }
 
-    console.log(`  Generated ${newChunks.length} new chunks from ${filesProcessed} files`);
+    this.log(`  Generated ${newChunks.length} new chunks from ${filesProcessed} files`);
 
     // Combine unchanged chunks with new chunks
     const allChunks: CodeChunk[] = [
@@ -1767,22 +1854,37 @@ export class RAGSystem {
 
     if (allChunks.length === 0) {
       console.warn('No chunks to index after update');
+      this.metadata.clear();
+      this.index = null;
+      this.documentCount = 0;
+      this.buildBM25Index();
+      fs.writeFileSync(cachedMetaPath, '{}', 'utf8');
+      for (const obsolete of [cachedIndexPath, bm25IndexPath]) {
+        if (fs.existsSync(obsolete)) fs.unlinkSync(obsolete);
+      }
+      const currentCommit = await this.getCurrentCommitHash();
+      this.indexState = {
+        commitHash: currentCommit, indexedAt: new Date().toISOString(),
+        fileCount: 0, chunkCount: 0, embeddingModel: this.embeddingModelName,
+        embeddingDimension: this.embeddingDimension ?? undefined, hasHybridIndex: false,
+      };
+      fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf8');
       return {
         filesUpdated: filesProcessed,
         chunksRemoved: chunksToRemove.size,
         chunksAdded: 0,
-        newCommitHash: await this.getCurrentCommitHash()
+        newCommitHash: currentCommit
       };
     }
 
     // Generate embeddings for ALL chunks (we need to rebuild the FAISS index)
     // This is because FAISS doesn't support in-place updates
-    console.log(`  Regenerating embeddings for ${allChunks.length} total chunks...`);
-    const embeddings = await this.generateEmbeddings(allChunks);
+    if (faiss) this.log(`  Regenerating embeddings for ${allChunks.length} total chunks...`);
+    const embeddings = faiss ? await this.generateEmbeddings(allChunks) : [];
     this.index = null;
 
     // Rebuild FAISS index
-    console.log(`  Rebuilding search index...`);
+    this.log(`  Rebuilding search index...`);
     if (faiss && embeddings.length > 0) {
       const actualDimension = embeddings[0].length;
       if (actualDimension !== this.embeddingDimension) {
@@ -1832,7 +1934,7 @@ export class RAGSystem {
         );
 
         // Rebuild BM25 index
-        console.log('  Rebuilding BM25 index...');
+        this.log('  Rebuilding BM25 index...');
         this.buildBM25Index();
         if (this.bm25Index) {
           const bm25Data = {
@@ -1869,7 +1971,7 @@ export class RAGSystem {
         fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
         this.documentCount = allChunks.length;
-        console.log(`  ✓ Updated index: ${this.documentCount} chunks (commit ${currentCommit.slice(0, 7)})`);
+        this.log(`  ✓ Updated index: ${this.documentCount} chunks (commit ${currentCommit.slice(0, 7)})`);
 
         return {
           filesUpdated: filesProcessed,
@@ -1931,7 +2033,7 @@ export class RAGSystem {
     fs.writeFileSync(indexStatePath, JSON.stringify(this.indexState, null, 2), 'utf-8');
 
     this.documentCount = allChunks.length;
-    console.log(`  ✓ Updated index: ${this.documentCount} chunks (keyword mode, commit ${currentCommit.slice(0, 7)})`);
+    this.log(`  ✓ Updated index: ${this.documentCount} chunks (keyword mode, commit ${currentCommit.slice(0, 7)})`);
 
     return {
       filesUpdated: filesProcessed,

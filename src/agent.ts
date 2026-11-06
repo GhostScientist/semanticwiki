@@ -1,3 +1,4 @@
+import { DEFAULT_ANTHROPIC_MODEL } from './llm/defaults.js';
 import { query, tool, createSdkMcpServer, type Query } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { FileOperations } from './tools/file-operations.js';
@@ -108,7 +109,7 @@ export class DevelopmentAgentAgent {
     const externalMcpServers = await this.loadExternalMcpServers();
 
     const options: any = {
-      model: 'claude-sonnet-5',
+      model: DEFAULT_ANTHROPIC_MODEL,
       cwd: process.cwd(),
       systemPrompt,
       mcpServers: {

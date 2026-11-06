@@ -312,7 +312,7 @@ describe('Keyword Search Fallback', () => {
   });
 
   it('should weight heading matches', () => {
-    expect(scripts).toContain('page.headings.some');
+    expect(scripts).toContain('headings.includes(term)');
     expect(scripts).toContain('score += 2');
   });
 

@@ -1,3 +1,4 @@
+import { DEFAULT_ANTHROPIC_MODEL } from '../llm/defaults.js';
 /**
  * Contextual Retrieval for SemanticWiki
  *
@@ -94,7 +95,7 @@ export class ContextualRetrieval {
       useLocal: config.useLocal ?? false,
       useOllama: config.useOllama ?? false,
       apiKey: config.apiKey ?? process.env.ANTHROPIC_API_KEY ?? '',
-      model: config.model ?? 'claude-3-haiku-20240307',
+      model: config.model ?? DEFAULT_ANTHROPIC_MODEL,
       ollamaHost: config.ollamaHost ?? 'http://localhost:11434',
       localModel: config.localModel ?? 'qwen2.5-coder:7b',
       modelFamily: config.modelFamily ?? 'gpt-oss',
