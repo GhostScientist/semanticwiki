@@ -46,11 +46,11 @@
     "access": "public"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.252",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.316",
     "@anthropic-ai/sdk": "^0.122.0",
     "@huggingface/transformers": "^4.3.1",
     "@modelcontextprotocol/server-filesystem": "^2026.8.31",
-    "axios": "^1.20.0",
+    "axios": "^1.21.0",
     "chalk": "^5.3.0",
     "cheerio": "^1.2.0",
     "commander": "^12.0.0",
@@ -59,17 +59,21 @@
     "gray-matter": "^4.0.3",
     "inquirer": "^9.2.12",
     "inquirer-autocomplete-prompt": "^3.0.1",
-    "marked": "^18.0.11",
-    "node-llama-cpp": "^3.20.0",
-    "ollama": "^0.6.3",
+    "marked": "^18.1.2",
+    "node-llama-cpp": "^3.22.2",
+    "ollama": "^0.6.4",
     "ora": "^9.4.1",
-    "simple-git": "^3.36.0"
+    "simple-git": "^3.36.0",
+    "@modelcontextprotocol/sdk": "^1.29.0"
   },
   "devDependencies": {
     "@types/inquirer": "^9.0.10",
     "@types/node": "^22.19.1",
-    "@vitest/coverage-v8": "^4.1.11",
+    "@vitest/coverage-v8": "^5.0.0",
     "typescript": "^5.9.3",
     "vitest": "^5.0.0"
+  },
+  "optionalDependencies": {
+    "faiss-node": "^0.5.1"
   }
 }
