@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { marked } from 'marked';
+import type { Marked } from 'marked';
 import { SiteGenerator } from '../src/site-generator.js';
 
 /**
@@ -8,14 +8,15 @@ import { SiteGenerator } from '../src/site-generator.js';
  * generated site the way the v12 -> v18 signature change did.
  */
 describe('SiteGenerator markdown renderers', () => {
-  const render = (md: string) => marked.parse(md) as string;
+  let markdown: Marked;
+  const render = (md: string) => markdown.parse(md) as string;
 
   beforeAll(() => {
     const generator = new SiteGenerator({
       wikiDir: '/tmp/semanticwiki-test-wiki',
       outputDir: '/tmp/semanticwiki-test-site'
     });
-    (generator as unknown as { configureMarked(): void }).configureMarked();
+    markdown = (generator as unknown as { markdown: Marked }).markdown;
   });
 
   it('renders code blocks with a language label and copy button', () => {

@@ -81,7 +81,7 @@ The API provides the following endpoints:
   });
 
   describe('aiChat Feature Flag', () => {
-    it('should enable aiChat by default', () => {
+    it('should keep aiChat opt-in by default', () => {
       const generator = new SiteGenerator({
         wikiDir: testWikiDir,
         outputDir: testOutputDir
@@ -89,7 +89,7 @@ The API provides the following endpoints:
 
       // Access private options through any
       const options = (generator as any).options;
-      expect(options.features.aiChat).toBe(true);
+      expect(options.features.aiChat).toBe(false);
     });
 
     it('should respect aiChat: false option', () => {
@@ -296,7 +296,7 @@ const code = 'block';
         search: true,
         progressTracking: true,
         keyboardNav: true,
-        aiChat: true
+        aiChat: false
       });
     });
 

@@ -1,93 +1,38 @@
-# AGENTS.md
+# Working on SemanticWiki
 
-Guidance for AI coding agents working in this repository.
+SemanticWiki generates, verifies, searches and publishes source-linked codebase wikis. Documentation maintenance is the primary product. The older coding assistant is retained behind an explicit query / interactive mode.
 
-## Project Overview
+## Development
 
-SemanticWiki is an AI-powered CLI (published to npm as `semanticwiki`) that generates architectural documentation wikis with source traceability (`file:line` references), and doubles as an agentic coding assistant. Built on the Claude Agent SDK with a local RAG system for semantic code search.
-
-## Commands
+Use Node 24+ and TypeScript ESM imports with `.js` suffixes. The compiler is plain `tsc`; no bundler or linter is configured.
 
 ```bash
-npm run build          # Compile TypeScript to dist/ (tsc)
-npm run dev            # Watch mode compilation
-npm test               # Run all tests (vitest run)
-npm run test:watch     # Vitest watch mode
-npm run test:coverage  # Tests with v8 coverage
-
-# Run a single test file
-npx vitest run tests/chat-scripts.test.ts
-
-# Run tests matching a name
-npx vitest run -t "codemap"
-
-# Run the CLI locally (build first — entry point is dist/cli.js)
-npm start -- generate -r ./some-project --verbose
+npm ci --ignore-scripts
+npm run check          # build, tests, isolated compiled-CLI contracts
+npm run test:coverage
+npm pack --dry-run --ignore-scripts
 ```
 
-There is no linter configured. Tests live in `tests/` and have a 30s timeout (some load ML models). `scripts/release.sh` handles version bump + publish.
-
-## CI
-
-`.github/workflows/ci.yml` runs on every push to `master` and every pull request:
-
-- **build-and-test** — `npm ci --ignore-scripts`, then `npm run build` and `npm test`, on Node 20.19 and 22.x. Install scripts are skipped because the native dependencies (`faiss-node`, `node-llama-cpp`, `onnxruntime-node`, `sharp`) download large prebuilt binaries that neither `tsc` nor the test suite needs.
-- **audit** — `npm audit --audit-level=critical`. The gate is set to `critical`, not `high`, because `@huggingface/transformers` pins `sharp@^0.34`, which carries an unfixed libvips advisory (GHSA-f88m-g3jw-g9cj). SemanticWiki only uses transformers for text embeddings and never decodes images.
-
-`.github/dependabot.yml` opens grouped weekly npm and Actions update PRs. Majors that need real code changes (`commander`, `chalk`, `inquirer`, `typescript`, `@huggingface/transformers`) are ignored there and upgraded deliberately.
+CI covers Node 24 and 26, package contents and a high/critical dependency audit. Default tests use fixture data, fake providers and in-memory MCP transports; they must not require secrets or large model downloads. Native/live checks are separate and documented in CONTRIBUTING.md.
 
 ## Architecture
 
-TypeScript ESM project (`"type": "module"`, Node >= 20.19). Local imports must use `.js` extensions (e.g. `import { RAGSystem } from './rag/index.js'`). Compiled with plain `tsc`, no bundler. CommonJS-only deps (e.g. `faiss-node`) are loaded via `createRequire(import.meta.url)`.
+- `src/cli.ts`: command routing and wiki workflow. `cli-options.ts` resolves explicit provider choices and legacy aliases before side effects. `cli-management.ts` registers diagnostics, model preparation and export commands.
+- `src/wiki-agent.ts`: source retrieval, generation, repair and structural verification. Direct Anthropic/OpenAI and local providers share a tool abstraction; local initial generation uses page-by-page planning. Always consume error events as failures and release providers in `finally`.
+- `src/llm/`: cloud/local/Ollama implementations. Use `assistantMessageFromResponse` to preserve complete thinking, tool and Responses continuation state. Defaults are centralized in `defaults.ts`; never silently substitute another provider/model.
+- `src/runtime-paths.ts`: shared weights, embedding downloads and repository clones. Paths default under `~/.semanticwiki`, never the caller's repository. `SEMANTICWIKI_HOME` and `SEMANTICWIKI_MODELS_DIR` overrides must be absolute. Per-wiki code indexes remain portable under `<wiki>/.semanticwiki-cache`.
+- `src/rag/`: EmbeddingGemma 2 via Transformers.js, AST chunking, contextual enrichment, FAISS and BM25. Model and source provenance determine cache compatibility. Keyword search must not download embedding weights.
+- `src/discovery/`: heuristic source/domain discovery. Do not treat language constructs or generic entities as evidence of business functionality; retain unmatched source files under a neutral category.
+- `src/wiki-catalog.ts`: common Markdown discovery, heading IDs, links and metadata for agents. Exclude `knowledge/`, `site/`, hidden paths, dependencies and symlinks from human page discovery.
+- `src/knowledge-export.ts`: OKF 0.2 catalog. Preserve human pages and existing trust metadata; do not manufacture verification. Maintain managed-file ownership and protect unrelated content.
+- `src/mcp-wiki-server.ts`: read-only stdio MCP. Keep protocol stdout clean; diagnostics go to stderr. Provide bounded reads, discovery, structured search and related-page navigation.
+- `src/site-generator.ts` and `src/site/`: generated reader. Use a per-instance Marked renderer, sanitize Markdown/inline config, and use page-relative URLs so file access and arbitrary hosted subpaths work. AI chat remains opt-in.
+- `src/package-format.ts`: portable `.semantics` package, with legacy `.archiwiki` reading. Preserve knowledge manifest/ownership, llms.txt and per-wiki retrieval cache on roundtrip. Never include shared model weights or credentials.
+- `src/safe-path.ts`: contain model-provided source and output paths; guard traversal and symlinks.
+- `src/agent.ts`, `permissions.ts`, `planner.ts`, `workflows.ts`: legacy coding-assistant surface.
 
-### Entry point and commands
+## Changes and evidence
 
-`src/cli.ts` (commander) defines all commands: `generate`, `continue`, `update-docs`, `update-embeddings`, `update-wiki`, `verify`, `search`, `mcp-server`, `pack`, `unpack`, `config`, plus a default argument form (`semanticwiki "query"` / `-i`) that runs the general coding assistant.
+Preserve existing command aliases. Add behavioral regression coverage for provider roundtrips, failure/cancellation, path boundaries, export compatibility and CLI machine output. Test an actual generated site, not just source-template strings. Check fixture sites in a browser when navigation or layout changes.
 
-### Two agents
-
-- **`ArchitecturalWikiAgent`** (`src/wiki-agent.ts`, the core of the project) — generates the wiki. Indexes the repo with the RAG system, then runs an agentic loop with custom MCP tools (semantic search, file read, wiki page write). System prompt lives in `src/prompts/wiki-system.ts`. Includes a verification loop (`continue`/`verify` commands) that checks wiki links and generates missing pages, and an `updateContext` path for surgical wiki updates when code changes.
-- **`DevelopmentAgentAgent`** (`src/agent.ts`) — general-purpose coding assistant with file/command tools, gated by `PermissionManager` (`src/permissions.ts`). Loads the target repo's own CLAUDE.md/skills/commands via `src/claude-config.ts`.
-
-### Three execution modes for generation
-
-The wiki agent branches on options in `WikiGenerationOptions`:
-
-1. **Default** — Claude Agent SDK `query()` (spawns Claude Code subprocess, uses its billing).
-2. **`--direct-api`** — hand-rolled tool-use loop against the Anthropic API via the LLM provider layer (uses `ANTHROPIC_API_KEY` credits directly).
-3. **`--full-local`** — same loop, but with a local model; no API key required.
-
-Modes 2 and 3 share the same code path (`generateWithDirectAPI` in `wiki-agent.ts`) via the provider abstraction.
-
-### LLM provider layer (`src/llm/`)
-
-`createLLMProvider()` in `src/llm/index.ts` is the factory. Implementations of the `LLMProvider` interface (`types.ts`):
-
-- `AnthropicProvider` — cloud Claude API, default model `claude-sonnet-5`
-- `LocalLlamaProvider` — bundled inference via node-llama-cpp (GGUF models, gpt-oss family)
-- `OllamaProvider` — external Ollama server
-
-`ModelManager` (`model-manager.ts`) handles hardware detection, model recommendation, and GGUF downloads.
-
-### RAG system (`src/rag/index.ts` + `src/ast-chunker.ts`)
-
-Powers both wiki generation and the `search`/`mcp-server` commands:
-
-- AST-aware chunking (`ASTChunker`) at logical code boundaries with business-domain hints
-- BGE-small-en-v1.5 embeddings via `@huggingface/transformers`, cached in `./.semanticwiki-models`
-- FAISS (`IndexFlatIP`) vector search with a JS fallback when faiss-node is unavailable
-- Hybrid search: BM25 + vector similarity fused with Reciprocal Rank Fusion; optional cross-encoder reranking
-- Incremental indexing (only re-embeds changed files) and chunk prioritization for large repos (`--max-chunks`, `--batch-size`)
-
-### Static site generator (`src/site-generator.ts` + `src/site/`)
-
-Converts the markdown wiki into a self-contained interactive site. The entire site's HTML/CSS/JS is embedded as template strings in `src/site/templates.ts`, `styles.ts`, and `scripts.ts` — editing the generated site means editing these TS files. The `--ai-chat` feature runs SmolLM2 client-side in the browser via transformers.js; most tests in `tests/` cover this site/chat generation.
-
-`configureMarked()` overrides marked's `code`, `heading`, `link`, `image`, and `blockquote` renderers. These use marked's object-argument API (v13+) and are declared as `function` expressions — not arrows — so `this` stays bound to the renderer and `this.parser` is available for rendering child tokens; the enclosing class is reached through the `self` alias. `tests/site-generator-markdown.test.ts` pins the emitted HTML so a future marked upgrade cannot silently break it.
-
-### Supporting modules
-
-- `src/mcp-wiki-server.ts` — stdio MCP server exposing wiki search/Q&A tools to Claude Desktop/Claude Code
-- `src/mcp-config.ts` — loads external MCP servers for the agents to use
-- `src/package-format.ts` — `.archiwiki` pack/unpack format (wiki + RAG index)
-- `src/planner.ts` / `src/workflows.ts` — plan mode and declarative multi-step workflows for the assistant
+`verify` proves structural link completeness, not factual correctness. Keep claims in docs and status output within what was tested. Historical plans under `docs/plans/` are context, not implemented capabilities. See docs/LAUNCH_BASELINE.md for the consolidation decisions and remaining launch checks.

@@ -33,6 +33,7 @@ audit.log
 
 # Agent config directory (may contain cached API keys)
 .semanticwiki/
+.semanticwiki-models/
 
 # npm
 *.tgz
@@ -43,3 +44,10 @@ audit.log
 
 # Claude Code local settings
 .claude/
+
+# Runtime artifacts and launch checks
+*.gguf
+*.gguf.partial*
+.semanticwiki-repos/
+coverage/
+.firecrawl/

@@ -2,6 +2,37 @@
 
 All notable changes to semanticwiki will be documented in this file.
 
+## [2.0.0] - 2026-11-06
+
+Launch baseline (prepared in source; publication is a separate release step).
+
+### Changed
+- Consolidate outstanding wiki discovery, contextual retrieval, EmbeddingGemma, dependency and planning branches while preserving uncommitted improvements.
+- Require Node 24+. Update native inference and vulnerable dependencies; CI targets Node 24 and 26.
+- Use explicit `--provider anthropic|openai|local|ollama|claude-code`, defaulting to direct Anthropic API. Retain `--direct-api` and `--full-local` aliases.
+- Default to current Claude Sonnet and OpenAI Responses models, and SemanticWiki Coder 7B v2 Q4_K_M locally.
+- Keep shared weights, embedding downloads and remote checkouts under the user SemanticWiki directory. Leave old repository caches untouched.
+- Generate the static site inside `<wiki>/site`; make links and text search portable across local files and hosted subpaths.
+- Make browser AI chat opt-in and return failure for empty/incomplete generation.
+- Use `.semantics` for new packages while continuing to read legacy packages.
+
+### Added
+- `doctor`, `models list|prepare|verify`, `preview`, `export`, and structured `search --json`.
+- OpenAI Responses tool-use with preserved reasoning continuation; updated Claude handling and complete local/Ollama conversation history.
+- Pinned local model revision, SHA-256 verification, partial-file downloads and atomic promotion.
+- OKF 0.2 export with typed concept pages, directory indexes, manifest and `llms.txt`; bounded, structured MCP page/section queries and navigation.
+- Markdown download/copy, previous/next navigation, agent export entry, accessible search and refreshed site layouts.
+- Provider, runtime, generation lifecycle, CLI, export/package and MCP protocol regression tests.
+
+### Fixed
+- Local context sequence exhaustion and provider cleanup on failure/cancellation.
+- Model weights and embedding downloads appearing in the caller's repository.
+- Source/Markdown path traversal and unsafe generated HTML/config handling.
+- Incorrect success output after provider errors or turn exhaustion, missing metadata fields during page writes, and generated-copy duplication during verification.
+- Token-limited native pages being accepted as complete; source discovery confusing ordinary task entities and the TypeScript `export` keyword with batch/reporting domains.
+
+See [migration and consolidation notes](docs/LAUNCH_BASELINE.md).
+
 ## [1.5.0] - 2026-09-01
 
 Maintenance release that re-baselines the repository: CI, current dependencies, and a
@@ -98,7 +129,7 @@ Model Context Protocol server for AI assistant integration:
 
 #### Portable Package Format (`semanticwiki pack/unpack`)
 Bundle wikis with RAG indexes for sharing:
-- `.archiwiki` compressed format with manifest
+- `.semantics` compressed format with manifest
 - Includes wiki content + embeddings + BM25 index
 - Extract wiki-only or full package
 

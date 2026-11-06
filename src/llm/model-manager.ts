@@ -1,482 +1,244 @@
-/**
- * Model Manager
- *
- * Handles hardware detection, model selection, and model downloads
- * for the local LLM provider.
- */
+/** Shared, verified GGUF downloads and hardware-aware local model selection. */
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, rename, rm } from 'node:fs/promises';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { getRuntimePaths } from '../runtime-paths.js';
+import { DEFAULT_LOCAL_MODEL_ID } from './defaults.js';
+import type { HardwareProfile, ModelRecommendation, ModelFamily, ProgressCallback } from './types.js';
+export type { ModelFamily } from './types.js';
 
-import * as fs from 'fs';
-import * as path from 'path';
-import * as os from 'os';
-import { createWriteStream } from 'fs';
-import { mkdir } from 'fs/promises';
-import { Transform, Readable } from 'stream';
-import { pipeline } from 'stream/promises';
-import type { HardwareProfile, ModelRecommendation, ProgressCallback } from './types.js';
+interface ModelRegistryEntry extends ModelRecommendation { family: ModelFamily; }
 
-/**
- * Model family type for filtering models
- */
-export type ModelFamily = 'gpt-oss';
-
-/**
- * Extended model recommendation with family
- */
-interface ModelRegistryEntry extends ModelRecommendation {
-  family: ModelFamily;
-}
-
-/**
- * Registry of available models with their hardware requirements
- */
 const MODEL_REGISTRY: ModelRegistryEntry[] = [
-  // GPT-OSS 20B fine-tuned for architectural wiki (SemanticWiki)
+  {
+    family: 'semanticwiki',
+    modelId: DEFAULT_LOCAL_MODEL_ID,
+    ggufFile: 'semanticwiki-coder-7b-v2-q4_k_m.gguf',
+    downloadUrl: 'https://huggingface.co/GhostScientist/semanticwiki-coder-7b-v2-gguf/resolve/e04e873741f29e5d8b80adf5d1dc6f3f848f6c00/semanticwiki-coder-7b-v2-q4_k_m.gguf',
+    fileSizeBytes: 4_683_073_920,
+    sha256: '333f4285f6af58d97bfaec3d22b27922b2993d9d54f1f24ea38e6d5358b60393',
+    minVram: 6,
+    minRam: 8,
+    contextLength: 32768,
+    quality: 'excellent',
+  },
+  // Retained for explicit selection and existing installations.
   {
     family: 'gpt-oss',
     modelId: 'gpt-oss-20b-semanticwiki-q8',
     ggufFile: 'gpt-oss-20b-semanticwiki-q8_0.gguf',
-    downloadUrl:
-      'https://huggingface.co/GhostScientist/gpt-oss-20b-semanticwiki-gguf/resolve/main/gpt-oss-20b-semanticwiki-q8_0.gguf',
-    fileSizeBytes: 22_300_000_000, // ~22.3 GB
+    downloadUrl: 'https://huggingface.co/GhostScientist/gpt-oss-20b-semanticwiki-gguf/resolve/main/gpt-oss-20b-semanticwiki-q8_0.gguf',
+    fileSizeBytes: 22_261_912_096,
+    sha256: 'd424387c4a6aca14f0124942a4436c879e47c2ed42ae14602e02b11040461a52',
     minVram: 24,
     minRam: 32,
     contextLength: 32768,
     quality: 'excellent',
   },
+  {
+    family: 'completion',
+    modelId: 'qwen2.5-coder-1.5b-q8',
+    ggufFile: 'qwen2.5-coder-1.5b-instruct-q8_0.gguf',
+    downloadUrl: 'https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/qwen2.5-coder-1.5b-instruct-q8_0.gguf',
+    fileSizeBytes: 1_894_532_160,
+    sha256: '507de59046601282ba768a9789900e6ccf60ed93ddf346730b7c68eb0715bc47',
+    minVram: 2,
+    minRam: 4,
+    contextLength: 32768,
+    quality: 'good',
+  },
 ];
 
 export class ModelManager {
-  private modelsDir: string;
+  private readonly modelsDir: string;
   private progressCallback?: ProgressCallback;
+  private readonly downloads = new Map<string, Promise<string>>();
 
-  constructor() {
-    this.modelsDir = path.join(os.homedir(), '.semanticwiki', 'models');
+  constructor(options: { modelsDir?: string } = {}) {
+    this.modelsDir = options.modelsDir ? path.resolve(options.modelsDir) : getRuntimePaths().modelsDir;
   }
 
-  /**
-   * Set a callback for progress updates
-   */
-  setProgressCallback(callback: ProgressCallback): void {
-    this.progressCallback = callback;
-  }
+  setProgressCallback(callback: ProgressCallback): void { this.progressCallback = callback; }
+  getModelsDir(): string { return this.modelsDir; }
 
-  /**
-   * Get the models directory path
-   */
-  getModelsDir(): string {
-    return this.modelsDir;
-  }
-
-  /**
-   * Detect hardware capabilities
-   */
   async detectHardware(): Promise<HardwareProfile> {
-    const systemRam = os.totalmem() / 1024 ** 3;
-    const cpuCores = os.cpus().length;
-    const cpuModel = os.cpus()[0]?.model || 'Unknown';
-
-    // Try to detect GPU using node-llama-cpp if available
-    let gpuVendor: HardwareProfile['gpuVendor'] = 'none';
-    let gpuVram = 0;
-    let gpuName: string | undefined;
-
+    const hardware: HardwareProfile = {
+      systemRam: os.totalmem() / 1024 ** 3,
+      cpuCores: os.cpus().length,
+      cpuModel: os.cpus()[0]?.model ?? 'Unknown',
+      gpuVendor: 'none', gpuVram: 0,
+    };
     try {
-      // Dynamic import to avoid hard dependency
       const { getLlama } = await import('node-llama-cpp');
       const llama = await getLlama();
-
-      // Get GPU info from llama.cpp
-      const gpuDevices = await llama.getGpuDeviceNames();
-
-      if (gpuDevices && gpuDevices.length > 0) {
-        gpuName = gpuDevices[0];
-
-        // Detect vendor from name
-        if (gpuName.toLowerCase().includes('nvidia') || gpuName.toLowerCase().includes('geforce') || gpuName.toLowerCase().includes('rtx') || gpuName.toLowerCase().includes('gtx')) {
-          gpuVendor = 'nvidia';
-        } else if (gpuName.toLowerCase().includes('amd') || gpuName.toLowerCase().includes('radeon')) {
-          gpuVendor = 'amd';
-        } else if (gpuName.toLowerCase().includes('apple') || gpuName.toLowerCase().includes('m1') || gpuName.toLowerCase().includes('m2') || gpuName.toLowerCase().includes('m3')) {
-          gpuVendor = 'apple';
-        } else if (gpuName.toLowerCase().includes('intel')) {
-          gpuVendor = 'intel';
-        }
-
-        // Estimate VRAM based on common GPU models
-        gpuVram = this.estimateVram(gpuName);
+      const devices = await llama.getGpuDeviceNames();
+      if (devices.length) {
+        hardware.gpuName = devices[0];
+        const name = hardware.gpuName.toLowerCase();
+        hardware.gpuVendor = /nvidia|geforce|rtx|gtx/.test(name) ? 'nvidia'
+          : /amd|radeon/.test(name) ? 'amd'
+          : /apple|\bm\d/.test(name) ? 'apple'
+          : /intel/.test(name) ? 'intel' : 'none';
+        // Query actual memory instead of guessing from GPU marketing names.
+        const memory = await llama.getVramState();
+        hardware.gpuVram = memory.total / 1024 ** 3;
       }
     } catch {
-      // node-llama-cpp not available or no GPU detected
-      // Check for Apple Silicon via platform
       if (process.platform === 'darwin' && process.arch === 'arm64') {
-        gpuVendor = 'apple';
-        gpuName = 'Apple Silicon';
-        // For Apple Silicon, unified memory is shared
-        // Estimate ~70% available for GPU
-        gpuVram = Math.floor(systemRam * 0.7);
+        hardware.gpuVendor = 'apple';
+        hardware.gpuName = 'Apple Silicon (unified memory)';
+        hardware.gpuVram = Math.floor(hardware.systemRam * 0.7);
       }
     }
-
-    return {
-      gpuVendor,
-      gpuName,
-      gpuVram,
-      systemRam,
-      cpuCores,
-      cpuModel,
-    };
+    return hardware;
   }
 
-  /**
-   * Estimate VRAM from GPU name
-   */
-  private estimateVram(gpuName: string): number {
-    const name = gpuName.toLowerCase();
-
-    // NVIDIA RTX 40 series
-    if (name.includes('4090')) return 24;
-    if (name.includes('4080')) return 16;
-    if (name.includes('4070 ti')) return 12;
-    if (name.includes('4070')) return 12;
-    if (name.includes('4060 ti')) return 8;
-    if (name.includes('4060')) return 8;
-
-    // NVIDIA RTX 30 series
-    if (name.includes('3090')) return 24;
-    if (name.includes('3080 ti')) return 12;
-    if (name.includes('3080')) return 10;
-    if (name.includes('3070 ti')) return 8;
-    if (name.includes('3070')) return 8;
-    if (name.includes('3060 ti')) return 8;
-    if (name.includes('3060')) return 12;
-
-    // Apple Silicon (unified memory)
-    if (name.includes('m3 max')) return 48;
-    if (name.includes('m3 pro')) return 18;
-    if (name.includes('m3')) return 8;
-    if (name.includes('m2 max')) return 32;
-    if (name.includes('m2 pro')) return 16;
-    if (name.includes('m2')) return 8;
-    if (name.includes('m1 max')) return 32;
-    if (name.includes('m1 pro')) return 16;
-    if (name.includes('m1')) return 8;
-
-    // Default conservative estimate
-    return 4;
-  }
-
-  /**
-   * Get all available models in the registry
-   */
   getAvailableModels(family?: ModelFamily): ModelRecommendation[] {
-    if (family) {
-      return MODEL_REGISTRY.filter((m) => m.family === family);
-    }
-    return [...MODEL_REGISTRY];
+    return MODEL_REGISTRY.filter(model => !family || model.family === family).map(model => ({ ...model }));
   }
-
-  /**
-   * Get models by family name
-   */
-  getModelsByFamily(family: ModelFamily): ModelRecommendation[] {
-    return MODEL_REGISTRY.filter((m) => m.family === family);
-  }
-
-  /**
-   * Get family for a model ID
-   */
-  getModelFamily(modelId: string): ModelFamily | undefined {
-    return MODEL_REGISTRY.find((m) => m.modelId === modelId)?.family;
-  }
-
-  /**
-   * Get a specific model by ID
-   */
+  getModelsByFamily(family: ModelFamily): ModelRecommendation[] { return this.getAvailableModels(family); }
+  getModelFamily(modelId: string): ModelFamily | undefined { return MODEL_REGISTRY.find(model => model.modelId === modelId)?.family; }
   getModelById(modelId: string): ModelRecommendation | undefined {
-    return MODEL_REGISTRY.find((m) => m.modelId === modelId);
+    const model = MODEL_REGISTRY.find(entry => entry.modelId === modelId);
+    return model ? { ...model } : undefined;
   }
 
-  /**
-   * Recommend the best model for the given hardware
-   * @param hardware - Hardware profile
-   * @param family - Optional model family filter ('lfm' or 'qwen')
-   */
-  recommendModel(hardware: HardwareProfile, family?: ModelFamily): ModelRecommendation {
-    // Filter by family if specified
-    const registry = family
-      ? MODEL_REGISTRY.filter((m) => m.family === family)
-      : MODEL_REGISTRY;
-
-    // Find models that fit the hardware
-    const candidates = registry.filter((m) => {
-      // Check if GPU can handle it
-      if (hardware.gpuVram >= m.minVram) return true;
-      // Check if system RAM can handle it (CPU-only mode)
-      if (hardware.systemRam >= m.minRam) return true;
-      return false;
-    }).sort((a, b) => {
-      // Prefer higher quality first
-      const qualityOrder = { excellent: 0, good: 1, acceptable: 2 };
-      if (a.quality !== b.quality) {
-        return qualityOrder[a.quality] - qualityOrder[b.quality];
-      }
-      // Then prefer larger context
-      return b.contextLength - a.contextLength;
-    });
-
-    if (candidates.length === 0) {
-      const familyNote = family ? ` in the '${family}' family` : '';
-      throw new Error(
-        `No suitable models${familyNote} for your hardware.\n\n` +
-          `Minimum requirements: 2GB VRAM or 4GB RAM\n` +
-          `Detected: ${hardware.gpuVram}GB VRAM, ${hardware.systemRam.toFixed(1)}GB RAM\n\n` +
-          `Options:\n` +
-          `  1. Use cloud mode (remove --full-local flag)\n` +
-          `  2. Try a different model family (-m lfm or -m qwen)\n` +
-          `  3. Add more RAM or use a machine with a GPU`
-      );
+  recommendModel(hardware: HardwareProfile, family: ModelFamily = 'semanticwiki'): ModelRecommendation {
+    const candidates = this.getAvailableModels(family).filter(model => hardware.gpuVram >= model.minVram || hardware.systemRam >= model.minRam);
+    if (!candidates.length) {
+      const requirements = this.getAvailableModels(family).map(model => `${model.minVram} GB VRAM or ${model.minRam} GB RAM`).join('; ');
+      throw new Error(`No ${family} model fits this machine. Need ${requirements || 'a supported model family'}; detected ${hardware.gpuVram.toFixed(1)} GB VRAM and ${hardware.systemRam.toFixed(1)} GB RAM. Use --provider anthropic or --provider openai, or supply --model-path.`);
     }
-
     return candidates[0];
   }
 
-  /**
-   * Check if a model is already downloaded
-   */
-  isModelDownloaded(modelId: string): boolean {
-    const model = this.getModelById(modelId);
-    if (!model) return false;
-
-    const modelPath = path.join(this.modelsDir, model.ggufFile);
-    return fs.existsSync(modelPath);
-  }
-
-  /**
-   * Get the path to a downloaded model
-   */
+  isModelDownloaded(modelId: string): boolean { return this.getModelPath(modelId) !== null; }
   getModelPath(modelId: string): string | null {
     const model = this.getModelById(modelId);
     if (!model) return null;
-
-    const modelPath = path.join(this.modelsDir, model.ggufFile);
-    if (fs.existsSync(modelPath)) {
-      return modelPath;
-    }
-    return null;
+    const file = this.destination(model);
+    try { return fs.statSync(file).isFile() && fs.statSync(file).size === model.fileSizeBytes ? file : null; }
+    catch { return null; }
   }
 
-  /**
-   * Ensure a model is downloaded, downloading if necessary
-   */
+  /** Full checksum validation; no network requests or mutations. */
+  async verifyModel(modelOrId: ModelRecommendation | string): Promise<boolean> {
+    const model = typeof modelOrId === 'string' ? this.getModelById(modelOrId) : modelOrId;
+    if (!model) return false;
+    return this.verifyFile(this.destination(model), model);
+  }
+
   async ensureModel(model: ModelRecommendation): Promise<string> {
-    const modelPath = path.join(this.modelsDir, model.ggufFile);
-
-    if (fs.existsSync(modelPath)) {
-      // Verify file size
-      const stats = fs.statSync(modelPath);
-      if (stats.size >= model.fileSizeBytes * 0.95) {
-        // Allow 5% tolerance
-        return modelPath;
-      }
-      // File seems incomplete, re-download
-      console.log('   Model file appears incomplete, re-downloading...');
-      fs.unlinkSync(modelPath);
-    }
-
-    await this.downloadModel(model, modelPath);
-    return modelPath;
+    const dest = this.destination(model);
+    const pending = this.downloads.get(dest);
+    if (pending) return pending;
+    const operation = (async () => {
+      if (await this.verifyFile(dest, model)) return dest;
+      // Keep any old file intact until a complete, verified replacement is available.
+      await this.downloadModel(model, dest);
+      return dest;
+    })();
+    this.downloads.set(dest, operation);
+    try { return await operation; } finally { this.downloads.delete(dest); }
   }
 
-  /**
-   * Download a model with progress reporting
-   */
-  private async downloadModel(model: ModelRecommendation, destPath: string): Promise<void> {
-    const sizeGB = (model.fileSizeBytes / 1e9).toFixed(1);
-
-    console.log(`\n📦 Downloading model: ${model.modelId}`);
-    console.log(`   Size: ${sizeGB} GB`);
-    console.log(`   Destination: ${destPath}`);
-    console.log(`\n   This is a one-time download. Models are cached for future use.\n`);
-
-    // Create directory if needed
-    await mkdir(path.dirname(destPath), { recursive: true });
-
-    // Start download
-    const response = await fetch(model.downloadUrl, {
-      headers: {
-        'User-Agent': 'semanticwiki/1.0',
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`Failed to download model: ${response.status} ${response.statusText}`);
+  private destination(model: ModelRecommendation): string {
+    if (path.basename(model.ggufFile) !== model.ggufFile || !model.ggufFile.endsWith('.gguf')) {
+      throw new Error('Model filename must be a GGUF filename without a directory.');
     }
+    return path.join(this.modelsDir, model.ggufFile);
+  }
 
-    if (!response.body) {
-      throw new Error('No response body received');
-    }
-
-    const totalBytes = model.fileSizeBytes;
-    let downloadedBytes = 0;
-    let lastProgressUpdate = Date.now();
-    let lastBytes = 0;
-
-    // Capture reference to the progress callback
-    const progressCallback = this.progressCallback;
-
-    // Create progress tracking transform stream
-    const progressTracker = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        downloadedBytes += chunk.length;
-        const now = Date.now();
-        const elapsed = (now - lastProgressUpdate) / 1000;
-
-        if (elapsed >= 0.5) {
-          // Update every 500ms
-          const bytesPerSec = (downloadedBytes - lastBytes) / elapsed;
-          const percent = (downloadedBytes / totalBytes) * 100;
-          const downloaded = (downloadedBytes / 1e9).toFixed(1);
-          const total = (totalBytes / 1e9).toFixed(1);
-          const speed = (bytesPerSec / 1e6).toFixed(1);
-          const remaining = (totalBytes - downloadedBytes) / bytesPerSec;
-          const eta = formatTime(remaining);
-
-          // Create progress bar
-          const barWidth = 30;
-          const filled = Math.round((percent / 100) * barWidth);
-          const bar = '█'.repeat(filled) + '░'.repeat(barWidth - filled);
-
-          process.stdout.write(
-            `\r   [${bar}] ${percent.toFixed(1)}%  |  ${downloaded}/${total} GB  |  ${speed} MB/s  |  ETA ${eta}  `
-          );
-
-          lastProgressUpdate = now;
-          lastBytes = downloadedBytes;
-
-          // Call progress callback if set
-          if (progressCallback) {
-            progressCallback({
-              phase: 'downloading',
-              percent,
-              message: `${downloaded}/${total} GB`,
-            });
-          }
-        }
-
-        callback(null, chunk);
-      },
-    });
-
-    // Pipe response to file with progress tracking
-    const fileStream = createWriteStream(destPath);
-
+  private async verifyFile(file: string, model: ModelRecommendation): Promise<boolean> {
     try {
-      // Convert web stream to node stream and pipe through
-      const nodeStream = convertWebStreamToNodeStream(response.body);
-      await pipeline(nodeStream, progressTracker, fileStream);
-
-      console.log('\n\n   ✅ Download complete!\n');
+      const stat = await fs.promises.stat(file);
+      if (!stat.isFile() || stat.size !== model.fileSizeBytes) return false;
+      if (!model.sha256) return true;
+      const hash = createHash('sha256');
+      for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
+      return hash.digest('hex') === model.sha256;
     } catch (error) {
-      // Clean up partial file on error
-      if (fs.existsSync(destPath)) {
-        fs.unlinkSync(destPath);
-      }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
       throw error;
     }
   }
 
-  /**
-   * Delete a downloaded model
-   */
+  private async downloadModel(model: ModelRecommendation, destPath: string): Promise<void> {
+    await mkdir(this.modelsDir, { recursive: true });
+    const disk = await fs.promises.statfs(this.modelsDir);
+    const available = disk.bavail * disk.bsize;
+    const required = model.fileSizeBytes + 256 * 1024 ** 2;
+    if (available < required) {
+      throw new Error(`Not enough disk space for ${model.modelId}: need ${(required / 1024 ** 3).toFixed(2)} GiB including temporary headroom; ${(available / 1024 ** 3).toFixed(2)} GiB is available. Free space or set SEMANTICWIKI_MODELS_DIR to an absolute directory on another drive.`);
+    }
+    const partialPath = `${destPath}.${randomUUID()}.partial`;
+    const controller = new AbortController();
+    let idleTimer: NodeJS.Timeout;
+    const resetIdleTimeout = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => controller.abort(), 120_000);
+      idleTimer.unref();
+    };
+    resetIdleTimeout();
+    try {
+      this.progressCallback?.({ phase: 'downloading', percent: 0, message: `${model.modelId} → ${destPath}` });
+      const response = await fetch(model.downloadUrl, { headers: { 'User-Agent': 'semanticwiki' }, signal: controller.signal });
+      if (!response.ok) throw new Error(`Model download failed (${response.status} ${response.statusText}). Retry semanticwiki models prepare.`);
+      if (!response.body) throw new Error('Model download returned no data.');
+      const hash = createHash('sha256');
+      let bytes = 0;
+      let lastUpdate = 0;
+      const report = this.progressCallback;
+      const tracker = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          resetIdleTimeout();
+          bytes += chunk.length;
+          hash.update(chunk);
+          if (bytes > model.fileSizeBytes) return callback(new Error('Model download exceeds its expected size.'));
+          if (Date.now() - lastUpdate > 500) {
+            report?.({ phase: 'downloading', percent: bytes / model.fileSizeBytes * 100, message: `${(bytes / 1e9).toFixed(2)} / ${(model.fileSizeBytes / 1e9).toFixed(2)} GB` });
+            lastUpdate = Date.now();
+          }
+          callback(null, chunk);
+        },
+      });
+      await pipeline(Readable.fromWeb(response.body as import('node:stream/web').ReadableStream<Uint8Array>), tracker, fs.createWriteStream(partialPath, { flags: 'wx' }));
+      if (bytes !== model.fileSizeBytes) throw new Error(`Incomplete model download: expected ${model.fileSizeBytes} bytes, received ${bytes}.`);
+      const checksum = hash.digest('hex');
+      if (model.sha256 && checksum !== model.sha256) throw new Error('Model checksum mismatch. Download discarded; retry semanticwiki models prepare.');
+      await rename(partialPath, destPath);
+      this.progressCallback?.({ phase: 'downloaded', percent: 100, message: destPath });
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('Model download stalled for two minutes. Check your connection and retry semanticwiki models prepare.');
+      if ((error as NodeJS.ErrnoException).code === 'ENOSPC') throw new Error('The model download ran out of disk space. Its partial file was removed. Free space or set SEMANTICWIKI_MODELS_DIR to another drive, then retry semanticwiki models prepare.');
+      throw error;
+    } finally {
+      clearTimeout(idleTimer!);
+      await rm(partialPath, { force: true });
+    }
+  }
+
   deleteModel(modelId: string): boolean {
-    const modelPath = this.getModelPath(modelId);
-    if (modelPath && fs.existsSync(modelPath)) {
-      fs.unlinkSync(modelPath);
-      return true;
-    }
-    return false;
+    const model = this.getModelById(modelId);
+    if (!model) return false;
+    try { fs.unlinkSync(this.destination(model)); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
   }
 
-  /**
-   * List all downloaded models
-   */
   listDownloadedModels(): Array<{ model: ModelRecommendation; path: string; sizeBytes: number }> {
-    const downloaded: Array<{ model: ModelRecommendation; path: string; sizeBytes: number }> = [];
-
-    for (const model of MODEL_REGISTRY) {
-      const modelPath = path.join(this.modelsDir, model.ggufFile);
-      if (fs.existsSync(modelPath)) {
-        const stats = fs.statSync(modelPath);
-        downloaded.push({
-          model,
-          path: modelPath,
-          sizeBytes: stats.size,
-        });
-      }
-    }
-
-    return downloaded;
+    return this.getAvailableModels().flatMap(model => {
+      const file = this.getModelPath(model.modelId);
+      return file ? [{ model, path: file, sizeBytes: fs.statSync(file).size }] : [];
+    });
   }
 
-  /**
-   * Format hardware profile for display
-   */
   formatHardwareProfile(hardware: HardwareProfile): string {
-    const lines: string[] = [];
-
-    if (hardware.gpuVendor !== 'none' && hardware.gpuName) {
-      lines.push(`GPU: ${hardware.gpuName} (${hardware.gpuVram} GB VRAM)`);
-    } else if (hardware.gpuVendor !== 'none') {
-      lines.push(`GPU: ${hardware.gpuVendor} (${hardware.gpuVram} GB VRAM)`);
-    } else {
-      lines.push('GPU: None detected (CPU-only mode)');
-    }
-
-    lines.push(`RAM: ${hardware.systemRam.toFixed(0)} GB`);
-    lines.push(`CPU: ${hardware.cpuModel} (${hardware.cpuCores} cores)`);
-
-    return lines.join('\n');
+    return [hardware.gpuName ? `GPU: ${hardware.gpuName} (${hardware.gpuVram.toFixed(1)} GB VRAM)` : 'GPU: CPU-only mode',
+      `RAM: ${hardware.systemRam.toFixed(0)} GB`, `CPU: ${hardware.cpuModel} (${hardware.cpuCores} cores)`].join('\n');
   }
 }
-
-/**
- * Convert a Web ReadableStream to a Node.js Readable stream
- */
-function convertWebStreamToNodeStream(
-  webStream: ReadableStream<Uint8Array>
-): NodeJS.ReadableStream {
-  const reader = webStream.getReader();
-
-  return new Readable({
-    async read() {
-      try {
-        const { done, value } = await reader.read();
-        if (done) {
-          this.push(null);
-        } else {
-          this.push(Buffer.from(value));
-        }
-      } catch (error) {
-        this.destroy(error as Error);
-      }
-    },
-  });
-}
-
-/**
- * Format seconds into human-readable time
- */
-function formatTime(seconds: number): string {
-  if (!isFinite(seconds) || seconds < 0) return '--:--';
-
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const secs = Math.floor(seconds % 60);
-
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-  }
-  return `${minutes}:${secs.toString().padStart(2, '0')}`;
-}
-
 export default ModelManager;

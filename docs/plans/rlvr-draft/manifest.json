@@ -1,0 +1,56 @@
+{
+  "baseCommit": "33271fc92213b4d098e6687d068482e6a8968f09",
+  "sourceBranch": "ghostscientist-build-rlvr-foundation",
+  "snapshotDate": "2026-11-06",
+  "patchSha256": "328919f38c09b4bd6659432858d68c4e0af427b7e7625e4751a0381ee003f87d",
+  "normalizedRegistryUrls": 144,
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 13184,
+      "sha256": "c07076497544a09c2e4715b06cc6919c4ffe2be2fea42e8ef0e817d8221822ea"
+    },
+    {
+      "path": "package.json",
+      "bytes": 1897,
+      "sha256": "71b975d6e134161178269154894b9ceacd100a0934233de47899db5c5077a510"
+    },
+    {
+      "path": "package-lock.json",
+      "bytes": 306499,
+      "sha256": "52f0586e5db2b41d229a2268d3e552715d85ce763f71da8ae55db882cbd6daa4",
+      "originalSha256": "d5f554130ee9167862a5c469f4d00cea436402e34a183e3dc3c9dec5b7ae1494",
+      "normalization": "Private registry download URLs replaced by public npm URLs; dependency versions and integrity hashes unchanged."
+    },
+    {
+      "path": "src/cli.ts",
+      "bytes": 113650,
+      "sha256": "944cbcbe3d3184833372deef53823560986f2fc5c8da706b10097ccb4397390b"
+    },
+    {
+      "path": "src/wiki-agent.ts",
+      "bytes": 170302,
+      "sha256": "9097f091543881e29a9ef969ae06e1df45fbdbb4a3fb3456e34c544b96e15a57"
+    },
+    {
+      "path": "src/rlvr/trajectory.ts",
+      "bytes": 1475,
+      "sha256": "d08a9be919d8fb15d7be2c0b737aa8fc9a336909f08d878da875bb005a69f717"
+    },
+    {
+      "path": "src/verification/index.ts",
+      "bytes": 322,
+      "sha256": "c499513c8efde3a59447eda02c829e56bdb1e26ff6f0978a4000d2f1be776544"
+    },
+    {
+      "path": "src/verification/wiki-quality.ts",
+      "bytes": 13551,
+      "sha256": "86afcf7b650a63169a81ca21a0d72df2a35afd4d043b87c68e827885b07de72c"
+    },
+    {
+      "path": "tests/wiki-quality.test.ts",
+      "bytes": 4820,
+      "sha256": "d96bd4c7e3a2f495536f11821e8255efc22684c59dd7f2d2c95e5e44ae6c763f"
+    }
+  ]
+}

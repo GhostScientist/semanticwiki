@@ -1,20 +1,15 @@
-# SemanticWiki Documentation
+# Documentation
 
-Start with the main [README](../README.md) for installation, the cloud-vs-local mode choice, and the full command reference.
+Start with the [README](../README.md) for installation, provider choice and everyday commands.
 
-## Guides
+- [Models and storage](models.md): cloud APIs, the pinned 7B model, runtime limits and paths.
+- [Local setup](local-mode.md): preparation, memory, offline use and Ollama.
+- [Agent integration](AGENT_INTEGRATION.md): OKF, discovery, MCP tools and bounded retrieval.
+- [Generated site](SITE.md): reader features, source links, offline behavior and browser chat.
+- [Launch baseline](LAUNCH_BASELINE.md): branch consolidation, migration and release evidence.
+- [Launch validation](LAUNCH_VALIDATION.md): completed checks and remaining release gates.
+- [Local testing](LOCAL_ONLY_TESTING.md): native model and fixture workflow checks.
+- [Contributing](../CONTRIBUTING.md): automated checks and release process.
+- [Product direction](PRODUCT_DIRECTION.md): longer-term design guidance, including proposals not yet shipped.
 
-- **[Local Mode Guide](./local-mode.md)** — run SemanticWiki with no API key: bundled model, hardware requirements, Ollama backend, tuning, troubleshooting
-- **[Local Mode Testing Guide](./LOCAL_ONLY_TESTING.md)** — maintainer checklist and test repositories for exercising `--full-local`
-
-## Plans (historical / forward-looking)
-
-- **[Roadmap](./plans/ROADMAP.md)** — prioritized next features
-- **[Evaluation Plan](./plans/EVAL_PLAN.md)** — manual rubric, automated checks, and LLM-judge scoring for grading generated wikis (proposed; not implemented)
-- **[Fine-Tuning Plan](./plans/fine-tuning/README.md)** — dataset preparation, training, and evaluation for a fine-tuned local wiki model (proposed; not implemented)
-- **[Local Mode Plan](./plans/LOCAL_MODE_PLAN.md)** — original design document for local mode (implemented; kept for reference)
-
-## Project-Level Files
-
-- [CHANGELOG](../CHANGELOG.md) — release history
-- [AGENTS.md](../AGENTS.md) — codebase guidance for AI coding assistants (`CLAUDE.md` points here)
+Historical/forward-looking plans are in the repository's [plans directory](https://github.com/GhostScientist/semanticwiki/tree/master/docs/plans). They are not the current command reference and are not included in the npm package.

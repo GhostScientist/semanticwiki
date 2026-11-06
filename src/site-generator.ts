@@ -7,15 +7,14 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { execFileSync } from 'node:child_process';
 import matter from 'gray-matter';
-import { marked } from 'marked';
+import { Marked, Renderer } from 'marked';
+import { load } from 'cheerio';
+import { getRuntimePaths } from './runtime-paths.js';
 import { getTemplates } from './site/templates.js';
 import { getStyles } from './site/styles.js';
 import { getClientScripts } from './site/scripts.js';
-import { pipeline, env } from '@huggingface/transformers';
-
-// Configure transformers.js for embeddings generation
-env.cacheDir = './.semanticwiki-models';
 
 export interface SiteGenerationOptions {
   wikiDir: string;
@@ -104,6 +103,13 @@ export class SiteGenerator {
   private navigation: SiteNavigation = { sections: [] };
   private tours: GuidedTour[] = [];
   private mermaidPlaceholders: Map<string, string> = new Map();
+  private markdownPaths: Set<string> = new Set();
+  private currentPageRelativePath: string | null = null;
+  private markdown = new Marked();
+  private renderedHeadings: WikiPage['headings'] = [];
+  private headingIds = new Map<string, number>();
+  private repositoryRemote = '';
+  private repositoryRevision = 'HEAD';
 
   constructor(options: SiteGenerationOptions) {
     // Extract codebase name from wiki directory or use provided title
@@ -112,7 +118,7 @@ export class SiteGenerator {
     this.options = {
       wikiDir: path.resolve(options.wikiDir),
       outputDir: path.resolve(options.outputDir),
-      title: `${codebaseName} Wiki`,
+      title: options.title || (/wiki$/i.test(codebaseName) ? codebaseName : `${codebaseName} Wiki`),
       description: options.description || 'Interactive architectural documentation',
       theme: options.theme || 'auto',
       features: {
@@ -121,13 +127,18 @@ export class SiteGenerator {
         search: true,
         progressTracking: true,
         keyboardNav: true,
-        aiChat: true,
+        aiChat: false,
         ...options.features
       },
       repoUrl: options.repoUrl || '',
-      repoPath: options.repoPath || ''
+      repoPath: options.repoPath ? path.resolve(options.repoPath)
+        : options.repoUrl && !/^(https?:|git@|ssh:)/i.test(options.repoUrl) ? path.resolve(options.repoUrl) : ''
     };
 
+    const outputRelativeToWiki = path.relative(this.options.outputDir, this.options.wikiDir);
+    if (!outputRelativeToWiki || (!outputRelativeToWiki.startsWith('..' + path.sep) && outputRelativeToWiki !== '..' && !path.isAbsolute(outputRelativeToWiki))) {
+      throw new Error('The site output must be a separate directory, not the wiki directory or its parent.');
+    }
     this.configureMarked();
   }
 
@@ -184,7 +195,7 @@ export class SiteGenerator {
    * Configure marked with custom renderers for enhanced features
    */
   private configureMarked(): void {
-    const renderer = new marked.Renderer();
+    const renderer = new Renderer();
     // Renderer methods are plain functions so `this` stays bound to the renderer,
     // which is how marked exposes `this.parser` for rendering child tokens.
     const self = this;
@@ -192,7 +203,8 @@ export class SiteGenerator {
     // Enhanced code block rendering with copy button and source links
     renderer.code = function ({ text, lang: language }) {
       const code = text;
-      const lang = language || 'text';
+      const languageName = language?.split(/\s+/)[0] || 'text';
+      const lang = /^[\w+#.-]+$/.test(languageName) ? languageName : 'text';
       const escapedCode = self.escapeHtml(code);
 
       // Check for source reference in the code block
@@ -204,8 +216,8 @@ export class SiteGenerator {
         <div class="code-block" data-language="${lang}">
           <div class="code-header">
             <span class="code-language">${lang}</span>
-            ${sourceRef ? `<a href="#" class="code-source" data-source="${sourceRef}">${sourceRef}</a>` : ''}
-            <button class="code-copy" title="Copy code">
+            ${sourceRef ? `<a href="#" class="code-source" data-source="${self.escapeHtml(sourceRef)}">${self.escapeHtml(sourceRef)}</a>` : ''}
+            <button class="code-copy" title="Copy code" aria-label="Copy code">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                 <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
@@ -220,10 +232,15 @@ export class SiteGenerator {
     // Enhanced heading rendering with anchor links
     renderer.heading = function ({ tokens, depth: level }) {
       const text = this.parser.parseInline(tokens);
-      const id = self.slugify(text);
+      const plainText = load(text, null, false).text();
+      const baseId = self.slugify(plainText) || 'section';
+      const count = self.headingIds.get(baseId) || 0;
+      self.headingIds.set(baseId, count + 1);
+      const id = count ? `${baseId}-${count}` : baseId;
+      self.renderedHeadings.push({ level, text: plainText, id });
       return `
         <h${level} id="${id}" class="heading-anchor">
-          <a href="#${id}" class="anchor-link" aria-hidden="true">#</a>
+          <a href="#${id}" class="anchor-link" aria-label="Link to ${self.escapeHtml(plainText)}">#</a>
           ${text}
         </h${level}>
       `;
@@ -232,28 +249,35 @@ export class SiteGenerator {
     // Enhanced link rendering
     renderer.link = function ({ href, title, tokens }) {
       const text = this.parser.parseInline(tokens);
-      const isExternal = href.startsWith('http://') || href.startsWith('https://');
-      const isSourceLink = href.includes(':') && !isExternal && href.match(/\.(ts|js|py|go|rs|java|rb|php|c|cpp|swift):/);
+      const isExternal = /^(https?:)?\/\//i.test(href);
+      const sourceReference = !isExternal ? self.getSourceReference(href) : undefined;
 
-      if (isSourceLink) {
-        return `<a href="#" class="source-link" data-source="${href}" title="${title || 'View source'}">${text}</a>`;
+      if (sourceReference) {
+        const sourceUrl = self.sourceUrl(sourceReference);
+        if (sourceUrl) return `<a href="${self.escapeHtml(sourceUrl)}" class="external-link" target="_blank" rel="noopener noreferrer">${text}</a>`;
+        return self.options.features.codeExplorer
+          ? `<a href="#" class="source-link" data-source="${self.escapeHtml(sourceReference)}" title="${self.escapeHtml(title || 'View source reference')}">${text}</a>`
+          : text;
       }
+
+      if (!self.isSafeUrl(href)) return text;
 
       if (isExternal) {
-        return `<a href="${href}" title="${title || ''}" target="_blank" rel="noopener noreferrer" class="external-link">${text}<svg class="external-icon" width="12" height="12" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" stroke="currentColor" stroke-width="2" fill="none"/></svg></a>`;
+        return `<a href="${self.escapeHtml(href)}" title="${self.escapeHtml(title || '')}" target="_blank" rel="noopener noreferrer" class="external-link">${text}<svg class="external-icon" width="12" height="12" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3" stroke="currentColor" stroke-width="2" fill="none"/></svg></a>`;
       }
 
-      // Convert .md links to .html
-      const htmlHref = href.replace(/\.md(#.*)?$/, '.html$1');
-      return `<a href="${htmlHref}" title="${title || ''}" class="internal-link">${text}</a>`;
+      // Convert wiki markdown links to page-relative HTML links.
+      const htmlHref = self.resolveInternalLink(href);
+      return `<a href="${self.escapeHtml(htmlHref)}" title="${self.escapeHtml(title || '')}" class="internal-link">${text}</a>`;
     };
 
     // Enhanced image rendering
     renderer.image = function ({ href, title, text }) {
+      if (!self.isSafeUrl(href, true)) return self.escapeHtml(text);
       return `
         <figure class="image-figure">
-          <img src="${href}" alt="${text}" title="${title || ''}" loading="lazy" />
-          ${title ? `<figcaption>${title}</figcaption>` : ''}
+          <img src="${self.escapeHtml(href)}" alt="${self.escapeHtml(text)}" title="${self.escapeHtml(title || '')}" loading="lazy" />
+          ${title ? `<figcaption>${self.escapeHtml(title)}</figcaption>` : ''}
         </figure>
       `;
     };
@@ -277,7 +301,7 @@ export class SiteGenerator {
         const body = first.raw.slice(calloutMatch[0].length);
         const rest = tokens.slice(1);
         const content = [
-          body.trim() ? (marked.parse(body, { async: false }) as string) : '',
+          body.trim() ? (self.markdown.parse(body, { async: false }) as string) : '',
           rest.length ? this.parser.parse(rest) : ''
         ]
           .filter(Boolean)
@@ -289,7 +313,9 @@ export class SiteGenerator {
       return `<blockquote>${this.parser.parse(tokens)}</blockquote>`;
     };
 
-    marked.use({ renderer });
+    // Documentation may quote HTML; it must never execute it in the reader's browser.
+    renderer.html = ({ text }) => self.escapeHtml(text);
+    this.markdown.use({ renderer });
   }
 
   /**
@@ -297,9 +323,13 @@ export class SiteGenerator {
    */
   async generate(): Promise<void> {
     console.log('🌐 Generating static site...');
+    this.pages = [];
+    this.tours = [];
+    this.resolveRepositoryMetadata();
 
     // Step 1: Discover and parse all wiki pages
     await this.discoverPages();
+    if (!this.pages.length) throw new Error(`No Markdown pages found in ${this.options.wikiDir}. Generate a wiki first.`);
     console.log(`  Found ${this.pages.length} wiki pages`);
 
     // Step 2: Build navigation structure
@@ -315,6 +345,7 @@ export class SiteGenerator {
 
     // Step 5: Write static assets (CSS, JS)
     await this.writeAssets();
+    this.copyWikiAssets();
 
     // Step 6: Generate HTML pages
     await this.generatePages();
@@ -335,6 +366,9 @@ export class SiteGenerator {
    */
   private async discoverPages(): Promise<void> {
     const files = this.findMarkdownFiles(this.options.wikiDir);
+    this.markdownPaths = new Set(
+      files.map(file => this.toPosixPath(path.relative(this.options.wikiDir, file)))
+    );
 
     for (const filePath of files) {
       const page = await this.parsePage(filePath);
@@ -347,6 +381,8 @@ export class SiteGenerator {
     this.pages.sort((a, b) => {
       if (a.relativePath === 'README.md') return -1;
       if (b.relativePath === 'README.md') return 1;
+      const depthDifference = a.relativePath.split('/').length - b.relativePath.split('/').length;
+      if (depthDifference) return depthDifference;
       return a.relativePath.localeCompare(b.relativePath);
     });
   }
@@ -366,7 +402,7 @@ export class SiteGenerator {
 
       if (entry.isDirectory()) {
         // Skip hidden directories and cache
-        if (!entry.name.startsWith('.') && entry.name !== 'node_modules') {
+        if (!entry.name.startsWith('.') && !['node_modules', 'knowledge'].includes(entry.name) && path.resolve(fullPath) !== this.options.outputDir) {
           files.push(...this.findMarkdownFiles(fullPath));
         }
       } else if (entry.isFile() && entry.name.endsWith('.md')) {
@@ -385,11 +421,14 @@ export class SiteGenerator {
       const content = fs.readFileSync(filePath, 'utf-8');
       const { data: frontmatter, content: markdownContent } = matter(content);
 
-      const relativePath = path.relative(this.options.wikiDir, filePath);
+      const relativePath = this.toPosixPath(path.relative(this.options.wikiDir, filePath));
+      this.currentPageRelativePath = relativePath;
 
       // Extract title from frontmatter or first H1
       const extractedTitle = this.extractTitle(markdownContent);
-      const title = frontmatter.title || extractedTitle || path.basename(filePath, '.md');
+      const title = typeof frontmatter.title === 'string' ? frontmatter.title
+        : extractedTitle ? load(this.markdown.parseInline(extractedTitle, { async: false }) as string, null, false).text()
+        : path.basename(filePath, '.md');
 
       // Always remove the first H1 from content since the template renders the title separately
       // This prevents duplication regardless of whether title came from frontmatter or H1
@@ -397,7 +436,8 @@ export class SiteGenerator {
       const contentWithoutTitle = markdownContent.replace(/^\s*#\s+[^\n]+\n*/, '');
 
       // Extract headings (after potentially removing title)
-      const headings = this.extractHeadings(contentWithoutTitle);
+      this.renderedHeadings = [];
+      this.headingIds.clear();
 
       // Extract code blocks
       const codeBlocks = this.extractCodeBlocks(contentWithoutTitle);
@@ -409,7 +449,8 @@ export class SiteGenerator {
       const processedMarkdown = this.processMermaidBlocks(contentWithoutTitle);
 
       // Convert markdown to HTML
-      const parsedHtml = await marked.parse(processedMarkdown);
+      const parsedHtml = await this.markdown.parse(processedMarkdown);
+      this.currentPageRelativePath = null;
 
       // Restore mermaid diagrams after markdown processing to preserve their syntax
       const htmlContent = this.restoreMermaidBlocks(parsedHtml);
@@ -422,42 +463,21 @@ export class SiteGenerator {
         path: filePath,
         relativePath,
         title,
-        description: frontmatter.description,
+        description: typeof frontmatter.description === 'string' ? frontmatter.description : undefined,
         content: contentWithoutTitle,
         htmlContent,
         frontmatter,
         sources: frontmatter.sources,
-        related: frontmatter.related,
-        headings,
+        related: Array.isArray(frontmatter.related) ? frontmatter.related.filter((value): value is string => typeof value === 'string') : [],
+        headings: [...this.renderedHeadings],
         codeBlocks,
         mermaidDiagrams,
         lastModified
       };
     } catch (error) {
-      console.error(`Failed to parse ${filePath}:`, error);
-      return null;
+      this.currentPageRelativePath = null;
+      throw new Error(`Failed to render wiki page ${filePath}`, { cause: error });
     }
-  }
-
-  /**
-   * Extract headings from markdown content
-   */
-  private extractHeadings(content: string): Array<{ level: number; text: string; id: string }> {
-    const headings: Array<{ level: number; text: string; id: string }> = [];
-    const regex = /^(#{1,6})\s+(.+)$/gm;
-
-    let match;
-    while ((match = regex.exec(content)) !== null) {
-      const level = match[1].length;
-      const text = match[2].trim();
-      headings.push({
-        level,
-        text,
-        id: this.slugify(text)
-      });
-    }
-
-    return headings;
   }
 
   /**
@@ -517,8 +537,8 @@ export class SiteGenerator {
 
       // Store the original diagram content with its HTML wrapper
       this.mermaidPlaceholders.set(placeholder, `<div class="mermaid-container" id="${id}">
-        <div class="mermaid">${diagram.trim()}</div>
-        <button class="mermaid-fullscreen" title="Fullscreen" data-diagram="${id}">
+        <div class="mermaid">${this.escapeHtml(diagram.trim())}</div>
+        <button class="mermaid-fullscreen" title="Fullscreen" aria-label="Expand diagram" data-diagram="${id}">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
           </svg>
@@ -557,7 +577,7 @@ export class SiteGenerator {
     const sections = new Map<string, Array<{ title: string; path: string; description?: string }>>();
 
     for (const page of this.pages) {
-      const parts = page.relativePath.split(path.sep);
+      const parts = this.toPosixPath(page.relativePath).split('/');
       const section = parts.length > 1 ? parts[0] : 'Overview';
       const htmlPath = page.relativePath.replace(/\.md$/, '.html');
 
@@ -753,19 +773,104 @@ export class SiteGenerator {
     console.log('  Wrote static assets');
   }
 
+  private copyWikiAssets(): void {
+    const copy = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const source = path.join(directory, entry.name);
+        if (source === this.options.outputDir || entry.name.startsWith('.') || entry.name === 'node_modules' || entry.isSymbolicLink()) continue;
+        const relative = path.relative(this.options.wikiDir, source);
+        if (entry.isDirectory()) copy(source);
+        else if (entry.isFile() && (relative.startsWith('knowledge' + path.sep) || entry.name === 'llms.txt' || /\.(png|jpe?g|gif|svg|webp|avif|pdf)$/i.test(entry.name))) {
+          const target = path.join(this.options.outputDir, relative);
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.copyFileSync(source, target);
+        }
+      }
+    };
+    copy(this.options.wikiDir);
+  }
+
+  private generatePageNavigation(index: number): string {
+    const items = [
+      { page: this.pages[index - 1], label: 'Previous', className: 'previous' },
+      { page: this.pages[index + 1], label: 'Next', className: 'next' }
+    ];
+    return `<nav class="page-pagination" aria-label="Page navigation">${items.map(({ page, label, className }) => page
+      ? `<a class="page-pagination-link ${className}" href="${this.getSiteHref(page.relativePath.replace(/\.md$/, '.html'))}"><span>${label}</span><strong>${this.escapeHtml(page.title)}</strong></a>`
+      : '<span></span>').join('')}</nav>`;
+  }
+
+  private resolveRepositoryMetadata(): void {
+    this.repositoryRemote = '';
+    this.repositoryRevision = 'HEAD';
+    let remote = this.options.repoUrl;
+    if (this.options.repoPath && fs.existsSync(this.options.repoPath)) {
+      try {
+        remote = execFileSync('git', ['-C', this.options.repoPath, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+        const revision = execFileSync('git', ['-C', this.options.repoPath, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+        if (/^[a-f0-9]{40,64}$/i.test(revision)) this.repositoryRevision = revision;
+      } catch { /* A local repository need not have a remote or any commits. */ }
+    }
+    remote = remote.replace(/^git@([^:]+):/, 'https://$1/').replace(/^ssh:\/\/git@/, 'https://');
+    try {
+      const url = new URL(remote);
+      if (!['http:', 'https:'].includes(url.protocol)) return;
+      // Remote URLs can contain credentials; they must never enter published HTML.
+      url.username = ''; url.password = ''; url.search = ''; url.hash = '';
+      this.repositoryRemote = url.href.replace(/\/$/, '').replace(/\.git$/, '');
+    } catch { this.repositoryRemote = ''; }
+  }
+
+  private getSourceReference(href: string): string | undefined {
+    let decoded: string;
+    try { decoded = decodeURI(href); } catch { decoded = href; }
+    if (/^(?:https?:|mailto:|tel:|javascript:|data:)/i.test(decoded) || decoded.startsWith('#')) return undefined;
+    const lineMatch = decoded.match(/^(.*?)(?:#L|:)(\d+)(?:[-–]L?(\d+))?$/i);
+    let filePath = lineMatch ? lineMatch[1] : decoded.split('#')[0];
+    const normalizedWikiPath = filePath.replace(/^\/+/, '');
+    const absolute = path.isAbsolute(filePath);
+    const wikiRelative = absolute ? path.relative(this.options.wikiDir, filePath) : '';
+    // Existing wiki pages remain navigation links unless an explicit source line is cited.
+    if (!lineMatch && (this.markdownPaths.has(normalizedWikiPath) || (absolute && this.markdownPaths.has(this.toPosixPath(wikiRelative))))) return undefined;
+    const codePath = /\.(?:[cm]?[jt]sx?|py|go|rs|java|rb|php|[ch](?:pp)?|swift|kt|scala|sh|sql|ya?ml|json|toml)$/i.test(filePath);
+    if (!lineMatch && !codePath && !absolute) return undefined;
+    if (absolute && this.options.repoPath) {
+      const relative = path.relative(this.options.repoPath, filePath);
+      if (relative && !relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative)) filePath = this.toPosixPath(relative);
+    }
+    if (!filePath || /[\u0000-\u001f]/.test(filePath)) return undefined;
+    return filePath + (lineMatch ? `:${lineMatch[2]}${lineMatch[3] ? '-' + lineMatch[3] : ''}` : '');
+  }
+
+  private sourceUrl(reference: string): string | undefined {
+    const remote = this.repositoryRemote;
+    if (!remote) return undefined;
+    const match = reference.match(/^(.+?)(?::(\d+)(?:-(\d+))?)?$/);
+    if (!match || path.isAbsolute(match[1]) || match[1].split('/').includes('..')) return undefined;
+    const anchor = match[2] ? `#L${match[2]}${match[3] ? '-L' + match[3] : ''}` : '';
+    const browsePath = new URL(remote).hostname.includes('gitlab') ? '/-/blob/' : '/blob/';
+    return `${remote}${browsePath}${this.repositoryRevision}/${match[1].split('/').map(encodeURIComponent).join('/')}${anchor}`;
+  }
+
+  private isSafeUrl(value: string, image = false): boolean {
+    const normalized = value.replace(/[\u0000-\u0020\u007f]/g, '');
+    const scheme = normalized.match(/^([a-z][a-z0-9+.-]*):/i)?.[1].toLowerCase();
+    return !scheme || (image ? ['http', 'https'] : ['http', 'https', 'mailto', 'tel']).includes(scheme);
+  }
+
   /**
    * Generate HTML pages
    */
   private async generatePages(): Promise<void> {
     const templates = getTemplates();
 
-    for (const page of this.pages) {
+    for (const [pageIndex, page] of this.pages.entries()) {
+      this.currentPageRelativePath = page.relativePath;
       const htmlPath = page.relativePath.replace(/\.md$/, '.html');
       const outputPath = path.join(this.options.outputDir, htmlPath);
 
-      // Calculate relative path to root for asset links
-      const depth = page.relativePath.split(path.sep).length - 1;
-      const rootPath = depth > 0 ? '../'.repeat(depth) : './';
+      // Page-relative URLs work on file:// and at any deployment subpath.
+      const rootPath = this.getSiteRootPath();
 
       // Generate table of contents
       const toc = this.generateTOC(page.headings);
@@ -785,6 +890,11 @@ export class SiteGenerator {
         toc,
         breadcrumbs,
         relatedPages,
+        pageNavigation: this.generatePageNavigation(pageIndex),
+        pageMarkdown: fs.readFileSync(page.path, 'utf-8'),
+        markdownPath: 'source/' + this.toPosixPath(page.relativePath),
+        readingMinutes: Math.max(1, Math.ceil(page.content.split(/\s+/).length / 220)),
+        agentEntry: fs.existsSync(path.join(this.options.wikiDir, 'llms.txt')) ? 'llms.txt' : undefined,
         navigation: this.navigation,
         rootPath,
         currentPath: htmlPath,
@@ -798,20 +908,28 @@ export class SiteGenerator {
       });
 
       fs.writeFileSync(outputPath, html);
+      const markdownOutput = path.join(this.options.outputDir, 'source', page.relativePath);
+      fs.mkdirSync(path.dirname(markdownOutput), { recursive: true });
+      fs.copyFileSync(page.path, markdownOutput);
+      if (page.relativePath === 'README.md' && !this.markdownPaths.has('index.md')) {
+        fs.writeFileSync(path.join(this.options.outputDir, 'index.html'), html);
+      }
     }
+    this.currentPageRelativePath = null;
 
     // Generate index.html (redirect to README.html or first page)
     const indexPage = this.pages.find(p => p.relativePath === 'README.md') || this.pages[0];
-    if (indexPage) {
+    if (indexPage && !this.markdownPaths.has('index.md') && !this.markdownPaths.has('README.md')) {
+      const indexHref = this.getSiteHref(indexPage.relativePath.replace(/\.md$/, '.html'));
       const indexHtml = `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="0; url=${indexPage.relativePath.replace(/\.md$/, '.html')}">
-  <title>${this.options.title}</title>
+  <meta http-equiv="refresh" content="0; url=${indexHref}">
+  <title>${this.escapeHtml(this.options.title)}</title>
 </head>
 <body>
-  <p>Redirecting to <a href="${indexPage.relativePath.replace(/\.md$/, '.html')}">${indexPage.title}</a>...</p>
+  <p>Redirecting to <a href="${indexHref}">${this.escapeHtml(indexPage.title)}</a>...</p>
 </body>
 </html>`;
       fs.writeFileSync(path.join(this.options.outputDir, 'index.html'), indexHtml);
@@ -834,7 +952,7 @@ export class SiteGenerator {
 
     for (const heading of tocHeadings) {
       const indent = heading.level - 2;
-      html += `<li class="toc-item toc-level-${indent}"><a href="#${heading.id}">${heading.text}</a></li>`;
+      html += `<li class="toc-item toc-level-${indent}"><a href="#${heading.id}">${this.escapeHtml(heading.text)}</a></li>`;
     }
 
     html += '</ul></nav>';
@@ -845,23 +963,27 @@ export class SiteGenerator {
    * Generate breadcrumb navigation
    */
   private generateBreadcrumbs(relativePath: string): string {
-    const parts = relativePath.split(path.sep);
+    const parts = this.toPosixPath(relativePath).split('/');
     if (parts.length === 1) return '';
 
     let html = '<nav class="breadcrumbs" aria-label="Breadcrumb"><ol>';
     let currentPath = '';
+    const rootPath = this.getSiteRootPath();
 
     // Add home link
-    html += `<li><a href="${'../'.repeat(parts.length - 1)}index.html">Home</a></li>`;
+    html += `<li><a href="${rootPath}index.html">Home</a></li>`;
 
     for (let i = 0; i < parts.length - 1; i++) {
       currentPath += parts[i] + '/';
-      html += `<li><a href="${'../'.repeat(parts.length - 1 - i)}${currentPath}index.html">${this.formatSectionTitle(parts[i])}</a></li>`;
+      const directoryIndex = this.markdownPaths.has(currentPath + 'index.md') ? 'index.html'
+        : this.markdownPaths.has(currentPath + 'README.md') ? 'README.html' : '';
+      const label = this.escapeHtml(this.formatSectionTitle(parts[i]));
+      html += directoryIndex ? `<li><a href="${rootPath}${currentPath}${directoryIndex}">${label}</a></li>` : `<li><span>${label}</span></li>`;
     }
 
     // Current page (not a link)
     const page = this.pages.find(p => p.relativePath === relativePath);
-    html += `<li aria-current="page">${page?.title || parts[parts.length - 1]}</li>`;
+    html += `<li aria-current="page">${this.escapeHtml(page?.title || parts[parts.length - 1])}</li>`;
 
     html += '</ol></nav>';
     return html;
@@ -899,7 +1021,7 @@ export class SiteGenerator {
 
     for (const rp of related.slice(0, 5)) {
       const href = this.getRelativeLink(page.relativePath, rp.relativePath);
-      html += `<li><a href="${href}">${rp.title}</a>${rp.description ? `<span class="related-desc">${rp.description}</span>` : ''}</li>`;
+      html += `<li><a href="${href}">${this.escapeHtml(rp.title)}</a>${rp.description ? `<span class="related-desc">${this.escapeHtml(rp.description)}</span>` : ''}</li>`;
     }
 
     html += '</ul></aside>';
@@ -910,15 +1032,84 @@ export class SiteGenerator {
    * Get relative link between two pages
    */
   private getRelativeLink(fromPath: string, toPath: string): string {
-    const fromDir = path.dirname(fromPath);
-    const toHtml = toPath.replace(/\.md$/, '.html');
+    const toHtml = this.toPosixPath(toPath).replace(/\.md$/, '.html');
 
-    if (fromDir === '.') {
-      return toHtml;
+    return this.getSiteHref(toHtml);
+  }
+
+  /**
+   * Resolve markdown links inside wiki pages to correct page-relative HTML links.
+   *
+   * Wiki generation often emits links from the wiki root, e.g.
+   * `architecture/overview.md`. If that href is copied unchanged into
+   * `architecture/data-flow.html`, browsers resolve it as
+   * `architecture/architecture/overview.html`. Use the discovered markdown page
+   * set to distinguish root-relative wiki links from same-directory links.
+   */
+  private resolveInternalLink(href: string): string {
+    if (!href || href.startsWith('#')) {
+      return href;
     }
 
-    const depth = fromDir.split(path.sep).length;
-    return '../'.repeat(depth) + toHtml;
+    if (
+      href.startsWith('mailto:') ||
+      href.startsWith('tel:')
+    ) {
+      return href;
+    }
+
+    let [rawPath, rawAnchor] = href.split('#', 2);
+    if (path.isAbsolute(rawPath)) {
+      const relative = this.toPosixPath(path.relative(this.options.wikiDir, rawPath));
+      if (this.markdownPaths.has(relative)) rawPath = '/' + relative;
+    }
+    const anchor = rawAnchor ? `#${rawAnchor}` : '';
+
+    if (!rawPath.endsWith('.md')) {
+      return href;
+    }
+
+    const fromPath = this.currentPageRelativePath;
+    if (!fromPath) {
+      return rawPath.replace(/\.md$/, '.html') + anchor;
+    }
+
+    const fromDir = this.toPosixPath(path.dirname(fromPath));
+    const normalizedHref = this.toPosixPath(rawPath.replace(/^\/+/, ''));
+    const hrefIsExplicitRelative = rawPath.startsWith('./') || rawPath.startsWith('../');
+
+    let targetMarkdownPath: string;
+    if (hrefIsExplicitRelative) {
+      targetMarkdownPath = this.normalizePosixPath(path.posix.join(fromDir, rawPath));
+    } else {
+      const rootRelativeCandidate = this.normalizePosixPath(normalizedHref);
+      const pageRelativeCandidate = this.normalizePosixPath(path.posix.join(fromDir, rawPath));
+
+      targetMarkdownPath = this.markdownPaths.has(rootRelativeCandidate)
+        ? rootRelativeCandidate
+        : pageRelativeCandidate;
+    }
+
+    const targetHtmlPath = targetMarkdownPath.replace(/\.md$/, '.html');
+
+    return this.getSiteHref(targetHtmlPath) + anchor;
+  }
+
+  private getSiteRootPath(): string {
+    const depth = this.currentPageRelativePath ? this.toPosixPath(this.currentPageRelativePath).split('/').length - 1 : 0;
+    return depth ? '../'.repeat(depth) : './';
+  }
+
+  private getSiteHref(siteRelativePath: string): string {
+    return this.getSiteRootPath() + this.normalizePosixPath(siteRelativePath).split('/').map(encodeURIComponent).join('/');
+  }
+
+  private toPosixPath(filePath: string): string {
+    return filePath.split(path.sep).join('/');
+  }
+
+  private normalizePosixPath(filePath: string): string {
+    return path.posix.normalize(this.toPosixPath(filePath)).replace(/^\.\//, '');
   }
 
   /**
@@ -939,7 +1130,7 @@ export class SiteGenerator {
       searchIndex: this.pages.map(p => ({
         path: p.relativePath.replace(/\.md$/, '.html'),
         title: p.title,
-        content: this.stripMarkdown(p.content).slice(0, 5000), // Limit for performance
+        content: this.stripMarkdown(p.content),
         headings: p.headings.map(h => h.text)
       }))
     };
@@ -949,6 +1140,8 @@ export class SiteGenerator {
       JSON.stringify(manifest, null, 2)
     );
 
+    // A script asset also works when opened directly from disk, where fetch is blocked.
+    fs.writeFileSync(path.join(this.options.outputDir, 'assets', 'manifest.js'), `window.WIKI_MANIFEST = ${JSON.stringify(manifest).replace(/</g, '\\u003c')};`);
     console.log('  Generated site manifest');
   }
 
@@ -960,7 +1153,9 @@ export class SiteGenerator {
     console.log('  Generating embeddings index for AI chat...');
 
     try {
-      // Load embedding model
+      const { pipeline, env } = await import('@huggingface/transformers');
+      env.cacheDir = getRuntimePaths().embeddingsDir;
+      // Load embedding model only for explicitly enabled browser chat.
       const embedder = await pipeline(
         'feature-extraction',
         'Xenova/all-MiniLM-L6-v2',

@@ -28,7 +28,15 @@ export function getClientScripts(features: Features): string {
   // ========================================
   // Configuration & State
   // ========================================
-  const config = window.WIKI_CONFIG || {};
+  const config = window.WIKI_CONFIG || JSON.parse(document.getElementById('wiki-config')?.textContent || '{}');
+  const siteRoot = new URL(config.rootPath || './', window.location.href).href;
+  const storage = {
+    getItem(key) { try { return window.localStorage.getItem(key); } catch { return null; } },
+    setItem(key, value) { try { window.localStorage.setItem(key, value); } catch {} },
+    removeItem(key) { try { window.localStorage.removeItem(key); } catch {} }
+  };
+  let tocObserver;
+  let navigationSequence = 0;
   const state = {
     manifest: null,
     searchIndex: [],
@@ -49,6 +57,8 @@ export function getClientScripts(features: Features): string {
     initMobileMenu();
     initScrollToTop();
     initCopyButtons();
+    initPageTools();
+    initDialogs();
     initMermaid();
     initSourceLinks();
     initTocHighlight();
@@ -72,8 +82,12 @@ export function getClientScripts(features: Features): string {
   // ========================================
   async function loadManifest() {
     try {
-      const response = await fetch(config.rootPath + 'manifest.json');
-      state.manifest = await response.json();
+      state.manifest = window.WIKI_MANIFEST;
+      if (!state.manifest) {
+        const response = await fetch(siteRoot + 'manifest.json');
+        if (!response.ok) throw new Error('Manifest unavailable');
+        state.manifest = await response.json();
+      }
       state.searchIndex = state.manifest.searchIndex || [];
     } catch (e) {
       console.warn('Failed to load manifest:', e);
@@ -88,16 +102,17 @@ export function getClientScripts(features: Features): string {
     if (!toggle) return;
 
     // Load saved theme
-    const savedTheme = localStorage.getItem('wiki-theme');
-    if (savedTheme) {
+    const savedTheme = storage.getItem('wiki-theme');
+    if (['light', 'dark'].includes(savedTheme)) {
       document.documentElement.setAttribute('data-theme', savedTheme);
     }
 
     toggle.addEventListener('click', () => {
       const current = document.documentElement.getAttribute('data-theme');
-      const next = current === 'dark' ? 'light' : 'dark';
+      const isDark = current === 'dark' || (current === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      const next = isDark ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', next);
-      localStorage.setItem('wiki-theme', next);
+      storage.setItem('wiki-theme', next);
       showToast('Theme switched to ' + next, 'info');
     });
   }
@@ -108,20 +123,80 @@ export function getClientScripts(features: Features): string {
   function initMobileMenu() {
     const toggle = document.querySelector('.mobile-menu-toggle');
     const sidebar = document.querySelector('.sidebar');
-
     if (!toggle || !sidebar) return;
-
-    toggle.addEventListener('click', () => {
-      sidebar.classList.toggle('open');
+    function setOpen(open) {
+      sidebar.classList.toggle('open', open);
+      toggle.setAttribute('aria-expanded', String(open));
+    }
+    toggle.addEventListener('click', () => setOpen(!sidebar.classList.contains('open')));
+    document.addEventListener('click', (event) => {
+      if (event.target.closest('.nav-link') || (!sidebar.contains(event.target) && !toggle.contains(event.target))) setOpen(false);
     });
-
-    // Close on outside click
-    document.addEventListener('click', (e) => {
-      if (sidebar.classList.contains('open') &&
-          !sidebar.contains(e.target) &&
-          !toggle.contains(e.target)) {
-        sidebar.classList.remove('open');
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && sidebar.classList.contains('open')) {
+        setOpen(false);
+        toggle.focus();
       }
+    });
+  }
+
+  function initPageTools() {
+    document.querySelector('.copy-page')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      try {
+        const markdown = JSON.parse(document.querySelector('.page-markdown')?.textContent || '""');
+        await copyText(markdown);
+        button.textContent = 'Copied';
+        showToast('Page copied as Markdown', 'success');
+      } catch {
+        showToast('Could not copy. Use the Markdown download instead.', 'error');
+      }
+    });
+  }
+
+  async function copyText(text) {
+    if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text);
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand('copy');
+    textarea.remove();
+    if (!copied) throw new Error('Clipboard unavailable');
+  }
+
+  function initDialogs() {
+    const focusable = 'a[href], button:not([disabled]), input, textarea, select, [tabindex="0"]';
+    document.querySelectorAll('[role="dialog"]').forEach(modal => {
+      let opener;
+      let wasOpen = false;
+      new MutationObserver(() => {
+        const open = modal.classList.contains('open');
+        if (open === wasOpen) return;
+        wasOpen = open;
+        modal.setAttribute('aria-hidden', String(!open));
+        if (open) {
+          opener = document.activeElement;
+          modal.querySelector(focusable)?.focus();
+        } else if (opener?.isConnected) opener.focus();
+      }).observe(modal, { attributes: true, attributeFilter: ['class'] });
+    });
+    document.addEventListener('keydown', event => {
+      const modal = document.querySelector('[role="dialog"].open');
+      if (!modal) return;
+      if (event.key === 'Tab') {
+        const elements = [...modal.querySelectorAll(focusable)].filter(element => element.getClientRects().length);
+        const first = elements[0];
+        const last = elements[elements.length - 1];
+        if (event.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) {
+          event.preventDefault(); last?.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || !modal.contains(document.activeElement))) {
+          event.preventDefault(); first?.focus();
+        }
+      }
+      if (event.key === 'Escape') modal.querySelector('[class$="-close"], [class$="-backdrop"]')?.click();
     });
   }
 
@@ -147,7 +222,7 @@ export function getClientScripts(features: Features): string {
         const code = codeBlock.querySelector('code').textContent;
 
         try {
-          await navigator.clipboard.writeText(code);
+          await copyText(code);
           btn.classList.add('copied');
           showToast('Code copied!', 'success');
 
@@ -172,10 +247,11 @@ export function getClientScripts(features: Features): string {
          window.matchMedia('(prefers-color-scheme: dark)').matches);
 
       mermaid.initialize({
-        startOnLoad: true,
+        startOnLoad: false,
         theme: isDark ? 'dark' : 'default',
-        securityLevel: 'loose'
+        securityLevel: 'strict'
       });
+      mermaid.run({ nodes: document.querySelectorAll('.page-content .mermaid:not([data-processed])') }).catch(error => console.warn('Could not render a diagram:', error));
     }
 
     // Fullscreen buttons
@@ -228,13 +304,16 @@ export function getClientScripts(features: Features): string {
   // Table of Contents Highlighting
   // ========================================
   function initTocHighlight() {
+    tocObserver?.disconnect();
     const toc = document.querySelector('.toc-list');
     if (!toc) return;
 
     const headings = document.querySelectorAll('.heading-anchor');
     const tocLinks = toc.querySelectorAll('a');
 
-    const observer = new IntersectionObserver((entries) => {
+    tocObserver?.disconnect();
+    if (!window.IntersectionObserver) return;
+    tocObserver = new IntersectionObserver((entries) => {
       entries.forEach(entry => {
         if (entry.isIntersecting) {
           const id = entry.target.id;
@@ -245,159 +324,78 @@ export function getClientScripts(features: Features): string {
       });
     }, { rootMargin: '-100px 0px -66%' });
 
-    headings.forEach(h => observer.observe(h));
+    headings.forEach(h => tocObserver.observe(h));
   }
 
   // ========================================
   // SPA Navigation (no page reload for internal links)
   // ========================================
   function initSPANavigation() {
-    // Intercept clicks on internal links for SPA-like navigation
-    document.addEventListener('click', async (e) => {
-      const link = e.target.closest('a[href]');
-      if (!link) return;
-
-      // Skip if modifier keys are pressed (let browser handle normally)
-      if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
-
-      // Skip anchor links (same page)
-      if (link.getAttribute('href')?.startsWith('#')) return;
-
-      // Skip external links
-      const linkUrl = new URL(link.href, window.location.origin);
-      if (linkUrl.origin !== window.location.origin) return;
-
-      // Skip non-HTML links (downloads, etc.)
-      if (link.getAttribute('download')) return;
-
-      // Skip links with target="_blank"
-      if (link.target === '_blank') return;
-
-      // Skip source links (handled separately)
+    // Directly opened files use native navigation; fetch cannot read file:// pages.
+    if (window.location.protocol === 'file:') return;
+    window.history.replaceState({ spaUrl: window.location.href }, '', window.location.href);
+    document.addEventListener('click', event => {
+      const link = event.target.closest('a[href]');
+      if (!link || event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      if (link.getAttribute('href').startsWith('#') || link.hasAttribute('download') || link.target === '_blank') return;
       if (link.classList.contains('source-link') || link.classList.contains('code-source')) return;
-
-      // Check if it's an internal wiki link (.html file)
-      const path = linkUrl.pathname;
-      if (!path.endsWith('.html') && !path.endsWith('/')) return;
-
-      // Prevent default and navigate via SPA
-      e.preventDefault();
-      await navigateSPA(link.href, link);
+      const url = new URL(link.href);
+      if (!url.href.startsWith(siteRoot) || !url.pathname.endsWith('.html')) return;
+      event.preventDefault();
+      navigateSPA(url.href, link);
     });
-
-    // Handle browser back/forward
-    window.addEventListener('popstate', async (e) => {
-      if (e.state?.spaUrl) {
-        await navigateSPA(e.state.spaUrl, null, true);
-      }
+    window.addEventListener('popstate', event => {
+      if (event.state?.spaUrl) navigateSPA(event.state.spaUrl, null, true);
     });
   }
 
   async function navigateSPA(url, linkElement, isPopState = false) {
-    // Add loading state to clicked link
-    if (linkElement) {
-      linkElement.classList.add('loading');
-    }
-
+    if (window.location.protocol === 'file:') { window.location.href = url; return; }
+    const sequence = ++navigationSequence;
+    linkElement?.classList.add('loading');
     try {
       const response = await fetch(url);
       if (!response.ok) throw new Error('Page not found');
-
       const html = await response.text();
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(html, 'text/html');
-
-      // Extract key elements from new page
-      const newContent = doc.querySelector('.page-content');
-      const newTitle = doc.querySelector('title')?.textContent || 'Documentation';
-      const newToc = doc.querySelector('.toc-list');
-      const newBreadcrumbs = doc.querySelector('.breadcrumbs');
-
-      const currentContent = document.querySelector('.page-content');
-      const currentToc = document.querySelector('.toc-list');
-      const currentBreadcrumbs = document.querySelector('.breadcrumbs');
-
-      if (newContent && currentContent) {
-        // Smooth transition
-        currentContent.style.opacity = '0.5';
-
-        // Small delay for visual feedback
-        await new Promise(r => setTimeout(r, 100));
-
-        // Update content
-        currentContent.innerHTML = newContent.innerHTML;
-        currentContent.style.opacity = '1';
-
-        // Update TOC if present
-        if (newToc && currentToc) {
-          currentToc.innerHTML = newToc.innerHTML;
+      if (sequence !== navigationSequence) return;
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const newMain = doc.querySelector('.main-content');
+      const main = document.querySelector('.main-content');
+      if (!newMain || !main) throw new Error('Not a wiki page');
+      const nextConfig = JSON.parse(doc.getElementById('wiki-config')?.textContent || '{}');
+      main.innerHTML = newMain.innerHTML;
+      for (const selector of ['.sidebar', '.toc-sidebar']) {
+        const current = document.querySelector(selector);
+        const next = doc.querySelector(selector);
+        if (current && next) {
+          current.innerHTML = next.innerHTML;
+          current.className = next.className;
         }
-
-        // Update breadcrumbs if present
-        if (newBreadcrumbs && currentBreadcrumbs) {
-          currentBreadcrumbs.innerHTML = newBreadcrumbs.innerHTML;
-        }
-
-        // Update title
-        document.title = newTitle;
-
-        // Update URL (don't push state if this is a popstate navigation)
-        if (!isPopState) {
-          window.history.pushState({ spaUrl: url }, newTitle, url);
-        }
-
-        // Update config.currentPath for other features
-        const urlPath = new URL(url).pathname;
-        config.currentPath = urlPath.replace(config.rootPath, '').replace(/^\\//, '');
-
-        // Scroll to top of main content, or to hash if present
-        const hash = new URL(url).hash;
-        if (hash) {
-          const targetEl = document.querySelector(hash);
-          if (targetEl) {
-            targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          }
-        } else {
-          document.querySelector('.main-content')?.scrollTo({ top: 0, behavior: 'smooth' });
-        }
-
-        // Update active nav item
-        document.querySelectorAll('.nav-item').forEach(item => {
-          item.classList.remove('active');
-          const navLink = item.querySelector('a');
-          if (navLink && (navLink.href === url || navLink.getAttribute('href') === urlPath)) {
-            item.classList.add('active');
-          }
-        });
-
-        // Re-initialize dynamic features
-        if (window.mermaid) {
-          document.querySelectorAll('.page-content .mermaid:not([data-processed])').forEach(el => {
-            try {
-              window.mermaid.init(undefined, el);
-            } catch (err) {
-              console.warn('Mermaid init error:', err);
-            }
-          });
-        }
-
-        if (window.Prism) {
-          Prism.highlightAllUnder(currentContent);
-        }
-
-        // Reinitialize TOC highlighting
-        initTocHighlight();
-
-        showToast('Navigated to: ' + newTitle.split(' | ')[0], 'success');
       }
+      document.title = doc.title;
+      config.currentPath = nextConfig.currentPath;
+      config.rootPath = new URL(nextConfig.rootPath || './', url).href;
+      document.querySelector('.site-logo').href = config.rootPath + 'index.html';
+      document.querySelector('.mobile-menu-toggle')?.setAttribute('aria-expanded', 'false');
+      if (!isPopState) window.history.pushState({ spaUrl: url }, doc.title, url);
+      main.focus({ preventScroll: true });
+      const hash = new URL(url).hash;
+      let target;
+      try { target = hash ? document.getElementById(decodeURIComponent(hash.slice(1))) : null; } catch {}
+      if (target) target.scrollIntoView({ block: 'start' });
+      else window.scrollTo({ top: 0, behavior: 'instant' });
+      initTocHighlight();
+      initCopyButtons();
+      initPageTools();
+      initSourceLinks();
+      initScrollToTop();
+      initMermaid();
+      if (window.Prism) Prism.highlightAllUnder(main);
+      if (config.features?.progressTracking && typeof initProgressTracking === 'function') initProgressTracking();
     } catch (error) {
-      console.error('SPA navigation failed:', error);
-      // Fallback to traditional navigation
-      window.location.href = url;
+      if (sequence === navigationSequence) window.location.href = url;
     } finally {
-      if (linkElement) {
-        linkElement.classList.remove('loading');
-      }
+      linkElement?.classList.remove('loading');
     }
   }
 
@@ -410,127 +408,96 @@ export function getClientScripts(features: Features): string {
     const trigger = document.querySelector('.search-trigger');
     const input = modal?.querySelector('.search-input');
     const results = modal?.querySelector('.search-results');
-    const backdrop = modal?.querySelector('.search-modal-backdrop');
-
+    const status = modal?.querySelector('.search-status');
     if (!modal || !trigger || !input) return;
-
     let selectedIndex = -1;
-
-    // Open search
+    let debounceTimer;
+    let opener;
     trigger.addEventListener('click', openSearch);
-
     function openSearch() {
+      if (modal.classList.contains('open')) return;
+      opener = document.activeElement;
       modal.classList.add('open');
-      input.focus();
+      input.setAttribute('aria-expanded', 'true');
       document.body.style.overflow = 'hidden';
     }
-
     function closeSearch() {
+      clearTimeout(debounceTimer);
       modal.classList.remove('open');
       input.value = '';
-      results.innerHTML = '<div class="search-empty"><p>Start typing to search...</p></div>';
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-activedescendant');
+      results.innerHTML = '<div class="search-empty"><p>Start typing to search all pages.</p></div>';
+      status.textContent = '';
       document.body.style.overflow = '';
       selectedIndex = -1;
+      if (opener?.isConnected) opener.focus();
     }
-
-    // Close on backdrop/escape
-    backdrop?.addEventListener('click', closeSearch);
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && modal.classList.contains('open')) {
-        closeSearch();
-      }
-      if (e.key === '/' && !e.ctrlKey && !e.metaKey && !isInputFocused()) {
-        e.preventDefault();
-        openSearch();
+    modal.querySelector('.search-modal-backdrop')?.addEventListener('click', closeSearch);
+    modal.querySelector('.search-close')?.addEventListener('click', closeSearch);
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && modal.classList.contains('open')) closeSearch();
+      if (((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') ||
+          (event.key === '/' && !event.ctrlKey && !event.metaKey && !isInputFocused())) {
+        event.preventDefault(); openSearch();
       }
     });
-
-    // Search input handling
-    let debounceTimer;
     input.addEventListener('input', () => {
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        performSearch(input.value.trim());
-      }, 200);
+      debounceTimer = setTimeout(() => performSearch(input.value.trim()), 100);
     });
-
-    // Keyboard navigation in results
-    input.addEventListener('keydown', (e) => {
+    input.addEventListener('keydown', event => {
       const items = results.querySelectorAll('.search-result');
-
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        selectedIndex = Math.min(selectedIndex + 1, items.length - 1);
-        updateSelection(items);
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        selectedIndex = Math.max(selectedIndex - 1, 0);
-        updateSelection(items);
-      } else if (e.key === 'Enter' && selectedIndex >= 0) {
-        e.preventDefault();
-        items[selectedIndex]?.click();
+      if (event.key === 'ArrowDown') {
+        event.preventDefault(); selectedIndex = Math.min(selectedIndex + 1, items.length - 1); updateSelection(items);
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault(); selectedIndex = Math.max(selectedIndex - 1, 0); updateSelection(items);
+      } else if (event.key === 'Enter' && selectedIndex >= 0) {
+        event.preventDefault(); items[selectedIndex]?.click();
       }
     });
-
     function updateSelection(items) {
-      items.forEach((item, i) => {
-        item.classList.toggle('selected', i === selectedIndex);
+      items.forEach((item, index) => {
+        item.classList.toggle('selected', index === selectedIndex);
+        item.setAttribute('aria-selected', String(index === selectedIndex));
       });
       if (items[selectedIndex]) {
+        input.setAttribute('aria-activedescendant', items[selectedIndex].id);
         items[selectedIndex].scrollIntoView({ block: 'nearest' });
-      }
+      } else input.removeAttribute('aria-activedescendant');
     }
-
     function performSearch(query) {
       selectedIndex = -1;
-
-      if (!query || query.length < 2) {
-        results.innerHTML = '<div class="search-empty"><p>Start typing to search...</p><div class="search-hints"><p><kbd>Enter</kbd> to select</p><p><kbd>↑</kbd> <kbd>↓</kbd> to navigate</p><p><kbd>ESC</kbd> to close</p></div></div>';
+      input.removeAttribute('aria-activedescendant');
+      if (query.length < 2) {
+        results.innerHTML = '<div class="search-empty"><p>Type at least two characters to search all pages.</p></div>';
+        status.textContent = '';
         return;
       }
-
-      const queryLower = query.toLowerCase();
-      const matches = state.searchIndex.filter(page => {
-        return page.title.toLowerCase().includes(queryLower) ||
-               page.content.toLowerCase().includes(queryLower) ||
-               page.headings.some(h => h.toLowerCase().includes(queryLower));
-      }).slice(0, 10);
-
-      if (matches.length === 0) {
-        results.innerHTML = '<div class="search-empty"><p>No results found for "' + escapeHtml(query) + '"</p></div>';
+      const terms = query.toLowerCase().split(/\\s+/).filter(Boolean);
+      const matches = state.searchIndex.map(page => {
+        const title = page.title.toLowerCase();
+        const headings = page.headings.join(' ').toLowerCase();
+        const content = page.content.toLowerCase();
+        if (!terms.every(term => title.includes(term) || headings.includes(term) || content.includes(term))) return null;
+        const score = terms.reduce((total, term) => total + (title.includes(term) ? 10 : 0) + (headings.includes(term) ? 4 : 0) + (content.includes(term) ? 1 : 0), 0);
+        return { ...page, score };
+      }).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 20);
+      status.textContent = matches.length + (matches.length === 1 ? ' result' : ' results');
+      if (!matches.length) {
+        results.innerHTML = '<div class="search-empty"><p>No pages match “' + escapeHtml(query) + '”.</p><p>Try a component name or a shorter phrase.</p></div>';
         return;
       }
-
-      results.innerHTML = matches.map(match => {
-        const snippet = getSnippet(match.content, query);
-        return \`
-          <a href="\${config.rootPath}\${match.path}" class="search-result">
-            <div class="search-result-title">\${escapeHtml(match.title)}</div>
-            <div class="search-result-snippet">\${snippet}</div>
-          </a>
-        \`;
+      results.innerHTML = matches.map((page, index) => {
+        const firstTerm = terms.find(term => page.content.toLowerCase().includes(term));
+        const position = firstTerm ? page.content.toLowerCase().indexOf(firstTerm) : 0;
+        const start = Math.max(0, position - 55);
+        const snippet = (start ? '…' : '') + page.content.slice(start, start + 180) + (page.content.length > start + 180 ? '…' : '');
+        return '<a href="' + escapeAttribute(siteRoot + page.path) + '" class="search-result" role="option" id="search-result-' + index + '" aria-selected="false"><div class="search-result-title">' + escapeHtml(page.title) + '</div><div class="search-result-path">' + escapeHtml(page.path.replace(/\\.html$/, '')) + '</div><div class="search-result-snippet">' + escapeHtml(snippet) + '</div></a>';
       }).join('');
-
-      // Add click handlers to close search
-      results.querySelectorAll('.search-result').forEach(result => {
-        result.addEventListener('click', closeSearch);
-      });
-    }
-
-    function getSnippet(content, query) {
-      const index = content.toLowerCase().indexOf(query.toLowerCase());
-      if (index === -1) return '';
-
-      const start = Math.max(0, index - 50);
-      const end = Math.min(content.length, index + query.length + 50);
-      let snippet = content.slice(start, end);
-
-      if (start > 0) snippet = '...' + snippet;
-      if (end < content.length) snippet = snippet + '...';
-
-      // Highlight matches
-      const regex = new RegExp('(' + escapeRegex(query) + ')', 'gi');
-      return escapeHtml(snippet).replace(regex, '<mark>$1</mark>');
+      selectedIndex = 0;
+      updateSelection(results.querySelectorAll('.search-result'));
+      results.querySelectorAll('.search-result').forEach(result => result.addEventListener('click', closeSearch));
     }
   }
   ` : ''}
@@ -582,15 +549,7 @@ export function getClientScripts(features: Features): string {
     overlay?.querySelector('.tour-btn-prev')?.addEventListener('click', prevTourStep);
     overlay?.querySelector('.tour-btn-next')?.addEventListener('click', nextTourStep);
 
-    // Check if first visit - show tour offer
-    if (!localStorage.getItem('wiki-tour-seen')) {
-      setTimeout(() => {
-        if (state.manifest.tours.length > 0) {
-          openTourSelector();
-          localStorage.setItem('wiki-tour-seen', 'true');
-        }
-      }, 1000);
-    }
+    // Tours are available on demand without interrupting the first page view.
   }
 
   function openTourSelector() {
@@ -764,6 +723,12 @@ export function getClientScripts(features: Features): string {
 
     modal.querySelector('.code-explorer-backdrop')?.addEventListener('click', closeCodeExplorer);
     modal.querySelector('.code-explorer-close')?.addEventListener('click', closeCodeExplorer);
+    modal.querySelector('.copy-source-reference')?.addEventListener('click', async () => {
+      try {
+        await copyText(modal.dataset.source || '');
+        showToast('Source location copied', 'success');
+      } catch { showToast('Select and copy the source location above.', 'info'); }
+    });
   }
 
   function openCodeExplorer(sourceRef) {
@@ -776,34 +741,15 @@ export function getClientScripts(features: Features): string {
 
     const [, filePath, startLine, endLine] = match;
 
+    modal.dataset.source = sourceRef;
     modal.querySelector('.code-explorer-file').textContent = filePath;
     modal.querySelector('.code-explorer-info').textContent =
       startLine ? 'Lines ' + startLine + (endLine ? '-' + endLine : '') : 'Full file';
 
-    // Show loading state
     const codeEl = modal.querySelector('.code-explorer-code');
-    codeEl.textContent = 'Loading...';
+    codeEl.textContent = sourceRef + '\\n\\nOpen this location in your repository or editor. Source files are not bundled with the documentation.';
     modal.classList.add('open');
     document.body.style.overflow = 'hidden';
-
-    // In a real implementation, this would fetch from the repo
-    // For static sites, we show a placeholder with navigation hint
-    setTimeout(() => {
-      codeEl.innerHTML = \`<span class="comment">// Source: \${escapeHtml(sourceRef)}</span>
-<span class="comment">// This code viewer shows source references from the documentation.</span>
-<span class="comment">// In the full version, code is fetched from your repository.</span>
-
-<span class="comment">// Navigate to:</span>
-<span class="string">"\${escapeHtml(filePath)}"</span>
-\${startLine ? '<span class="comment">// Lines: ' + startLine + (endLine ? '-' + endLine : '') + '</span>' : ''}
-
-<span class="comment">// Tip: Use the source links in code blocks to navigate</span>
-<span class="comment">// directly to the relevant code in your editor or IDE.</span>\`;
-
-      if (window.Prism) {
-        Prism.highlightElement(codeEl);
-      }
-    }, 300);
   }
 
   function closeCodeExplorer() {
@@ -936,7 +882,7 @@ export function getClientScripts(features: Features): string {
   ${features.progressTracking ? `
   function initProgressTracking() {
     // Load read pages from storage
-    const saved = localStorage.getItem('wiki-read-pages');
+    const saved = storage.getItem('wiki-read-pages:' + siteRoot);
     if (saved) {
       try {
         state.readPages = new Set(JSON.parse(saved));
@@ -961,12 +907,12 @@ export function getClientScripts(features: Features): string {
   }
 
   function saveReadPages() {
-    localStorage.setItem('wiki-read-pages', JSON.stringify([...state.readPages]));
+    storage.setItem('wiki-read-pages:' + siteRoot, JSON.stringify([...state.readPages]));
   }
 
   function updateProgressUI() {
     const totalPages = state.manifest?.pages?.length || 1;
-    const readCount = state.readPages.size;
+    const readCount = (state.manifest?.pages || []).filter(page => state.readPages.has(page.path)).length;
     const percentage = Math.round((readCount / totalPages) * 100);
 
     const fill = document.querySelector('.progress-fill');
@@ -1046,6 +992,9 @@ export function getClientScripts(features: Features): string {
     // Toggle chat panel open/close
     function toggleChatPanel() {
       const isOpen = document.body.classList.toggle('chat-open');
+      panel.inert = !isOpen;
+      toggleBtn.setAttribute('aria-expanded', String(isOpen));
+      if (!isOpen) toggleBtn.focus();
       if (isOpen) {
         loadAIModel();
         input?.focus();
@@ -1091,14 +1040,14 @@ export function getClientScripts(features: Features): string {
           resizeHandle.classList.remove('dragging');
           // Save width preference
           try {
-            localStorage.setItem('chat-panel-width', panel.style.width);
+            storage.setItem('chat-panel-width', panel.style.width);
           } catch (e) {}
         }
       });
 
       // Restore saved width
       try {
-        const savedWidth = localStorage.getItem('chat-panel-width');
+        const savedWidth = storage.getItem('chat-panel-width');
         if (savedWidth) {
           panel.style.width = savedWidth;
           document.documentElement.style.setProperty('--chat-panel-width', savedWidth);
@@ -1110,13 +1059,16 @@ export function getClientScripts(features: Features): string {
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && document.body.classList.contains('chat-open')) {
         document.body.classList.remove('chat-open');
+        panel.inert = true;
+        toggleBtn.setAttribute('aria-expanded', 'false');
+        toggleBtn.focus();
       }
     });
 
     // SPA navigation for links in chat (including source links)
     messagesContainer?.addEventListener('click', (e) => {
       const link = e.target.closest('a[href]');
-      if (link && link.href) {
+      if (link && link.href && window.location.protocol !== 'file:' && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey) {
         // Check if it's an internal link (same origin)
         const linkUrl = new URL(link.href, window.location.origin);
         const isInternal = linkUrl.origin === window.location.origin;
@@ -1237,8 +1189,8 @@ export function getClientScripts(features: Features): string {
 
     // Check for private/incognito mode (localStorage may be unavailable)
     try {
-      localStorage.setItem('__test__', '1');
-      localStorage.removeItem('__test__');
+      window.localStorage.setItem('__test__', '1');
+      window.localStorage.removeItem('__test__');
     } catch (e) {
       issues.push('Private browsing mode detected - storage unavailable');
     }
@@ -1500,7 +1452,7 @@ export function getClientScripts(features: Features): string {
               ? s.title + ' → ' + s.sectionTitle
               : s.title;
             const shortDisplay = displayTitle.length > 35 ? displayTitle.slice(0, 32) + '...' : displayTitle;
-            return '<a href="' + url + '" class="source-link" title="' + escapeHtml(displayTitle) + '">' +
+            return '<a href="' + escapeAttribute(url) + '" class="source-link" title="' + escapeAttribute(displayTitle) + '">' +
               '<span class="source-icon">📄</span>' +
               '<span class="source-title">' + escapeHtml(shortDisplay) + '</span>' +
               '</a>';
@@ -1559,7 +1511,7 @@ export function getClientScripts(features: Features): string {
     if (sources && sources.length > 0) {
       sourcesHtml = '<div class="chat-message-sources"><span class="sources-label">📚 Related docs:</span><div class="sources-list">' +
         sources.map(s =>
-          '<a href="' + config.rootPath + s.path + '" class="source-link" title="' + escapeHtml(s.title) + '">' +
+          '<a href="' + escapeAttribute(config.rootPath + s.path) + '" class="source-link" title="' + escapeAttribute(s.title) + '">' +
           '<span class="source-icon">📄</span>' +
           '<span class="source-title">' + escapeHtml(s.title) + '</span>' +
           '</a>'
@@ -1614,7 +1566,7 @@ export function getClientScripts(features: Features): string {
     });
 
     // Now handle paragraphs
-    let formatted = processedContent
+    let formatted = escapeHtml(processedContent)
       .split('\\n\\n')
       .filter(p => p.trim())
       .map(p => '<p>' + p.replace(/\\n/g, '<br>') + '</p>')
@@ -1631,27 +1583,31 @@ export function getClientScripts(features: Features): string {
               el.innerHTML = result.svg;
             }).catch(e => {
               console.warn('Mermaid render error:', e);
-              el.innerHTML = '<pre>' + item.diagram + '</pre>';
+              el.innerHTML = '<pre>' + escapeHtml(item.diagram) + '</pre>';
             });
           } catch (e) {
             console.warn('Mermaid render error:', e);
-            el.innerHTML = '<pre>' + item.diagram + '</pre>';
+            el.innerHTML = '<pre>' + escapeHtml(item.diagram) + '</pre>';
           }
         }
       }, 100);
-      formatted = formatted.replace('%%%MERMAID_' + idx + '%%%', '<div class="chat-diagram-container"><div class="mermaid" id="' + item.id + '">' + item.diagram + '</div></div>');
+      formatted = formatted.replace('%%%MERMAID_' + idx + '%%%', '<div class="chat-diagram-container"><div class="mermaid" id="' + item.id + '">' + escapeHtml(item.diagram) + '</div></div>');
     });
 
     // Restore code blocks
     codeBlocks.forEach((item, idx) => {
-      formatted = formatted.replace('%%%CODE_' + idx + '%%%', '<pre><code class="language-' + item.lang + '">' + item.code + '</code></pre>');
+      formatted = formatted.replace('%%%CODE_' + idx + '%%%', '<pre><code class="language-' + item.lang + '">' + escapeHtml(item.code) + '</code></pre>');
     });
 
     // Inline code
     formatted = formatted.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
 
     // Markdown links [text](url)
-    formatted = formatted.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2">$1</a>');
+    formatted = formatted.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, (_, label, href) => {
+      const normalized = href.replace(/[\\u0000-\\u0020\\u007f]/g, '');
+      if (/^[a-z][a-z0-9+.-]*:/i.test(normalized) && !/^(https?|mailto):/i.test(normalized)) return label;
+      return '<a href="' + escapeAttribute(href) + '">' + label + '</a>';
+    });
 
     // Bold and italic
     formatted = formatted
@@ -1682,7 +1638,7 @@ export function getClientScripts(features: Features): string {
             // Don't replace if already inside a link or code
             const before = string.substring(Math.max(0, offset - 50), offset);
             if (before.includes('<a ') || before.includes('<code')) return match;
-            return '<a href="' + config.rootPath + page.path + '" class="inline-doc-link" title="View: ' + page.title + '">' + p1 + '</a>';
+            return '<a href="' + escapeAttribute(config.rootPath + page.path) + '" class="inline-doc-link" title="View: ' + escapeAttribute(page.title) + '">' + p1 + '</a>';
           });
         }
       });
@@ -2138,7 +2094,7 @@ export function getClientScripts(features: Features): string {
         let sourcesHtml = '';
         if (sources && sources.length > 0) {
           sourcesHtml = '<div class="chat-message-sources">Sources: ' +
-            sources.map(s => '<a href="' + config.rootPath + s.path + '">' + escapeHtml(s.title) + '</a>').join(', ') +
+            sources.map(s => '<a href="' + escapeAttribute(config.rootPath + s.path) + '">' + escapeHtml(s.title) + '</a>').join(', ') +
             '</div>';
         }
 
@@ -2334,78 +2290,10 @@ export function getClientScripts(features: Features): string {
     return answer;
   }
 
-  // SPA-like navigation for chat links
+  // Chat links share the same history, sidebar, and content update path.
   async function navigateWithSPA(url, linkElement) {
-    // Add loading state
-    if (linkElement) {
-      linkElement.classList.add('loading');
-    }
-
-    try {
-      const response = await fetch(url);
-      if (!response.ok) throw new Error('Failed to fetch page');
-
-      const html = await response.text();
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(html, 'text/html');
-
-      // Extract the main content
-      const newContent = doc.querySelector('.page-content');
-      const newTitle = doc.querySelector('.page-title')?.textContent || document.title;
-      const currentContent = document.querySelector('.page-content');
-
-      if (newContent && currentContent) {
-        // Update the page content
-        currentContent.innerHTML = newContent.innerHTML;
-
-        // Update the page title
-        document.title = newTitle;
-
-        // Update browser history
-        window.history.pushState({ url }, newTitle, url);
-
-        // Scroll main content to top
-        document.querySelector('.main-content')?.scrollTo({ top: 0, behavior: 'smooth' });
-
-        // Update active nav item
-        document.querySelectorAll('.nav-item').forEach(item => {
-          item.classList.remove('active');
-          const link = item.querySelector('a');
-          if (link && link.href === url) {
-            item.classList.add('active');
-          }
-        });
-
-        // Re-initialize any dynamic features in new content
-        if (window.mermaid) {
-          document.querySelectorAll('.page-content .mermaid').forEach(el => {
-            try {
-              window.mermaid.init(undefined, el);
-            } catch (e) {
-              console.warn('Mermaid init error:', e);
-            }
-          });
-        }
-
-        showToast('Navigated to: ' + newTitle, 'success');
-      }
-    } catch (error) {
-      console.error('SPA navigation error:', error);
-      // Fallback to regular navigation
-      window.location.href = url;
-    } finally {
-      if (linkElement) {
-        linkElement.classList.remove('loading');
-      }
-    }
+    return navigateSPA(url, linkElement);
   }
-
-  // Handle browser back/forward
-  window.addEventListener('popstate', (e) => {
-    if (e.state?.url) {
-      navigateWithSPA(e.state.url, null);
-    }
-  });
   ` : ''}
 
   // ========================================
@@ -2416,6 +2304,7 @@ export function getClientScripts(features: Features): string {
     return active && (
       active.tagName === 'INPUT' ||
       active.tagName === 'TEXTAREA' ||
+      active.tagName === 'SELECT' ||
       active.contentEditable === 'true'
     );
   }
@@ -2424,6 +2313,10 @@ export function getClientScripts(features: Features): string {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+  }
+
+  function escapeAttribute(text) {
+    return escapeHtml(text).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   function escapeRegex(string) {

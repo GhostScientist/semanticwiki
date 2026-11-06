@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         # Matches the `engines.node` floor in package.json and the current LTS.
-        node-version: ['20.19', '22.x']
+        node-version: ['24.x', '26.x']
 
     steps:
       - uses: actions/checkout@v7
@@ -41,6 +41,12 @@ jobs:
       - name: Test
         run: npm test
 
+      - name: CLI and package contracts
+        run: npm run check:cli
+
+      - name: Check published contents
+        run: npm pack --dry-run --ignore-scripts
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
@@ -49,15 +55,11 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 22.x
+          node-version: 24.x
           cache: npm
 
-      # Gate on `critical` rather than `high`: `@huggingface/transformers` pins
-      # `sharp@^0.34`, which carries an unfixed high-severity libvips advisory
-      # (GHSA-f88m-g3jw-g9cj). SemanticWiki only uses transformers for text
-      # embeddings and never decodes images, so it is tracked, not blocking.
       - name: npm audit
-        run: npm audit --audit-level=critical
+        run: npm audit --audit-level=high
 
       - name: Report all advisories (informational)
         if: always()

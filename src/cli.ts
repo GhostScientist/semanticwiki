@@ -2,10 +2,14 @@
 
 import { config as loadEnv } from 'dotenv';
 import { resolve } from 'path';
-import { fileURLToPath } from 'url';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
+import { resolveProviderOptions, requireProviderCredential } from './cli-options.js';
+import { getRuntimePaths } from './runtime-paths.js';
+import { registerManagementCommands } from './cli-management.js';
+import { exportKnowledgeBundle } from './knowledge-export.js';
+import { collectRepositoryChanges, documentationCommit, documentationFingerprint } from './wiki-updates.js';
 import chalk from 'chalk';
 import ora from 'ora';
 import inquirer from 'inquirer';
@@ -31,24 +35,81 @@ loadEnv({ path: resolve(workingDir, '.env'), quiet: true });
 // Load Claude Code configuration (skills, commands, memory)
 const claudeConfig = loadClaudeConfig(workingDir);
 
-// Read the version from package.json rather than hardcoding it, so `--version`
-// cannot drift from the published release. Resolved relative to this module
-// (dist/cli.js -> ../package.json) so it works for global installs too.
-function readPackageVersion(): string {
-  try {
-    const pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
-    return JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-}
-
 const program = new Command();
+
+// Read the version from the package that is actually being executed. Keeping
+// this next to package.json means `semanticwiki --version` cannot silently
+// drift from the published artifact when the package version changes.
+const packageVersion = (() => {
+  try {
+    const packageUrl = new URL('../package.json', import.meta.url);
+    const packageJson = JSON.parse(fs.readFileSync(packageUrl, 'utf8')) as { version?: string };
+    return packageJson.version || '0.0.0-dev';
+  } catch {
+    return '0.0.0-dev';
+  }
+})();
 
 program
   .name('semanticwiki')
   .description('Generate architectural documentation wikis for code repositories with source traceability.')
-  .version(readPackageVersion());
+  .version(packageVersion);
+
+function positiveInteger(value: string): number {
+  if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw new InvalidArgumentError('must be a positive whole number');
+  }
+  return Number(value);
+}
+
+function nonnegativeInteger(value: string): number {
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw new InvalidArgumentError('must be a non-negative whole number');
+  }
+  return Number(value);
+}
+
+async function confirmAction(message: string, options: { yes?: boolean; nonInteractive?: boolean }): Promise<boolean> {
+  if (options.yes) return true;
+  if (!process.stdin.isTTY || options.nonInteractive) {
+    throw new Error('This command updates existing pages. Pass --yes to confirm in a non-interactive run.');
+  }
+  return (await inquirer.prompt([{ type: 'confirm', name: 'confirmed', message, default: false }])).confirmed;
+}
+
+async function finalizeWiki(agent: ArchitecturalWikiAgent, options: { output: string; repo?: string; siteTitle?: string; provider?: string; model?: string; json?: boolean }) {
+  const wikiDir = path.resolve(options.output);
+  const verification = await agent.verifyWikiCompleteness(wikiDir);
+  const runContext = agent.getRunContext();
+  const sourcePath = runContext.repositoryPath || (options.repo && fs.existsSync(options.repo) ? path.resolve(options.repo) : undefined);
+  const bundle = await exportKnowledgeBundle({ wikiDir, title: options.siteTitle, repoPath: sourcePath, sourceRepo: sourcePath ? undefined : options.repo });
+  const knowledgeManifest = JSON.parse(fs.readFileSync(bundle.manifestPath, 'utf8'));
+  let sourceFingerprint: string | undefined;
+  let previousDocumentationCommit: string | undefined;
+  let previousDocumentationFingerprint: string | undefined;
+  try {
+    const indexState = JSON.parse(fs.readFileSync(path.join(wikiDir, '.semanticwiki-cache/index-state.json'), 'utf8'));
+    sourceFingerprint = indexState.sourceFingerprint;
+    previousDocumentationCommit = documentationCommit(wikiDir, indexState);
+    previousDocumentationFingerprint = documentationFingerprint(wikiDir, indexState);
+  } catch { /* Index optional for imported wikis. */ }
+  const result = { formatVersion: 1, status: verification.isComplete ? 'complete' : 'incomplete', output: wikiDir, provider: options.provider, model: runContext.model || options.model, sourcePath, sourceCommit: knowledgeManifest.sourceCommit, sourceFingerprint, documentationCommit: verification.isComplete ? knowledgeManifest.sourceCommit : previousDocumentationCommit, documentationSourceFingerprint: verification.isComplete ? sourceFingerprint : previousDocumentationFingerprint, verification, knowledge: bundle };
+  fs.writeFileSync(path.join(wikiDir, '.semanticwiki-run.json'), JSON.stringify({ ...result, generatedAt: new Date().toISOString(), generatorVersion: packageVersion }, null, 2) + '\n');
+  if (!verification.isComplete) {
+    throw new Error(`Wiki is incomplete (${verification.totalPages} pages, ${verification.brokenLinks.length} broken links). Run semanticwiki continue -r <repo> -o ${JSON.stringify(wikiDir)} --yes to resume.`);
+  }
+  return result;
+}
+
+registerManagementCommands(program);
+program.command('preview')
+  .description('Build a portable static site from an existing wiki, without a model or API key')
+  .option('-o, --output <dir>', 'Wiki directory', './wiki')
+  .option('-r, --repo <path>', 'Source repository for source links (uses the last run when available)')
+  .option('--site-title <title>', 'Site title')
+  .option('--theme <theme>', 'light, dark, or auto', 'auto')
+  .option('--ai-chat', 'Opt in to browser AI chat and its model downloads')
+  .action(generateStaticSite);
 
 // Config command
 program
@@ -62,7 +123,8 @@ program
     if (options.show) {
       const config = configManager.get();
       console.log(chalk.cyan('\n📋 Current Configuration:'));
-      console.log(chalk.gray('API Key:'), config.apiKey ? '***' + config.apiKey.slice(-4) : chalk.red('Not set'));
+      console.log(chalk.gray('API Key:'), config.apiKey ? 'Configured' : chalk.red('Not set'));
+      console.log(chalk.gray('OpenAI API key:'), config.openaiApiKey ? 'Configured' : 'Not set');
       console.log(chalk.gray('Source:'), process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY ? 'Environment variable' : 'Config file');
       return;
     }
@@ -79,11 +141,14 @@ program
 program
   .command('generate')
   .description('Generate architectural documentation wiki for a repository')
-  .requiredOption('-r, --repo <url>', 'Repository URL (GitHub/GitLab) or local path')
+  .option('-r, --repo <url>', 'Repository URL (GitHub/GitLab) or local path', '.')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
   .option('-c, --config <file>', 'Path to wiki configuration file (wiki.json)')
   .option('-t, --token <token>', 'Access token for private repositories')
-  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
+  .option('--provider <provider>', 'Writer: anthropic, openai, local, ollama, or claude-code (default: anthropic)')
+  .option('-m, --model <model>', 'Override the selected provider model')
+  .option('--non-interactive', 'Never prompt for input')
+  .option('-y, --yes', 'Confirm updates to existing wiki pages')
   .option('-p, --path <path>', 'Specific path within repo to focus on')
   .option('-f, --force', 'Force regeneration (ignore cache)')
   .option('-v, --verbose', 'Verbose output')
@@ -92,38 +157,43 @@ program
   .option('--site-only', 'Only generate static site (skip wiki generation, use existing markdown)')
   .option('--site-title <title>', 'Site title for static site')
   .option('--theme <theme>', 'Site theme: light, dark, or auto', 'auto')
-  .option('--max-chunks <number>', 'Maximum chunks to index (for large codebases, e.g., 5000)', parseInt)
-  .option('--max-results <number>', 'Maximum search results per query (default 10, reduce for large codebases)', parseInt)
-  .option('--batch-size <number>', 'Enable batched mode: process codebase in batches of N chunks (for very large repos)', parseInt)
+  .option('--max-chunks <number>', 'Maximum chunks to index (for large codebases, e.g., 5000)', positiveInteger)
+  .option('--max-results <number>', 'Maximum search results per query (default 10, reduce for large codebases)', positiveInteger)
+  .option('--batch-size <number>', 'Enable batched mode: process codebase in batches of N chunks (for very large repos)', positiveInteger)
   .option('--skip-index', 'Skip indexing and use existing cached index (for debugging agent behavior)')
-  .option('--max-turns <number>', 'Maximum agent turns (default 200, lower to reduce cost estimate)', parseInt)
+  .option('--max-turns <number>', 'Maximum agent turns (default 200, lower to reduce cost estimate)', positiveInteger)
   .option('--direct-api', 'Use Anthropic API directly (bypasses Claude Code billing, uses your API credits)')
   .option('--ai-chat', 'Enable AI chat feature with semantic search in generated site')
   // Local mode options
   .option('--full-local', 'Run entirely locally without cloud APIs (requires initial model download)')
-  .option('--local-model <model>', 'Local model to use (default: auto-selected based on hardware)')
-  // Note: --model-family removed, now only supports gpt-oss-20b (21B model)
+  .option('--local-model <model>', 'Local model registry ID or Ollama model name')
   .option('--model-path <path>', 'Path to a local GGUF model file')
   .option('--use-ollama', 'Use Ollama server instead of bundled inference')
   .option('--ollama-host <url>', 'Ollama server URL (default: http://localhost:11434)')
-  .option('--gpu-layers <n>', 'Number of GPU layers to offload (default: auto)', parseInt)
-  .option('--context-size <n>', 'Context window size for local models (default: 32768)', parseInt)
-  .option('--threads <n>', 'CPU threads for local inference (default: auto)', parseInt)
+  .option('--gpu-layers <n>', 'Number of GPU layers to offload (default: auto)', nonnegativeInteger)
+  .option('--context-size <n>', 'Context window size for local models (default: 8192)', positiveInteger)
+  .option('--threads <n>', 'CPU threads for local inference (default: auto)', positiveInteger)
   .option('--compact-search', 'Truncate search results to reduce token usage (auto-enabled for large codebases)')
-  .action(async (options) => {
+  // Contextual retrieval options
+  .option('--contextual', 'Enable contextual retrieval for better chunk understanding (uses Claude API)')
+  .option('--contextual-local', 'Use local LLM for contextual retrieval instead of Claude API')
+  .option('--contextual-model <model>', 'Claude model for optional contextual retrieval (default: current Sonnet)')
+  .option('--contextual-ollama-model <model>', 'Ollama model for local contextual retrieval (default: qwen2.5-coder:7b)')
+  .option('--contextual-preview [n]', 'Preview contextual enrichment on N sample chunks (default: 10)', positiveInteger)
+  .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
 
-      // API key only required for cloud mode
-      if (!options.fullLocal && !configManager.hasApiKey()) {
-        console.log(chalk.red('❌ No API key found.'));
-        console.log(chalk.yellow('\nSet your Anthropic API key:'));
-        console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
-        console.log(chalk.yellow('\nOr use local mode (no API key needed):'));
-        console.log(chalk.gray('  semanticwiki generate -r ./repo --full-local'));
-        process.exit(1);
+      // Site generation is a pure transformation of existing Markdown. It
+      // must not prompt for a model or require cloud credentials.
+      if (options.siteOnly) {
+        await generateStaticSite(options);
+        return;
       }
+
+      Object.assign(options, resolveProviderOptions(options));
+      if (!options.estimate) requireProviderCredential(options.provider, config);
 
       // Show mode banner
       if (options.fullLocal) {
@@ -131,7 +201,7 @@ program
         if (options.useOllama) {
           console.log(chalk.gray('Using Ollama backend at:'), chalk.yellow(options.ollamaHost || 'http://localhost:11434'));
         } else {
-          const familyName = options.modelFamily === 'qwen' ? 'Qwen' : 'LFM (LiquidAI)';
+          const familyName = 'SemanticWiki Coder 7B v2';
           console.log(chalk.gray('Using self-contained local inference with'), chalk.yellow(familyName), chalk.gray('models'));
         }
       } else {
@@ -146,6 +216,7 @@ program
       const agent = new ArchitecturalWikiAgent({
         verbose: options.verbose,
         apiKey: config.apiKey,
+        openaiApiKey: config.openaiApiKey,
         permissionManager
       });
 
@@ -240,10 +311,7 @@ program
             console.log(chalk.gray('  Total:'), chalk.green.bold(`~${estimate.estimatedTime.totalMinutes} min`));
             console.log();
 
-            console.log(chalk.white.bold('💰 Estimated Cost (Claude Sonnet)'));
-            console.log(chalk.gray('  Input tokens:'), chalk.yellow(`$${estimate.estimatedCost.input.toFixed(2)}`));
-            console.log(chalk.gray('  Output tokens:'), chalk.yellow(`$${estimate.estimatedCost.output.toFixed(2)}`));
-            console.log(chalk.gray('  Total:'), chalk.green.bold(`$${estimate.estimatedCost.total.toFixed(2)}`));
+            console.log(chalk.gray('Cost depends on the selected model, caching and actual tool turns. This is a sizing heuristic, not a billing quote.'));
             console.log();
           }
 
@@ -286,10 +354,12 @@ program
         return;
       }
 
-      // Handle --site-only mode (generate site from existing markdown)
-      if (options.siteOnly) {
-        await generateStaticSite(options);
-        return;
+      if (options.contextualPreview === undefined && fs.existsSync(options.output)) {
+        const { listWikiMarkdown } = await import('./wiki-catalog.js');
+        if (listWikiMarkdown(path.resolve(options.output)).length && !await confirmAction('Regenerate existing wiki pages? This may replace their contents.', options)) {
+          console.log('Generation cancelled.');
+          return;
+        }
       }
 
       const spinner = ora('Starting wiki generation...').start();
@@ -302,6 +372,7 @@ program
         configPath: options.config,
         accessToken: options.token || process.env.GITHUB_TOKEN,
         model: options.model,
+        provider: options.provider,
         targetPath: options.path,
         forceRegenerate: options.force,
         verbose: options.verbose,
@@ -314,15 +385,131 @@ program
         // Local mode options
         fullLocal: options.fullLocal,
         localModel: options.localModel,
-        modelFamily: 'gpt-oss' as const, // Only gpt-oss is supported
         modelPath: options.modelPath,
         useOllama: options.useOllama,
         ollamaHost: options.ollamaHost,
         gpuLayers: options.gpuLayers,
         contextSize: options.contextSize,
         threads: options.threads,
-        compactSearch: options.compactSearch
+        compactSearch: options.compactSearch,
+        // Contextual retrieval options
+        useContextualRetrieval: options.contextual || options.contextualLocal,
+        contextualLocal: options.contextualLocal,
+        contextualUseOllama: options.contextualLocal && options.useOllama,  // Use Ollama if both flags set
+        contextualModel: options.contextualModel,
+        contextualOllamaHost: options.ollamaHost,  // Reuse Ollama host if set
+        contextualLocalModel: options.contextualOllamaModel
       };
+
+      // Handle --contextual-preview mode
+      if (options.contextualPreview !== undefined) {
+        spinner.stop();
+        console.log(chalk.cyan.bold('\n🔍 Contextual Retrieval Preview\n'));
+
+        const sampleSize = typeof options.contextualPreview === 'number' ? options.contextualPreview : 10;
+
+        // Import required modules
+        const { ASTChunker } = await import('./ast-chunker.js');
+        const { ContextualRetrieval } = await import('./rag/contextual-retrieval.js');
+        const simpleGit = await import('simple-git');
+        const { glob } = await import('glob');
+        const fsModule = await import('fs');
+
+        // Clone/prepare repo
+        const repoDir = options.repo.startsWith('http') || options.repo.includes('@')
+          ? `/tmp/semanticwiki-preview-${Date.now()}`
+          : path.resolve(options.repo);
+
+        if (options.repo.startsWith('http') || options.repo.includes('@')) {
+          console.log(chalk.gray('Cloning repository...'));
+          const git = simpleGit.simpleGit();
+          await git.clone(options.repo, repoDir, ['--depth', '1']);
+        }
+
+        // Find source files
+        console.log(chalk.gray('Finding source files...'));
+        const searchPath = options.path ? path.join(repoDir, options.path) : repoDir;
+        const files = await glob('**/*.{ts,tsx,js,jsx,py,java,go,rs,rb,php,cs,cpp,c,h}', {
+          cwd: searchPath,
+          ignore: ['**/node_modules/**', '**/dist/**', '**/build/**', '**/.git/**', '**/vendor/**'],
+        });
+
+        // Chunk files
+        console.log(chalk.gray('Chunking files...'));
+        const chunker = new ASTChunker();
+        const chunks: import('./ast-chunker.js').ASTChunk[] = [];
+
+        for (const file of files.slice(0, 50)) { // Limit files for preview
+          try {
+            const relativePath = options.path ? path.join(options.path, file) : file;
+            const fileChunks = await chunker.chunkFile(relativePath, repoDir);
+            chunks.push(...fileChunks);
+          } catch {
+            // Skip files that fail to chunk
+          }
+        }
+        console.log(chalk.gray(`  Found ${chunks.length} chunks from ${Math.min(files.length, 50)} files\n`));
+
+        // Initialize contextual retrieval
+        const contextualRetrieval = new ContextualRetrieval({
+          enabled: true,
+          useLocal: options.contextualLocal || options.fullLocal,
+          useOllama: options.useOllama,
+          apiKey: config.apiKey,
+          model: options.contextualModel,
+          ollamaHost: options.ollamaHost,
+          localModel: options.contextualOllamaModel,
+        });
+
+        console.log(chalk.gray('Initializing LLM...'));
+        await contextualRetrieval.initialize();
+
+        // Run preview
+        console.log(chalk.gray(`Generating context for ${sampleSize} sample chunks...\n`));
+        const preview = await contextualRetrieval.previewEnrichment(chunks, repoDir, sampleSize);
+
+        // Display results
+        console.log(chalk.white.bold('Mode:'), chalk.yellow(preview.mode));
+        console.log(chalk.white.bold('Total chunks:'), chalk.yellow(preview.totalChunks.toString()));
+        console.log(chalk.white.bold('Sample size:'), chalk.yellow(preview.sampleSize.toString()));
+        console.log();
+
+        // Count by status
+        const statusCounts = { success: 0, empty: 0, fallback: 0, error: 0 };
+        for (const sample of preview.samples) {
+          statusCounts[sample.status]++;
+        }
+
+        console.log(chalk.green(`  ✓ ${statusCounts.success} successful`));
+        if (statusCounts.empty > 0) console.log(chalk.yellow(`  ⚠ ${statusCounts.empty} empty responses`));
+        if (statusCounts.error > 0) console.log(chalk.red(`  ✗ ${statusCounts.error} errors`));
+        console.log();
+
+        // Show samples
+        console.log(chalk.cyan.bold('Sample Results:\n'));
+        for (let i = 0; i < preview.samples.length; i++) {
+          const sample = preview.samples[i];
+          const statusIcon = sample.status === 'success' ? '✓' : sample.status === 'empty' ? '⚠' : '✗';
+          const statusColor = sample.status === 'success' ? chalk.green : sample.status === 'empty' ? chalk.yellow : chalk.red;
+
+          console.log(statusColor(`[${i + 1}] ${statusIcon} ${sample.filePath}`));
+          if (sample.name) {
+            console.log(chalk.gray(`    ${sample.chunkType || 'chunk'}: ${sample.name}`));
+          }
+          console.log(chalk.white('    Context:'), chalk.cyan(sample.contextualPrefix || '(empty)'));
+          console.log();
+        }
+
+        // Cleanup
+        await contextualRetrieval.cleanup();
+
+        // Clean up temp dir if we cloned
+        if (options.repo.startsWith('http') || options.repo.includes('@')) {
+          fsModule.rmSync(repoDir, { recursive: true, force: true });
+        }
+
+        return;
+      }
 
       // Choose generator based on options
       let generator;
@@ -331,7 +518,7 @@ program
         console.log(chalk.yellow('\n🏠 Local mode: Page-by-page generation\n'));
         generator = agent.generateWikiLocalPageByPage(generationOptions);
       } else if (options.directApi) {
-        console.log(chalk.yellow('\n⚡ Direct API mode: Using Anthropic API directly (bypasses Claude Code)\n'));
+        console.log(chalk.yellow('\n⚡ Direct API mode: Using the selected cloud API directly\n'));
         generator = agent.generateWikiDirectApi(generationOptions);
       } else if (options.skipIndex) {
         console.log(chalk.yellow('\n⚡ Skip-index mode: Using existing cached index (debug mode)\n'));
@@ -377,7 +564,7 @@ program
           } else if (event.type === 'complete') {
             spinner.succeed(chalk.green('Wiki generation complete!'));
           } else if (event.type === 'error') {
-            spinner.fail(chalk.red(event.message));
+            throw new Error(event.message);
           }
           // Handle agent streaming messages
           else if ((event as any).type === 'stream_event') {
@@ -402,6 +589,7 @@ program
         }
 
         console.log();
+        await finalizeWiki(agent, options);
         console.log(chalk.cyan('📁 Wiki generated at:'), chalk.white(path.resolve(options.output)));
 
         // Generate static site if requested
@@ -428,22 +616,21 @@ program
 // Update-docs command - incremental documentation updates
 program
   .command('update-docs')
-  .description('Update documentation based on changes since last index')
+  .description('Regenerate documentation when its source contents change')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
+  .option('--provider <provider>', 'Writer: anthropic, openai, local, ollama, or claude-code (default: anthropic)')
+  .option('-m, --model <model>', 'Override the selected provider model')
+  .option('--non-interactive', 'Never prompt for input')
+  .option('-y, --yes', 'Confirm updates to existing wiki pages')
   .option('-v, --verbose', 'Verbose output')
-  .action(async (options) => {
+  .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
 
-      if (!configManager.hasApiKey()) {
-        console.log(chalk.red('❌ No API key found.'));
-        console.log(chalk.yellow('\nSet your Anthropic API key:'));
-        console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
-        process.exit(1);
-      }
+      Object.assign(options, resolveProviderOptions(options));
+      if (!options.verifyOnly && !options.dryRun) requireProviderCredential(options.provider, config);
 
       const wikiDir = path.resolve(options.output);
       const cacheDir = path.join(wikiDir, '.semanticwiki-cache');
@@ -462,26 +649,18 @@ program
       console.log(chalk.white('Indexed at:'), chalk.green(new Date(indexState.indexedAt).toLocaleString()));
       console.log();
 
-      // Get changed files since last index
-      const git = (await import('simple-git')).simpleGit(options.repo);
-      const currentLog = await git.log({ maxCount: 1 });
-      const currentCommit = currentLog.latest?.hash || 'unknown';
+      const baseline = documentationCommit(wikiDir, indexState);
+      const { currentCommit, changes, requiresFullRefresh } = await collectRepositoryChanges(options.repo, baseline, wikiDir);
+      const changedFiles = changes.map(change => change.file);
 
-      if (currentCommit === indexState.commitHash) {
-        console.log(chalk.green('✓ Documentation is up to date. No changes since last index.'));
-        return;
-      }
-
-      const diffResult = await git.diff(['--name-only', indexState.commitHash, 'HEAD']);
-      const changedFiles = diffResult.split('\n').filter(f => f.trim().length > 0);
-
-      if (changedFiles.length === 0) {
+      if (changedFiles.length === 0 && !requiresFullRefresh) {
         console.log(chalk.green('✓ No relevant file changes detected.'));
         return;
       }
 
       console.log(chalk.white('Current commit:'), chalk.green(currentCommit.slice(0, 7)));
       console.log(chalk.white('Changed files:'), chalk.yellow(changedFiles.length.toString()));
+      if (requiresFullRefresh) console.log(chalk.yellow('Source contents differ from the documented snapshot; this will regenerate the wiki.'));
       console.log();
 
       // Show changed files
@@ -498,12 +677,7 @@ program
       console.log();
 
       // Prompt for confirmation
-      const { confirm } = await inquirer.prompt([{
-        type: 'confirm',
-        name: 'confirm',
-        message: `Update documentation for ${relevantFiles.length} changed files?`,
-        default: true
-      }]);
+      const confirm = await confirmAction(requiresFullRefresh ? 'Refresh documentation for the current source contents?' : `Update documentation for ${relevantFiles.length} changed files?`, options);
 
       if (!confirm) {
         console.log(chalk.yellow('\nUpdate cancelled.'));
@@ -517,6 +691,7 @@ program
       const agent = new ArchitecturalWikiAgent({
         verbose: options.verbose,
         apiKey: config.apiKey,
+        openaiApiKey: config.openaiApiKey,
         permissionManager
       });
 
@@ -525,11 +700,15 @@ program
       // Future: Pass changedFiles to agent for targeted updates
 
       try {
-        for await (const event of agent.generateWiki({
+        for await (const event of (options.fullLocal ? agent.generateWikiLocalPageByPage.bind(agent) : options.directApi ? agent.generateWikiDirectApi.bind(agent) : agent.generateWiki.bind(agent))({
           repoUrl: options.repo,
           outputDir: options.output,
           model: options.model,
+        provider: options.provider,
           verbose: options.verbose,
+          fullLocal: options.fullLocal, useOllama: options.useOllama,
+          localModel: options.localModel, modelPath: options.modelPath, ollamaHost: options.ollamaHost,
+          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns,
           forceRegenerate: true  // Force re-index to update commit hash
         })) {
           if (event.type === 'phase') {
@@ -537,11 +716,12 @@ program
           } else if (event.type === 'complete') {
             spinner.succeed(chalk.green('Documentation updated!'));
           } else if (event.type === 'error') {
-            spinner.fail(chalk.red(event.message));
+            throw new Error(event.message);
           }
         }
 
         console.log();
+        await finalizeWiki(agent, options);
         console.log(chalk.cyan('📁 Wiki updated at:'), chalk.white(wikiDir));
         console.log(chalk.gray('Tip: Run with --site flag to regenerate the static site.'));
         console.log();
@@ -563,6 +743,8 @@ program
   .option('-o, --output <dir>', 'Output directory for wiki (where .semanticwiki-cache lives)', './wiki')
   .option('-v, --verbose', 'Verbose output')
   .option('--full', 'Force full re-index instead of incremental update')
+  .option('-y, --yes', 'Confirm updating the existing index')
+  .option('--non-interactive', 'Never prompt for input')
   .action(async (options) => {
     try {
       const wikiDir = path.resolve(options.output);
@@ -577,6 +759,8 @@ program
       }
 
       const indexState = JSON.parse(fs.readFileSync(indexStatePath, 'utf-8'));
+      const documentedCommit = documentationCommit(wikiDir, indexState);
+      const documentedFingerprint = documentationFingerprint(wikiDir, indexState);
       console.log(chalk.cyan.bold('\n🔄 Update Embeddings Index\n'));
       console.log(chalk.white('Repository:'), chalk.green(path.resolve(options.repo)));
       console.log(chalk.white('Last indexed commit:'), chalk.green(indexState.commitHash.slice(0, 7)));
@@ -586,20 +770,16 @@ program
 
       // Import RAGSystem and git
       const { RAGSystem } = await import('./rag/index.js');
-      const git = (await import('simple-git')).simpleGit(options.repo);
-
-      // Get current commit
-      const currentLog = await git.log({ maxCount: 1 });
-      const currentCommit = currentLog.latest?.hash || 'unknown';
-
-      if (currentCommit === indexState.commitHash && !options.full) {
-        console.log(chalk.green('✓ Index is up to date. No changes since last index.'));
-        return;
+      const ragSystem = new RAGSystem({
+        storePath: cacheDir,
+        repoPath: path.resolve(options.repo)
+      });
+      const { currentCommit, changes, requiresFullRefresh } = await collectRepositoryChanges(options.repo, indexState.commitHash, wikiDir, { purpose: 'index', baselineFingerprint: indexState.sourceFingerprint });
+      const fullReindex = options.full || !ragSystem.isIndexCompatible(indexState) || requiresFullRefresh;
+      if (fullReindex && !options.full) {
+        console.log(chalk.yellow(requiresFullRefresh ? 'Source contents changed; a full re-index is required.' : 'Embedding model changed; a full re-index is required.'));
       }
-
-      // Get changed files
-      const diffResult = await git.diff(['--name-only', indexState.commitHash, 'HEAD']);
-      const changedFiles = diffResult.split('\n').filter(f => f.trim().length > 0);
+      const changedFiles = changes.map(change => change.file);
 
       // Filter to only indexable files
       const indexableExts = [
@@ -615,12 +795,14 @@ program
         indexableExts.some(ext => f.endsWith(ext))
       );
 
-      if (relevantFiles.length === 0 && !options.full) {
+      if (relevantFiles.length === 0 && !fullReindex) {
         console.log(chalk.green('✓ No relevant source files changed.'));
 
         // Update index state to current commit anyway
         const updatedState = {
           ...indexState,
+          documentationCommit: documentedCommit,
+          documentationSourceFingerprint: documentedFingerprint,
           commitHash: currentCommit,
           indexedAt: new Date().toISOString()
         };
@@ -646,14 +828,9 @@ program
       }
 
       // Prompt for confirmation
-      const { confirm } = await inquirer.prompt([{
-        type: 'confirm',
-        name: 'confirm',
-        message: options.full
+      const confirm = await confirmAction(fullReindex
           ? 'Perform full re-index?'
-          : `Update embeddings for ${relevantFiles.length} changed files?`,
-        default: true
-      }]);
+          : `Update embeddings for ${relevantFiles.length} changed files?`, options);
 
       if (!confirm) {
         console.log(chalk.yellow('\nUpdate cancelled.'));
@@ -662,17 +839,11 @@ program
 
       const spinner = ora('Updating embeddings...').start();
 
-      // Create RAG system
-      const ragSystem = new RAGSystem({
-        storePath: cacheDir,
-        repoPath: path.resolve(options.repo)
-      });
-
       try {
-        if (options.full) {
+        if (fullReindex) {
           // Full re-index
           spinner.text = 'Performing full re-index...';
-          await ragSystem.indexRepository();
+          await ragSystem.indexRepository({ force: true });
           spinner.succeed(chalk.green('Full re-index complete!'));
         } else {
           // Incremental update
@@ -689,6 +860,9 @@ program
         }
 
         console.log();
+        // Preserve the documentation baseline when refreshing only retrieval data.
+        const refreshedState = JSON.parse(fs.readFileSync(indexStatePath, 'utf8'));
+        fs.writeFileSync(indexStatePath, JSON.stringify({ ...refreshedState, documentationCommit: documentedCommit, documentationSourceFingerprint: documentedFingerprint }, null, 2) + '\n');
         console.log(chalk.cyan('✓ Index updated successfully.'));
         console.log(chalk.gray('Run `semanticwiki update-wiki` to update affected documentation.'));
         console.log();
@@ -711,21 +885,20 @@ program
   .description('Update wiki documentation based on code changes (handles both modifications and new additions)')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
+  .option('--provider <provider>', 'Writer: anthropic, openai, local, ollama, or claude-code (default: anthropic)')
+  .option('-m, --model <model>', 'Override the selected provider model')
+  .option('--non-interactive', 'Never prompt for input')
+  .option('-y, --yes', 'Confirm updates to existing wiki pages')
   .option('-v, --verbose', 'Verbose output')
   .option('--direct-api', 'Use Anthropic API directly (bypasses Claude Code billing)')
   .option('--dry-run', 'Show what would be updated without making changes')
-  .action(async (options) => {
+  .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
 
-      if (!configManager.hasApiKey()) {
-        console.log(chalk.red('❌ No API key found.'));
-        console.log(chalk.yellow('\nSet your Anthropic API key:'));
-        console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
-        process.exit(1);
-      }
+      Object.assign(options, resolveProviderOptions(options));
+      if (!options.verifyOnly && !options.dryRun) requireProviderCredential(options.provider, config);
 
       const wikiDir = path.resolve(options.output);
       const cacheDir = path.join(wikiDir, '.semanticwiki-cache');
@@ -745,30 +918,8 @@ program
       console.log(chalk.white('Last indexed commit:'), chalk.green(indexState.commitHash.slice(0, 7)));
       console.log();
 
-      // Get changed files since last index
-      const git = (await import('simple-git')).simpleGit(options.repo);
-      const currentLog = await git.log({ maxCount: 1 });
-      const currentCommit = currentLog.latest?.hash || 'unknown';
-
-      if (currentCommit === indexState.commitHash) {
-        console.log(chalk.green('✓ Wiki is up to date. No changes since last index.'));
-        console.log(chalk.gray('Tip: Run `semanticwiki update-embeddings` first if you have new commits.'));
-        return;
-      }
-
-      // Get diff with status to know which files are new vs modified
-      const diffResult = await git.diff(['--name-status', indexState.commitHash, 'HEAD']);
-      const diffLines = diffResult.split('\n').filter(l => l.trim().length > 0);
-
-      // Parse diff results
-      const changes: { status: string; file: string }[] = [];
-      for (const line of diffLines) {
-        const [status, ...pathParts] = line.split('\t');
-        const file = pathParts.join('\t'); // Handle files with tabs in names
-        if (file) {
-          changes.push({ status: status.charAt(0), file });
-        }
-      }
+      const baseline = documentationCommit(wikiDir, indexState);
+      const { currentCommit, changes, requiresFullRefresh } = await collectRepositoryChanges(options.repo, baseline, wikiDir);
 
       // Filter to relevant source files
       const relevantExts = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.kt', '.rb', '.php', '.c', '.cpp', '.cs', '.swift'];
@@ -776,7 +927,7 @@ program
         relevantExts.some(ext => c.file.endsWith(ext))
       );
 
-      if (relevantChanges.length === 0) {
+      if (relevantChanges.length === 0 && !requiresFullRefresh) {
         console.log(chalk.green('✓ No relevant source code changes detected.'));
         return;
       }
@@ -785,7 +936,6 @@ program
       const newFiles = relevantChanges.filter(c => c.status === 'A').map(c => c.file);
       const modifiedFiles = relevantChanges.filter(c => c.status === 'M').map(c => c.file);
       const deletedFiles = relevantChanges.filter(c => c.status === 'D').map(c => c.file);
-      const renamedFiles = relevantChanges.filter(c => c.status === 'R').map(c => c.file);
 
       console.log(chalk.white.bold('Changes detected:'));
       if (newFiles.length > 0) {
@@ -801,13 +951,15 @@ program
       if (deletedFiles.length > 0) {
         console.log(chalk.red(`  - ${deletedFiles.length} deleted files (will update references)`));
       }
-      if (renamedFiles.length > 0) {
-        console.log(chalk.blue(`  → ${renamedFiles.length} renamed files`));
-      }
       console.log();
 
       // Find affected wiki pages
-      const affectedPages = await findAffectedWikiPages(wikiDir, [...newFiles, ...modifiedFiles, ...deletedFiles]);
+      const affectedPages = requiresFullRefresh
+        ? (await import('./wiki-catalog.js')).listWikiMarkdown(wikiDir)
+        : await findAffectedWikiPages(wikiDir, [...newFiles, ...modifiedFiles, ...deletedFiles]);
+      if (requiresFullRefresh) {
+        console.log(chalk.yellow('Source contents differ from the documented snapshot; refreshing all existing wiki pages.'));
+      }
 
       if (affectedPages.length > 0) {
         console.log(chalk.white.bold('Wiki pages to update:'));
@@ -825,7 +977,7 @@ program
       for (const file of newFiles) {
         // Check if there's already a wiki page for this file's directory/module
         const dirName = path.dirname(file);
-        const moduleName = dirName.split('/').pop() || path.basename(file, path.extname(file));
+        const moduleName = dirName === '.' ? path.basename(file, path.extname(file)) : path.basename(dirName);
         const potentialPages = [
           `${moduleName}.md`,
           `${dirName.replace(/\//g, '-')}.md`,
@@ -875,12 +1027,7 @@ program
         return;
       }
 
-      const { confirm } = await inquirer.prompt([{
-        type: 'confirm',
-        name: 'confirm',
-        message: `Update ${affectedPages.length} pages and create ${pagesToCreate.length} new pages?`,
-        default: true
-      }]);
+      const confirm = await confirmAction(`Update ${affectedPages.length} pages and create ${pagesToCreate.length} new pages?`, options);
 
       if (!confirm) {
         console.log(chalk.yellow('\nUpdate cancelled.'));
@@ -893,6 +1040,7 @@ program
       const agent = new ArchitecturalWikiAgent({
         verbose: options.verbose,
         apiKey: config.apiKey,
+        openaiApiKey: config.openaiApiKey,
         permissionManager
       });
 
@@ -902,8 +1050,12 @@ program
           repoUrl: options.repo,
           outputDir: options.output,
           model: options.model,
+        provider: options.provider,
           verbose: options.verbose,
           directApi: options.directApi,
+          fullLocal: options.fullLocal, useOllama: options.useOllama,
+          localModel: options.localModel, modelPath: options.modelPath, ollamaHost: options.ollamaHost,
+          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns,
           // Pass the surgical update context
           updateContext: {
             newFiles,
@@ -916,7 +1068,7 @@ program
 
         // Use direct API mode for surgical updates to the specific pages
         let generator;
-        if (options.directApi) {
+        if (options.directApi || options.fullLocal) {
           generator = agent.generateWikiDirectApi(generationOptions);
         } else {
           generator = agent.generateWiki(generationOptions);
@@ -934,11 +1086,12 @@ program
           } else if ((event as ProgressEvent).type === 'complete') {
             spinner.succeed(chalk.green('Wiki updated!'));
           } else if ((event as ProgressEvent).type === 'error') {
-            spinner.fail(chalk.red((event as ProgressEvent).message));
+            throw new Error((event as ProgressEvent).message);
           }
         }
 
         console.log();
+        await finalizeWiki(agent, options);
         console.log(chalk.cyan('✓ Wiki documentation updated.'));
         console.log(chalk.gray('Tip: Run `semanticwiki verify` to check for any broken links.'));
         console.log();
@@ -965,7 +1118,7 @@ async function findAffectedWikiPages(wikiDir: string, changedFiles: string[]): P
   const glob = (await import('glob')).glob;
   const wikiFiles = await glob('**/*.md', {
     cwd: wikiDir,
-    ignore: ['node_modules/**', '.semanticwiki-cache/**']
+    ignore: ['node_modules/**', '.semanticwiki-cache/**', 'knowledge/**', 'site/**']
   });
 
   // Normalize changed file paths for matching
@@ -1030,23 +1183,22 @@ program
   .description('Continue generating missing wiki pages (verifies completeness and creates missing pages)')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
+  .option('--provider <provider>', 'Writer: anthropic, openai, local, ollama, or claude-code (default: anthropic)')
+  .option('-m, --model <model>', 'Override the selected provider model')
+  .option('--non-interactive', 'Never prompt for input')
+  .option('-y, --yes', 'Confirm updates to existing wiki pages')
   .option('-v, --verbose', 'Verbose output')
   .option('--verify-only', 'Only verify completeness, do not generate missing pages')
   .option('--skip-index', 'Skip indexing and use existing cached index')
   .option('--direct-api', 'Use Anthropic API directly (bypasses Claude Code billing)')
-  .option('--max-turns <number>', 'Maximum agent turns (default 200)', parseInt)
-  .action(async (options) => {
+  .option('--max-turns <number>', 'Maximum agent turns (default 200)', positiveInteger)
+  .action(async (options, command: Command) => {
     try {
       const configManager = new ConfigManager();
       const config = await configManager.load();
 
-      if (!configManager.hasApiKey()) {
-        console.log(chalk.red('❌ No API key found.'));
-        console.log(chalk.yellow('\nSet your Anthropic API key:'));
-        console.log(chalk.gray('  export ANTHROPIC_API_KEY=your-key-here'));
-        process.exit(1);
-      }
+      Object.assign(options, resolveProviderOptions(options));
+      if (!options.verifyOnly && !options.dryRun) requireProviderCredential(options.provider, config);
 
       const wikiDir = path.resolve(options.output);
 
@@ -1064,10 +1216,11 @@ program
       const agent = new ArchitecturalWikiAgent({
         verbose: options.verbose,
         apiKey: config.apiKey,
+        openaiApiKey: config.openaiApiKey,
         permissionManager
       });
 
-      const verification = await agent.verifyWikiCompleteness(wikiDir);
+      const verification = await agent.verifyWikiCompleteness(wikiDir, { repoPath: path.resolve(options.repo) });
 
       console.log(chalk.white('Total pages:'), chalk.green(verification.totalPages.toString()));
       console.log(chalk.white('Broken links:'), verification.brokenLinks.length > 0
@@ -1118,12 +1271,7 @@ program
       }
 
       // Prompt for confirmation
-      const { confirm } = await inquirer.prompt([{
-        type: 'confirm',
-        name: 'confirm',
-        message: `Generate ${uniqueMissing.length} missing pages?`,
-        default: true
-      }]);
+      const confirm = await confirmAction(`Generate ${uniqueMissing.length} missing pages?`, options);
 
       if (!confirm) {
         console.log(chalk.yellow('\nGeneration cancelled.'));
@@ -1138,16 +1286,19 @@ program
         repoUrl: options.repo,
         outputDir: options.output,
         model: options.model,
+        provider: options.provider,
         verbose: options.verbose,
         missingPages: uniqueMissing,  // Pass normalized paths for targeted generation
         skipIndex: options.skipIndex,
         directApi: options.directApi,
-        maxTurns: options.maxTurns
+        fullLocal: options.fullLocal, useOllama: options.useOllama,
+          localModel: options.localModel, modelPath: options.modelPath, ollamaHost: options.ollamaHost,
+          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns
       };
 
       let generator;
-      if (options.directApi) {
-        console.log(chalk.yellow('\n⚡ Direct API mode: Using Anthropic API directly\n'));
+      if (options.directApi || options.fullLocal) {
+        console.log(chalk.yellow('\n⚡ Direct API mode: Using the selected cloud API directly\n'));
         generator = agent.generateWikiDirectApi(generationOptions);
       } else if (options.skipIndex) {
         console.log(chalk.yellow('\n⚡ Skip-index mode: Using existing cached index\n'));
@@ -1163,7 +1314,7 @@ program
           } else if ((event as ProgressEvent).type === 'complete') {
             spinner.succeed(chalk.green('Missing pages generated!'));
           } else if ((event as ProgressEvent).type === 'error') {
-            spinner.fail(chalk.red((event as ProgressEvent).message));
+            throw new Error((event as ProgressEvent).message);
           }
         }
 
@@ -1180,6 +1331,7 @@ program
         }
 
         console.log();
+        await finalizeWiki(agent, options);
         console.log(chalk.cyan('📁 Wiki at:'), chalk.white(wikiDir));
         console.log();
       } catch (error) {
@@ -1212,6 +1364,7 @@ program
       const permissionManager = new PermissionManager({ policy: 'permissive' });
       const agent = new ArchitecturalWikiAgent({
         apiKey: config.apiKey,
+        openaiApiKey: config.openaiApiKey,
         permissionManager
       });
 
@@ -1312,146 +1465,59 @@ program
     }
   });
 
-// Search command - search the wiki and codebase
-program
-  .command('search')
-  .description('Search the wiki documentation and codebase')
+// Search does not need a model for wiki text or cached keyword code search.
+program.command('search')
+  .description('Search wiki pages or indexed code; JSON output is suitable for agents')
   .argument('<query>', 'Search query')
   .option('-o, --output <dir>', 'Wiki directory', './wiki')
-  .option('-n, --max-results <number>', 'Maximum results', parseInt, 10)
-  .option('-m, --mode <mode>', 'Search mode: hybrid, vector, or keyword', 'hybrid')
-  .option('--code', 'Search code using RAG index instead of wiki pages')
-  .option('--rerank', 'Enable reranking for more accurate results (slower)')
-  .action(async (query, options) => {
-    try {
-      const wikiDir = path.resolve(options.output);
-
-      if (options.code) {
-        // Search code using RAG
-        const cacheDir = path.join(wikiDir, '.semanticwiki-cache');
-
-        if (!fs.existsSync(path.join(cacheDir, 'metadata.json'))) {
-          console.log(chalk.red('❌ No RAG index found.'));
-          console.log(chalk.gray('Run `semanticwiki generate` first to create the index.'));
-          process.exit(1);
-        }
-
-        console.log(chalk.cyan.bold('\n🔍 Code Search\n'));
-        console.log(chalk.gray(`Query: ${query}`));
-        console.log(chalk.gray(`Mode: ${options.mode}`));
-        console.log();
-
+  .option('-n, --max-results <number>', 'Maximum results (1–100)', positiveInteger, 10)
+  .option('-m, --mode <mode>', 'Code search mode: hybrid, vector, or keyword', 'hybrid')
+  .option('--code', 'Search cached source code')
+  .option('--rerank', 'Rerank code results (may download a local model)')
+  .option('--json', 'Return structured results with paths and excerpts')
+  .action(async (query: string, options) => {
+    if (!query.trim()) throw new Error('Search query cannot be empty.');
+    if (options.maxResults > 100) throw new Error('--max-results must be between 1 and 100.');
+    if (!['hybrid', 'vector', 'keyword'].includes(options.mode)) throw new Error('Search mode must be hybrid, vector, or keyword.');
+    const wikiDir = path.resolve(options.output);
+    if (!fs.existsSync(wikiDir)) throw new Error(`Wiki directory not found: ${wikiDir}`);
+    let results: any[];
+    if (options.code) {
+      const cacheDir = path.join(wikiDir, '.semanticwiki-cache');
+      if (!fs.existsSync(path.join(cacheDir, 'metadata.json'))) throw new Error('No code index found. Run semanticwiki generate first.');
+      const originalLog = console.log;
+      console.log = console.error;
+      try {
         const { RAGSystem } = await import('./rag/index.js');
-        const rag = new RAGSystem({
-          storePath: cacheDir,
-          repoPath: wikiDir,
-          useHybridSearch: options.mode !== 'vector',
-          useReranking: options.rerank
-        });
-
-        await rag.loadMetadataOnly();
-
-        const results = await rag.search(query, {
-          maxResults: options.maxResults,
-          mode: options.mode as 'hybrid' | 'vector' | 'keyword',
-          rerank: options.rerank
-        });
-
-        if (results.length === 0) {
-          console.log(chalk.yellow('No results found.'));
-          return;
-        }
-
-        console.log(chalk.green(`Found ${results.length} results:\n`));
-
-        for (const [i, result] of results.entries()) {
-          console.log(chalk.white.bold(`${i + 1}. ${result.filePath}:${result.startLine}-${result.endLine}`));
-          console.log(chalk.gray(`   Type: ${result.chunkType || 'code'}${result.name ? ` | Name: ${result.name}` : ''}`));
-
-          const scores: string[] = [`Score: ${result.score.toFixed(3)}`];
-          if (result.vectorScore !== undefined) scores.push(`Vector: ${result.vectorScore.toFixed(3)}`);
-          if (result.bm25Score !== undefined) scores.push(`BM25: ${result.bm25Score.toFixed(3)}`);
-          console.log(chalk.gray(`   ${scores.join(' | ')}`));
-
-          // Show preview
-          const preview = result.content.split('\n').slice(0, 5).join('\n');
-          console.log(chalk.dim('   ' + preview.split('\n').join('\n   ')));
-          console.log();
-        }
-      } else {
-        // Search wiki pages
-        if (!fs.existsSync(wikiDir)) {
-          console.log(chalk.red('❌ Wiki directory not found: ' + wikiDir));
-          process.exit(1);
-        }
-
-        console.log(chalk.cyan.bold('\n🔍 Wiki Search\n'));
-        console.log(chalk.gray(`Query: ${query}`));
-        console.log();
-
-        // Simple keyword search through wiki pages
-        const mdFiles = await (await import('glob')).glob('**/*.md', { cwd: wikiDir });
-        const results: Array<{ path: string; title: string; score: number; preview: string }> = [];
-        const queryWords = query.toLowerCase().split(/\s+/).filter((w: string) => w.length > 2);
-
-        for (const file of mdFiles) {
-          const content = fs.readFileSync(path.join(wikiDir, file), 'utf-8');
-          const { data: frontmatter, content: body } = (await import('gray-matter')).default(content);
-
-          const title = frontmatter.title || path.basename(file, '.md');
-          const titleLower = title.toLowerCase();
-          const bodyLower = body.toLowerCase();
-
-          let score = 0;
-          for (const word of queryWords) {
-            if (titleLower.includes(word)) score += 10;
-            if (bodyLower.includes(word)) score += 1;
-          }
-
-          if (score > 0) {
-            // Find preview snippet
-            let preview = '';
-            const lines = body.split('\n');
-            for (const line of lines) {
-              if (queryWords.some((w: string) => line.toLowerCase().includes(w))) {
-                preview = line.trim().slice(0, 200);
-                break;
-              }
-            }
-
-            results.push({ path: file, title, score, preview: preview || lines[0]?.trim().slice(0, 200) || '' });
-          }
-        }
-
-        results.sort((a, b) => b.score - a.score);
-        const topResults = results.slice(0, options.maxResults);
-
-        if (topResults.length === 0) {
-          console.log(chalk.yellow('No results found.'));
-          return;
-        }
-
-        console.log(chalk.green(`Found ${results.length} results (showing top ${topResults.length}):\n`));
-
-        for (const [i, result] of topResults.entries()) {
-          console.log(chalk.white.bold(`${i + 1}. ${result.title}`));
-          console.log(chalk.gray(`   Path: ${result.path}`));
-          console.log(chalk.dim(`   ${result.preview}...`));
-          console.log();
-        }
-      }
-    } catch (error) {
-      console.error(chalk.red('\nError:'), error instanceof Error ? error.message : String(error));
-      process.exit(1);
+        const rag = new RAGSystem({ storePath: cacheDir, repoPath: wikiDir, useHybridSearch: options.mode !== 'vector', useReranking: options.rerank });
+        await rag.loadMetadataOnly({ migrateEmbeddings: options.mode !== 'keyword' });
+        results = await rag.search(query, { maxResults: options.maxResults, mode: options.mode, rerank: options.rerank });
+      } finally { console.log = originalLog; }
+    } else {
+      const { loadWikiCatalog } = await import('./wiki-catalog.js');
+      const words = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
+      results = loadWikiCatalog(wikiDir).map(page => {
+        const title = page.title.toLocaleLowerCase();
+        const body = page.content.toLocaleLowerCase();
+        const score = words.reduce((total, word) => total + (title.includes(word) ? 10 : 0) + (body.includes(word) ? 1 : 0), 0);
+        const offset = Math.max(0, Math.min(...words.map(word => body.indexOf(word)).filter(i => i >= 0)) - 80);
+        const preview = page.content.slice(Number.isFinite(offset) ? offset : 0, (Number.isFinite(offset) ? offset : 0) + 400).replace(/\s+/g, ' ').trim();
+        return { path: page.path, title: page.title, type: page.type, score, preview, headings: page.headings.map(h => ({ id: h.id, title: h.title })) };
+      }).filter(result => result.score > 0).sort((a, b) => b.score - a.score || a.path.localeCompare(b.path)).slice(0, options.maxResults);
+    }
+    if (options.json) console.log(JSON.stringify({ formatVersion: 1, query, kind: options.code ? 'code' : 'wiki', results }, null, 2));
+    else {
+      console.log(`${results.length} result${results.length === 1 ? '' : 's'} for “${query}”\n`);
+      for (const result of results) console.log(`${result.title || result.filePath} · ${result.path || `${result.filePath}:${result.startLine}-${result.endLine}`}\n  ${result.preview || result.content.slice(0, 400).replace(/\s+/g, ' ')}\n`);
     }
   });
 
 // Package command - create portable wiki package
 program
   .command('pack')
-  .description('Create a portable .archiwiki package from wiki directory')
+  .description('Create a portable .semantics package from wiki directory')
   .option('-o, --output <dir>', 'Wiki directory to package', './wiki')
-  .option('-f, --file <path>', 'Output package file path (default: wiki name + .archiwiki)')
+  .option('-f, --file <path>', 'Output package file path (default: wiki name + .semantics)')
   .option('-n, --name <name>', 'Package name')
   .option('-d, --description <text>', 'Package description')
   .option('--source-repo <url>', 'Source repository URL')
@@ -1465,11 +1531,11 @@ program
         process.exit(1);
       }
 
-      console.log(chalk.cyan.bold('\n📦 Creating ArchiWiki Package\n'));
+      console.log(chalk.cyan.bold('\n📦 Creating SemanticWiki Package\n'));
 
       const { createPackage } = await import('./package-format.js');
 
-      const outputPath = options.file || path.join(path.dirname(wikiDir), `${path.basename(wikiDir)}.archiwiki`);
+      const outputPath = options.file || path.join(path.dirname(wikiDir), `${path.basename(wikiDir)}.semantics`);
 
       await createPackage({
         wikiPath: wikiDir,
@@ -1490,8 +1556,8 @@ program
 // Unpack command - extract portable wiki package
 program
   .command('unpack')
-  .description('Extract an .archiwiki package to a directory')
-  .argument('<package>', 'Path to .archiwiki package file')
+  .description('Extract a .semantics package to a directory')
+  .argument('<package>', 'Path to .semantics package file')
   .option('-o, --output <dir>', 'Output directory', '.')
   .option('--wiki-only', 'Extract only wiki files, skip RAG index')
   .option('--info', 'Show package info without extracting')
@@ -1541,7 +1607,7 @@ program
         return;
       }
 
-      console.log(chalk.cyan.bold('\n📦 Extracting ArchiWiki Package\n'));
+      console.log(chalk.cyan.bold('\n📦 Extracting SemanticWiki Package\n'));
 
       const manifest = await extractPackage({
         packagePath: pkgPath,
@@ -1568,8 +1634,9 @@ async function generateStaticSite(options: {
 }) {
   console.log(chalk.cyan.bold('\n🌐 Generating Interactive Static Site\n'));
 
+  if (options.theme && !['light', 'dark', 'auto'].includes(options.theme)) throw new Error('Theme must be light, dark, or auto.');
   const wikiDir = path.resolve(options.output);
-  const siteDir = path.join(path.dirname(wikiDir), 'site');
+  const siteDir = path.join(wikiDir, 'site');
 
   // Check if wiki directory exists
   if (!fs.existsSync(wikiDir)) {
@@ -1581,6 +1648,15 @@ async function generateStaticSite(options: {
   const spinner = ora('Building static site...').start();
 
   try {
+    let sourceRepoPath = options.repo && fs.existsSync(options.repo) ? path.resolve(options.repo) : undefined;
+    if (!options.repo) {
+      try {
+        const previous = JSON.parse(fs.readFileSync(path.join(wikiDir, '.semanticwiki-run.json'), 'utf8'));
+        if (typeof previous.sourcePath === 'string' && path.isAbsolute(previous.sourcePath) && fs.existsSync(previous.sourcePath)) sourceRepoPath = previous.sourcePath;
+      } catch { /* Imported wikis can be previewed without a local checkout. */ }
+    }
+    const knowledgeExport = await exportKnowledgeBundle({ wikiDir, title: options.siteTitle, repoPath: sourceRepoPath, sourceRepo: sourceRepoPath ? undefined : options.repo });
+    const knowledgeManifest = JSON.parse(fs.readFileSync(knowledgeExport.manifestPath, 'utf8'));
     const siteGenerator = new SiteGenerator({
       wikiDir,
       outputDir: siteDir,
@@ -1595,7 +1671,8 @@ async function generateStaticSite(options: {
         keyboardNav: true,
         aiChat: options.aiChat || false
       },
-      repoUrl: options.repo || ''
+      repoUrl: knowledgeManifest.sourceRepository || (sourceRepoPath ? '' : options.repo || ''),
+      repoPath: sourceRepoPath,
     });
 
     await siteGenerator.generate();
@@ -1607,7 +1684,6 @@ async function generateStaticSite(options: {
     console.log();
     console.log(chalk.white.bold('Features included:'));
     console.log(chalk.gray('  ✓ Interactive search (press "/" to open)'));
-    console.log(chalk.gray('  ✓ Guided tours for onboarding'));
     console.log(chalk.gray('  ✓ Code explorer with syntax highlighting'));
     console.log(chalk.gray('  ✓ Live Mermaid diagrams (click to zoom)'));
     console.log(chalk.gray('  ✓ Dark/light theme toggle'));
@@ -1619,7 +1695,7 @@ async function generateStaticSite(options: {
     }
     console.log();
     console.log(chalk.white('To preview locally:'));
-    console.log(chalk.gray('  npx serve ' + siteDir));
+    console.log(chalk.gray('  Open ' + path.join(siteDir, 'index.html')));
     console.log();
   } catch (error) {
     spinner.fail('Static site generation failed');
@@ -1634,6 +1710,16 @@ program
   .option('-p, --plan', 'Planning mode - create plan before executing')
   .action(async (query?: string, options?: { interactive?: boolean; verbose?: boolean; plan?: boolean }) => {
     try {
+      // The bare command should be a fast, discoverable entry point. Keep the
+      // old coding-agent behavior available for existing users who explicitly
+      // pass a query or --interactive, but do not make it the product's default.
+      if (!query && !options?.interactive && !options?.plan) {
+        console.log(program.helpInformation());
+        return;
+      }
+
+      console.warn(chalk.yellow('Legacy coding-agent mode: prefer generate, update, verify, or search for SemanticWiki workflows.'));
+
       const configManager = new ConfigManager();
       const config = await configManager.load();
 
@@ -2876,7 +2962,7 @@ function handleExit(signal: string) {
   if (isExiting) {
     // Force exit on second signal
     console.log(chalk.red('\n\nForce quitting...'));
-    process.exit(1);
+    process.exit(signal === 'SIGINT' ? 130 : 143);
   }
   isExiting = true;
   console.log(chalk.yellow(`\n\n👋 Received ${signal}, shutting down...`));
@@ -2887,8 +2973,8 @@ function handleExit(signal: string) {
     process.exit(1);
   }, 2000).unref();
 
-  // Try graceful exit
-  process.exit(0);
+  // Report cancellation accurately to scripts.
+  process.exit(signal === 'SIGINT' ? 130 : 143);
 }
 
 process.on('SIGINT', () => handleExit('SIGINT'));
@@ -2899,6 +2985,28 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error(chalk.red('Unhandled Rejection:'), reason);
 });
 
+// Keep provider and local-runtime options consistent for repair/update commands.
+for (const command of program.commands.filter(command => ['continue', 'update-docs', 'update-wiki'].includes(command.name()))) {
+  const add = (flags: string, description: string, parser?: (value: string) => number) => {
+    const long = flags.split(/[ ,|]+/).find(flag => flag.startsWith('--'));
+    if (command.options.some(option => option.long === long)) return;
+    if (parser) command.option(flags, description, parser); else command.option(flags, description);
+  };
+  add('--direct-api', 'Compatibility alias for --provider anthropic');
+  add('--full-local', 'Compatibility alias for --provider local');
+  add('--use-ollama', 'Use an Ollama server');
+  add('--local-model <model>', 'Local registry ID or installed Ollama model');
+  add('--model-path <path>', 'Existing GGUF file');
+  add('--ollama-host <url>', 'Ollama server URL');
+  add('--context-size <n>', 'Local context size', positiveInteger);
+  add('--gpu-layers <n>', 'GPU offload layers (0 for CPU)', nonnegativeInteger);
+  add('--threads <n>', 'Local CPU threads', positiveInteger);
+  add('--max-turns <n>', 'Maximum writer turns', positiveInteger);
+}
+
 // Read stdin history before parsing commander args (synchronous)
 initStdinHistory();
-program.parse();
+program.parseAsync().catch(error => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+});

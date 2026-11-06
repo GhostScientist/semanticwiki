@@ -61,7 +61,7 @@ export class OllamaProvider implements LLMProvider {
    * Initialize the provider - connect to Ollama and verify model availability
    */
   async initialize(): Promise<void> {
-    console.log(`🔌 Connecting to Ollama at ${this.host}...`);
+    this.progressCallback?.({ phase: 'connecting', message: `Ollama · ${this.host}` });
 
     try {
       const { Ollama } = await import('ollama');
@@ -78,13 +78,13 @@ export class OllamaProvider implements LLMProvider {
         throw new Error(
           `Model '${this.modelName}' not found in Ollama.\n\n` +
             `   Available models:\n     - ${availableModels || '(none)'}\n\n` +
-            `   Pull it with: ollama pull ${this.modelName}\n\n` +
+            `   Pull a published Ollama model, or import your GGUF using ollama create.\n\n` +
             `   Or use the bundled local mode without --use-ollama:\n` +
-            `     semanticwiki generate ./project --full-local`
+            `     semanticwiki generate -r ./project --provider local`
         );
       }
 
-      console.log(`✅ Connected! Using model: ${this.modelName}\n`);
+      this.progressCallback?.({ phase: 'ready', message: `Ollama · ${this.modelName}` });
     } catch (error) {
       const err = error as Error & { code?: string };
 
@@ -94,7 +94,7 @@ export class OllamaProvider implements LLMProvider {
             `  To use --use-ollama, ensure Ollama is running:\n` +
             `    $ ollama serve\n\n` +
             `  Or use the bundled local mode without --use-ollama:\n` +
-            `    $ semanticwiki generate ./project --full-local`
+            `    $ semanticwiki generate -r ./project --provider local`
         );
       }
 
@@ -124,20 +124,15 @@ export class OllamaProvider implements LLMProvider {
         tools: ollamaTools.length > 0 ? ollamaTools : undefined,
         options: {
           num_predict: options.maxTokens,
-          temperature: options.temperature ?? 0.7,
+          temperature: options.temperature ?? 0.2,
+          stop: options.stopSequences,
         },
       });
 
       return this.parseResponse(response);
     } catch (error) {
       const err = error as Error;
-      console.error('Ollama chat error:', err.message);
-      return {
-        content: '',
-        toolCalls: [],
-        stopReason: 'error',
-        usage: { inputTokens: 0, outputTokens: 0 },
-      };
+      throw new Error(`Ollama generation failed: ${err.message}`);
     }
   }
 
@@ -157,7 +152,7 @@ export class OllamaProvider implements LLMProvider {
       name: this.modelName,
       contextLength: 32768, // Default, actual varies by model
       supportsTools: true,
-      supportsStreaming: true,
+      supportsStreaming: false,
       isLocal: true,
     };
   }
@@ -165,60 +160,28 @@ export class OllamaProvider implements LLMProvider {
   /**
    * Convert messages to Ollama format
    */
-  private convertMessages(
-    messages: LLMMessage[],
-    systemPrompt?: string
-  ): Array<{
-    role: 'system' | 'user' | 'assistant' | 'tool';
-    content: string;
-    tool_calls?: Array<{
-      function: { name: string; arguments: Record<string, unknown> };
-    }>;
-  }> {
-    const result: Array<{
-      role: 'system' | 'user' | 'assistant' | 'tool';
-      content: string;
-      tool_calls?: Array<{
-        function: { name: string; arguments: Record<string, unknown> };
-      }>;
-    }> = [];
-
-    // Add system prompt if provided
-    if (systemPrompt) {
-      result.push({ role: 'system', content: systemPrompt });
-    }
-
-    for (const msg of messages) {
-      if (msg.role === 'system') {
-        result.push({ role: 'system', content: this.extractTextContent(msg.content) });
-      } else if (msg.role === 'user') {
-        result.push({ role: 'user', content: this.extractTextContent(msg.content) });
-      } else if (msg.role === 'assistant') {
-        const content = this.extractTextContent(msg.content);
-        const toolCalls = this.extractToolCalls(msg.content);
-
-        if (toolCalls.length > 0) {
-          result.push({
-            role: 'assistant',
-            content,
-            tool_calls: toolCalls.map((tc) => ({
-              function: {
-                name: tc.name,
-                arguments: tc.arguments,
-              },
-            })),
-          });
-        } else {
-          result.push({ role: 'assistant', content });
-        }
-      } else if (msg.role === 'tool') {
-        result.push({
-          role: 'tool',
-          content: this.extractTextContent(msg.content),
+  private convertMessages(messages: LLMMessage[], systemPrompt?: string): import('ollama').Message[] {
+    const result: import('ollama').Message[] = [];
+    const toolNames = new Map<string, string>();
+    if (systemPrompt) result.push({ role: 'system', content: systemPrompt });
+    for (const message of messages) {
+      if (message.role === 'assistant') {
+        const calls = this.extractToolCalls(message.content);
+        for (const call of calls) toolNames.set(call.id, call.name);
+        result.push({ role: 'assistant', content: this.extractTextContent(message.content),
+          ...(calls.length ? { tool_calls: calls.map(call => ({ function: { name: call.name, arguments: call.arguments } })) } : {}),
         });
+      } else if (typeof message.content === 'string') {
+        result.push({ role: message.role, content: message.content,
+          ...(message.role === 'tool' ? { tool_name: message.name ?? toolNames.get(message.toolCallId ?? '') } : {}),
+        });
+      } else {
+        for (const block of message.content) {
+          if (block.type === 'tool_result') result.push({ role: 'tool', content: block.content, tool_name: toolNames.get(block.tool_use_id) });
+          else if (block.type === 'text') result.push({ role: message.role, content: block.text });
+        }
       }
     }
-
     return result;
   }
 

@@ -6,6 +6,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk';
+import { DEFAULT_ANTHROPIC_MODEL } from './defaults.js';
 import type {
   LLMProvider,
   LLMMessage,
@@ -16,6 +17,8 @@ import type {
   ModelInfo,
   ProgressCallback,
   ContentBlock,
+  ThinkingContentBlock,
+  RedactedThinkingContentBlock,
 } from './types.js';
 
 /**
@@ -24,7 +27,7 @@ import type {
 export interface AnthropicProviderOptions {
   /** Anthropic API key */
   apiKey?: string;
-  /** Model name to use (default: claude-sonnet-5) */
+  /** Model name to use (default: claude-sonnet-5-5) */
   model?: string;
   /** Progress callback for status updates */
   onProgress?: ProgressCallback;
@@ -43,7 +46,7 @@ export class AnthropicProvider implements LLMProvider {
 
   constructor(options: AnthropicProviderOptions = {}) {
     this.apiKey = options.apiKey;
-    this.modelName = options.model || 'claude-sonnet-5';
+    this.modelName = options.model || DEFAULT_ANTHROPIC_MODEL;
     this.progressCallback = options.onProgress;
   }
 
@@ -65,7 +68,7 @@ export class AnthropicProvider implements LLMProvider {
         'Anthropic API key not found.\n\n' +
           'Set it via:\n' +
           '  1. Environment variable: ANTHROPIC_API_KEY=your-key\n' +
-          '  2. Or use --full-local for offline mode'
+          '  2. Or use --provider local for local generation'
       );
     }
 
@@ -74,7 +77,7 @@ export class AnthropicProvider implements LLMProvider {
     // Optionally verify the key works (commented out to avoid unnecessary API call)
     // await this.client.messages.create({ model: this.modelName, max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] });
 
-    console.log(`☁️  Using Anthropic API with model: ${this.modelName}\n`);
+    this.progressCallback?.({ phase: 'ready', message: `Anthropic · ${this.modelName}` });
   }
 
   /**
@@ -94,32 +97,32 @@ export class AnthropicProvider implements LLMProvider {
 
     try {
       // Build system parameter - use cache_control for prompt caching if system prompt provided
-      const systemParam = options.systemPrompt
+      const systemPrompt = [options.systemPrompt, ...messages.filter(m => m.role === 'system').map(m => typeof m.content === 'string' ? m.content : m.content.filter(b => b.type === 'text').map(b => b.text).join('\n'))].filter(Boolean).join('\n\n');
+      const systemParam = systemPrompt
         ? [
             {
               type: 'text' as const,
-              text: options.systemPrompt,
+              text: systemPrompt,
               cache_control: { type: 'ephemeral' as const }
             }
           ]
         : undefined;
 
-      const response = await this.client.messages.create({
+      const adaptiveThinking = /^claude-(?:opus|sonnet)-4-[678](?:-|$)/.test(this.modelName)
+        || /^claude-(?:opus|sonnet|haiku|fable)-5(?:-|$)/.test(this.modelName);
+      const createParams: Anthropic.MessageCreateParamsNonStreaming = {
         model: this.modelName,
         max_tokens: options.maxTokens,
-        // Disable extended/adaptive thinking. Sonnet 5 (and other current models)
-        // enable adaptive thinking by default when `thinking` is omitted, which
-        // emits `thinking` blocks that must be echoed back unchanged on later
-        // turns. This provider reconstructs assistant turns from text/tool_use
-        // only, so leaving thinking on would break the multi-turn tool loop.
-        thinking: { type: 'disabled' },
-        // Use cache_control on system prompt to enable Anthropic's prompt caching
-        // System prompt is 3,500+ tokens - caching saves significant tokens over many turns
         system: systemParam,
         tools: anthropicTools.length > 0 ? anthropicTools : undefined,
         messages: anthropicMessages,
         stop_sequences: options.stopSequences,
-      });
+        ...(adaptiveThinking ? {
+          thinking: { type: 'adaptive' },
+          output_config: { effort: 'high' },
+        } : { temperature: options.temperature }),
+      };
+      const response = await this.client.messages.create(createParams);
 
       return this.parseResponse(response);
     } catch (error) {
@@ -148,13 +151,26 @@ export class AnthropicProvider implements LLMProvider {
    * Get information about the current model
    */
   getModelInfo(): ModelInfo {
+    const contextLength = this.getContextLength();
+
     return {
       name: this.modelName,
-      contextLength: 200000, // Claude's context window
+      contextLength,
       supportsTools: true,
-      supportsStreaming: true,
+      supportsStreaming: false,
       isLocal: false,
     };
+  }
+
+  /**
+   * Return the known context window for Anthropic models used by this CLI.
+   * Modern model IDs are pinned snapshots. Older/custom models retain the
+   * conservative 200K input budget.
+   */
+  private getContextLength(): number {
+    if (/^claude-(?:opus|sonnet)-4-[678](?:-|$)/.test(this.modelName)
+      || /^claude-(?:opus|sonnet|haiku|fable)-5(?:-|$)/.test(this.modelName)) return 1_000_000;
+    return 200_000;
   }
 
   /**
@@ -162,62 +178,23 @@ export class AnthropicProvider implements LLMProvider {
    */
   private convertMessages(messages: LLMMessage[]): Anthropic.MessageParam[] {
     const result: Anthropic.MessageParam[] = [];
-
-    for (const msg of messages) {
-      if (msg.role === 'system') {
-        // System messages are handled via the system parameter
-        continue;
+    for (const message of messages) {
+      if (message.role === 'system') continue;
+      const role = message.role === 'assistant' ? 'assistant' : 'user';
+      let blocks: Anthropic.ContentBlockParam[];
+      if (message.role === 'tool' && typeof message.content === 'string') {
+        if (!message.toolCallId) throw new Error('A tool result is missing its tool call ID.');
+        blocks = [{ type: 'tool_result', tool_use_id: message.toolCallId, content: message.content }];
+      } else if (typeof message.content === 'string') {
+        blocks = [{ type: 'text', text: message.content }];
+      } else {
+        blocks = message.content.map(block => this.convertContentBlock(block));
       }
-
-      if (msg.role === 'user') {
-        if (typeof msg.content === 'string') {
-          result.push({ role: 'user', content: msg.content });
-        } else {
-          // Convert content blocks
-          const blocks = msg.content.map((block) => this.convertContentBlock(block));
-          result.push({ role: 'user', content: blocks as Anthropic.ContentBlockParam[] });
-        }
-      } else if (msg.role === 'assistant') {
-        if (typeof msg.content === 'string') {
-          result.push({ role: 'assistant', content: msg.content });
-        } else {
-          const blocks = msg.content.map((block) => this.convertContentBlock(block));
-          result.push({ role: 'assistant', content: blocks as Anthropic.ContentBlock[] });
-        }
-      } else if (msg.role === 'tool') {
-        // Tool results are added as user messages with tool_result content
-        if (typeof msg.content === 'string') {
-          result.push({
-            role: 'user',
-            content: [
-              {
-                type: 'tool_result',
-                tool_use_id: msg.toolCallId || '',
-                content: msg.content,
-              },
-            ],
-          });
-        } else {
-          // Handle complex tool results
-          const toolResult = msg.content.find((c) => c.type === 'tool_result') as
-            | { type: 'tool_result'; tool_use_id: string; content: string }
-            | undefined;
-          if (toolResult) {
-            result.push({
-              role: 'user',
-              content: [
-                {
-                  type: 'tool_result',
-                  tool_use_id: toolResult.tool_use_id,
-                  content: toolResult.content,
-                },
-              ],
-            });
-          }
-        }
-      }
+      const previous = result.at(-1);
+      // Parallel tool results must remain one user turn immediately after the tool calls.
+      if (previous?.role === role && Array.isArray(previous.content)) previous.content.push(...blocks);
+      else result.push({ role, content: blocks });
     }
-
     return result;
   }
 
@@ -226,7 +203,7 @@ export class AnthropicProvider implements LLMProvider {
    */
   private convertContentBlock(
     block: ContentBlock
-  ): Anthropic.TextBlockParam | Anthropic.ToolUseBlockParam | Anthropic.ToolResultBlockParam {
+  ): Anthropic.ContentBlockParam {
     switch (block.type) {
       case 'text':
         return { type: 'text', text: block.text };
@@ -244,6 +221,12 @@ export class AnthropicProvider implements LLMProvider {
           content: block.content,
           is_error: block.is_error,
         };
+      case 'thinking':
+        // Pass thinking blocks back verbatim — signature carries the encrypted reasoning
+        // that the server needs to reconstruct context on the next turn.
+        return { type: 'thinking', thinking: block.thinking, signature: block.signature };
+      case 'redacted_thinking':
+        return { type: 'redacted_thinking', data: block.data };
       default:
         throw new Error(`Unknown content block type: ${(block as ContentBlock).type}`);
     }
@@ -264,18 +247,34 @@ export class AnthropicProvider implements LLMProvider {
    * Parse Anthropic response to our format
    */
   private parseResponse(response: Anthropic.Message): LLMResponse {
+    if (response.stop_reason === 'model_context_window_exceeded') {
+      throw new Error(`Anthropic model ${this.modelName} reached its context limit before completing the response. Reduce conversation history or resume with semanticwiki continue to start a fresh conversation.`);
+    }
     const toolCalls: LLMToolCall[] = [];
+    const thinkingBlocks: Array<ThinkingContentBlock | RedactedThinkingContentBlock> = [];
+    const assistantContent: ContentBlock[] = [];
     let textContent = '';
 
     for (const block of response.content) {
       if (block.type === 'text') {
         textContent += block.text;
+        assistantContent.push({ type: 'text', text: block.text });
       } else if (block.type === 'tool_use') {
+        assistantContent.push({ type: 'tool_use', id: block.id, name: block.name, input: block.input as Record<string, unknown> });
         toolCalls.push({
           id: block.id,
           name: block.name,
           arguments: block.input as Record<string, unknown>,
         });
+      } else if (block.type === 'redacted_thinking') {
+        thinkingBlocks.push({ type: 'redacted_thinking', data: block.data });
+        assistantContent.push({ type: 'redacted_thinking', data: block.data });
+      } else if (block.type === 'thinking') {
+        // Collect adaptive-thinking blocks so the caller can round-trip them on the next
+        // turn. signature is opaque; thinking text is empty on Opus 4.7 by default.
+        const t = block;
+        thinkingBlocks.push({ type: 'thinking', thinking: t.thinking ?? '', signature: t.signature });
+        assistantContent.push({ type: 'thinking', thinking: t.thinking ?? '', signature: t.signature });
       }
     }
 
@@ -288,10 +287,12 @@ export class AnthropicProvider implements LLMProvider {
 
     return {
       content: textContent,
+      assistantContent,
       toolCalls,
+      thinkingBlocks: thinkingBlocks.length > 0 ? thinkingBlocks : undefined,
       stopReason,
       usage: {
-        inputTokens: response.usage.input_tokens,
+        inputTokens: response.usage.input_tokens + (response.usage.cache_read_input_tokens ?? 0) + (response.usage.cache_creation_input_tokens ?? 0),
         outputTokens: response.usage.output_tokens,
       },
     };
