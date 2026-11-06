@@ -29,6 +29,7 @@ Launch baseline (prepared in source; publication is a separate release step).
 - Model weights and embedding downloads appearing in the caller's repository.
 - Source/Markdown path traversal and unsafe generated HTML/config handling.
 - Incorrect success output after provider errors or turn exhaustion, missing metadata fields during page writes, and generated-copy duplication during verification.
+- Token-limited native pages being accepted as complete; source discovery confusing ordinary task entities and the TypeScript `export` keyword with batch/reporting domains.
 
 See [migration and consolidation notes](docs/LAUNCH_BASELINE.md).
 

@@ -43,6 +43,8 @@ Downloads first check for enough free disk space for the entire file plus 256 Mi
 
 The runtime uses `node-llama-cpp`, automatic GPU offload, and one reusable context sequence. Each request includes the full retained conversation and tool results. The sequence is released on success and failure, so a wiki with many pages does not exhaust a fixed pool. CPU inference is available with `--gpu-layers 0`; reduce `--context-size` if memory is tight. See the [node-llama-cpp runtime documentation](https://node-llama-cpp.withcat.ai/guide/chat-session).
 
+Local page generation uses the model card's context/query delimiters and records the source files actually supplied. Truncated pages are retried within a fixed budget, and an index that omits planned pages falls back to a complete catalog. These checks do not establish factual accuracy: README-only summaries can still make unsupported claims about the rest of a repository. See the [native validation results](LAUNCH_VALIDATION.md#native-prose-review-and-remaining-limitation).
+
 The prior GPT-OSS model and small completion model remain available by explicit local model ID for existing workflows. They are not selected instead of the new 7B model automatically.
 
 ## Storage locations

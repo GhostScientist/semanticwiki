@@ -17,9 +17,10 @@ Existing uncommitted work was first preserved in commit `3dd6224` on `codex/laun
 | PR #8, fine-tuning plan | Confirmed all five files already preserved under `docs/plans/fine-tuning`; no duplicate top-level training tree. |
 | Local `eval-plan` | Plan already preserved under `docs/plans/EVAL_PLAN.md`; ancestry retained. |
 | Old static-site planning branch | Archived as `docs/plans/STATIC_SITE_PLAN.md`; shipped reader takes precedence. |
+| Uncommitted RLVR worktree draft | Preserved in [docs/plans/rlvr-draft](plans/rlvr-draft/README.md), including untracked files, a base commit and checksums. Eight files match exactly; the old lockfile's private registry addresses are normalized to public npm URLs. Experimental scoring/capture remains unshipped; original worktree retained. |
 | Other remote feature branches | Already ancestors of the integrated main baseline. |
 
-Old local branches and other active worktrees are not forcibly deleted. They may contain a developer's context. Once the integration is merged, branch heads are reachable from the new baseline and can be retired safely by their owners.
+Fully merged inactive branches can be retired after integration, with their commits retained in the new baseline. The two other checked-out worktrees remain intact, including the original RLVR draft. Their branch references are retained so their owners can continue or archive that context deliberately.
 
 ## Migration from 1.x
 

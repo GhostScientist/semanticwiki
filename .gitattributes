@@ -1,0 +1,2 @@
+# Historical patches contain required single-space context lines.
+docs/plans/rlvr-draft/changes.patch -whitespace

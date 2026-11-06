@@ -209,6 +209,7 @@ const FILE_PATTERNS = {
  */
 const DOMAIN_PATTERNS: Array<{
   pattern: RegExp;
+  contentPattern?: RegExp;
   domain: string;
   category: DomainCategory;
   description: string;
@@ -250,7 +251,8 @@ const DOMAIN_PATTERNS: Array<{
   },
   // Batch Processing
   {
-    pattern: /batch|job|scheduler|cron|task|queue/i,
+    // A domain entity named Task is not evidence of scheduled/background work.
+    pattern: /batch|job|scheduler|cron|queue/i,
     domain: 'batch-processing',
     category: 'batch-processing',
     description: 'Batch jobs and scheduled tasks',
@@ -258,6 +260,8 @@ const DOMAIN_PATTERNS: Array<{
   // Screen/UI (Mainframe)
   {
     pattern: /screen|map|bms|panel|menu|display/i,
+    // Array.map and Map are general programming constructs, not UI evidence.
+    contentPattern: /\b(screen|bms|panel|menu|display)\b/i,
     domain: 'screen-handling',
     category: 'presentation',
     description: 'User interface and screen handling',
@@ -272,6 +276,8 @@ const DOMAIN_PATTERNS: Array<{
   // Reports
   {
     pattern: /report|print|output|export/i,
+    // JavaScript/TypeScript's export keyword does not imply report generation.
+    contentPattern: /report|print|output/i,
     domain: 'reporting',
     category: 'core-application',
     description: 'Reports and data export',
@@ -571,7 +577,7 @@ export class CodebaseDiscovery {
       if (
         pattern.pattern.test(fileName) ||
         pattern.pattern.test(dirName) ||
-        pattern.pattern.test(contentSample)
+        (pattern.contentPattern || pattern.pattern).test(contentSample)
       ) {
         return {
           domain: pattern.domain,
@@ -629,6 +635,14 @@ export class CodebaseDiscovery {
         domain: 'scripts',
         category: 'infrastructure',
         description: 'Shell scripts and utilities',
+      };
+    }
+
+    if (/^\.(ts|tsx|js|jsx|py|java|go|rs|rb|php|cs|cpp|c|h)$/.test(ext)) {
+      return {
+        domain: 'source-code',
+        category: 'core-application',
+        description: 'Application source code',
       };
     }
 

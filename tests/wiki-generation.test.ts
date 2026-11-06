@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import matter from 'gray-matter';
 
-const mocked = vi.hoisted(() => ({ chat: vi.fn(), shutdown: vi.fn(), create: vi.fn() }));
+const mocked = vi.hoisted(() => ({ chat: vi.fn(), shutdown: vi.fn(), create: vi.fn(), search: vi.fn() }));
 vi.mock('../src/llm/index.js', async importOriginal => ({
   ...await importOriginal<any>(),
   createLLMProvider: mocked.create,
@@ -13,6 +14,7 @@ vi.mock('../src/rag/index.js', () => ({
     async indexRepository() {}
     async loadMetadataOnly() {}
     getDocumentCount() { return 1; }
+    async search(...args: unknown[]) { return mocked.search(...args); }
   },
 }));
 
@@ -28,6 +30,7 @@ describe('wiki generation contracts', () => {
   const collect = async (stream: AsyncGenerator<any>) => { const events = []; for await (const e of stream) events.push(e); return events; };
   beforeEach(() => {
     vi.clearAllMocks();
+    mocked.search.mockResolvedValue([]);
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'semanticwiki-generation-'));
     repo = path.join(root, 'repo'); wiki = path.join(root, 'wiki');
     fs.mkdirSync(repo); fs.mkdirSync(wiki);
@@ -179,7 +182,10 @@ describe('wiki generation contracts', () => {
     mocked.chat.mockResolvedValueOnce(truncated).mockResolvedValueOnce(response({ content: completePage })).mockResolvedValueOnce(truncated);
     const events = await collect(agent.generateWikiLocalPageByPage({ repoUrl: repo, outputDir: wiki, fullLocal: true }));
     expect(mocked.chat).toHaveBeenCalledTimes(3);
-    expect(fs.readFileSync(path.join(wiki, 'greeting.md'), 'utf8')).toBe(completePage);
+    const page = fs.readFileSync(path.join(wiki, 'greeting.md'), 'utf8');
+    expect(matter(page).content).toContain(completePage.trimEnd());
+    expect(matter(page).data.sources).toEqual([{ resource: 'index.ts' }]);
+    expect(page).toContain('## Sources');
     const index = fs.readFileSync(path.join(wiki, 'index.md'), 'utf8');
     expect(index).toContain('[Greeting](./greeting.md)');
     expect(index).not.toContain('Truncated draft');
@@ -195,5 +201,53 @@ describe('wiki generation contracts', () => {
     expect(fs.existsSync(path.join(wiki, 'greeting.md'))).toBe(false);
     expect(fs.readFileSync(path.join(wiki, 'index.md'), 'utf8')).not.toContain('Truncated draft');
     expect(mocked.shutdown).toHaveBeenCalledOnce();
+  });
+  it('grounds documentation-only prompts and provenance in validated files actually supplied as context', async () => {
+    const readme = '# Fixture\n' + 'An in-memory task store with no persistence or network access. '.repeat(12);
+    fs.writeFileSync(path.join(repo, 'README.md'), readme);
+    fs.writeFileSync(path.join(root, 'outside.ts'), 'SECRET_OUTSIDE_REPOSITORY');
+    fs.symlinkSync(path.join(root, 'outside.ts'), path.join(repo, 'escape.ts'));
+    mocked.search.mockResolvedValue([
+      { filePath: 'README.md', startLine: 1, endLine: 2, content: readme },
+      { filePath: '../outside.ts', startLine: 1, endLine: 1, content: 'SECRET_OUTSIDE_REPOSITORY' },
+      { filePath: 'escape.ts', startLine: 1, endLine: 1, content: 'SECRET_OUTSIDE_REPOSITORY' },
+      { filePath: 'missing.ts', startLine: 1, endLine: 1, content: 'MISSING_FILE_EVIDENCE' },
+    ]);
+    vi.spyOn(agent as any, 'planPagesFromDiscovery').mockResolvedValue([{ title: 'Documentation', filename: 'documentation.md', type: 'guide', context: 'Readme claims', sourceFiles: ['README.md', '../outside.ts', 'escape.ts'] }]);
+    mocked.chat.mockResolvedValueOnce(response({ content: '---\nsources: [invented.ts]\n---\n# Documentation\n\n' + 'The README describes an in-memory task store without persistence or network access. '.repeat(4) })).mockResolvedValueOnce(response({ content: '# Index\n\n[Documentation](./documentation.md)' }));
+    const events = await collect(agent.generateWikiLocalPageByPage({ repoUrl: repo, outputDir: wiki, fullLocal: true }));
+    const prompt = mocked.chat.mock.calls[0][0][0].content;
+    expect(prompt).toContain(`<START_OF_CONTEXT>\n`);
+    expect(prompt).toContain('<END_OF_CONTEXT>\n\n<query>');
+    expect(prompt).toContain('documentation only, not implementation code');
+    expect(prompt).toContain('missing code in this page context does not mean the repository contains only documentation');
+    expect(prompt).toContain('Do not invent illustrative implementations, APIs, method names');
+    expect(prompt).toContain(readme);
+    expect(prompt).not.toMatch(/React|useAuth|SECRET_OUTSIDE_REPOSITORY|MISSING_FILE_EVIDENCE/);
+    const page = fs.readFileSync(path.join(wiki, 'documentation.md'), 'utf8');
+    expect(matter(page).data.sources).toEqual([{ resource: 'README.md' }]);
+    expect(page).toContain('- `README.md`');
+    expect(page).not.toContain('invented.ts');
+    expect(page).not.toContain('#L');
+    expect(events.at(-1).type).toBe('complete');
+  });
+  it.each([
+    '# Fixture Documentation\n\n## Overview\n- **Architecture Overview**: Understand the design.\n\n## Guides\n- **Getting Started**: A comprehensive guide.',
+    '# Fixture Documentation\n\n[Architecture Overview](./architecture.md)\n\n```markdown\n[Getting Started](./getting-started.md)\n```',
+  ])('replaces a native-style index without complete navigable page links', async indexDraft => {
+    const pages = [
+      { title: 'Architecture Overview', filename: 'architecture.md', type: 'overview', context: 'Architecture', sourceFiles: ['index.ts'] },
+      { title: 'Getting Started', filename: 'getting-started.md', type: 'guide', context: 'Setup', sourceFiles: ['index.ts'] },
+    ];
+    vi.spyOn(agent as any, 'planPagesFromDiscovery').mockResolvedValue(pages);
+    const content = '# Fixture\n\n' + 'The supplied source exports the greeting string. '.repeat(6);
+    mocked.chat.mockResolvedValueOnce(response({ content })).mockResolvedValueOnce(response({ content })).mockResolvedValueOnce(response({ content: indexDraft }));
+    const events = await collect(agent.generateWikiLocalPageByPage({ repoUrl: repo, outputDir: wiki, fullLocal: true }));
+    const index = fs.readFileSync(path.join(wiki, 'index.md'), 'utf8');
+    expect(index).toContain('[Architecture Overview](./architecture.md)');
+    expect(index).toContain('[Getting Started](./getting-started.md)');
+    expect(index).not.toContain('```');
+    expect(index).not.toBe(indexDraft);
+    expect(events.at(-1).type).toBe('complete');
   });
 });
