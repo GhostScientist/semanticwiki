@@ -1,0 +1,36 @@
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Keep routine version churn to a single reviewable PR per week.
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Majors here need code changes or a Node baseline bump, so they are
+      # handled deliberately rather than by an automated PR:
+      #   commander 15 / chalk 6 require Node >= 22
+      #   inquirer 14 is a full API rewrite (and pins inquirer-autocomplete-prompt)
+      #   typescript 7 is the native compiler port
+      #   @huggingface/transformers 4 moves to a new onnxruntime line
+      - dependency-name: commander
+        update-types: [version-update:semver-major]
+      - dependency-name: chalk
+        update-types: [version-update:semver-major]
+      - dependency-name: inquirer
+        update-types: [version-update:semver-major]
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]
+      - dependency-name: '@huggingface/transformers'
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -16,17 +16,54 @@ All notable changes to semanticwiki will be documented in this file.
 - `npm run check` for the build, test suite, and compiled CLI smoke checks.
 - Contributor workflow guidance and a product compatibility policy covering generated wiki migrations, provenance, and release contracts.
 
-## [1.4.0] - 2026-05-11
+## [1.5.0] - 2026-09-01
 
-### Changed
-- Default Claude model upgraded from `claude-sonnet-4-20250514` (Sonnet 4.0, deprecated, retires June 2026) to `claude-opus-4-7` across `generate`, `update-docs`, `update-wiki`, and `continue`
-- `AnthropicProvider` (`--direct-api` path) now enables adaptive thinking with `effort: "high"` and round-trips thinking blocks across tool-use turns — meaningfully better output quality for the wiki planning loop
-- `@anthropic-ai/claude-agent-sdk` bumped `^0.1.53` → `^0.2.139`; `@anthropic-ai/sdk` bumped `^0.71.2` → `^0.95.2`
+Maintenance release that re-baselines the repository: CI, current dependencies, and a
+consolidation of the planning documents that were stranded on stale branches.
 
 ### Added
-- First-run mode picker on `generate`: when none of `--full-local`, `--direct-api`, or `-m` is passed and stdin is a TTY, prompt for "Anthropic API vs Local model" — picking API chains into the model picker, picking Local skips the API-key check entirely
-- Interactive model picker (Opus 4.7 / Sonnet 4.6) on `generate`, `update-docs`, `update-wiki`, and `continue` when `-m` isn't passed and stdin is a TTY. Non-interactive runs (CI, piped input) silently use the default
-- `ThinkingContentBlock` type and `LLMResponse.thinkingBlocks` so providers can preserve adaptive-thinking state across multi-turn tool use
+- **Continuous integration** (`.github/workflows/ci.yml`). The repository previously had no `.github` directory at all. Every push to `master` and every pull request now builds and runs the test suite on Node 20.19 and 22.x, plus a dependency-audit job. Installs use `npm ci --ignore-scripts` because the native dependencies (`faiss-node`, `node-llama-cpp`, `onnxruntime-node`, `sharp`) fetch large prebuilt binaries that neither `tsc` nor the tests need.
+- **Dependabot** (`.github/dependabot.yml`) for grouped weekly npm and GitHub Actions updates. Majors that require code changes are explicitly ignored so they get a deliberate upgrade instead of an automated PR.
+- **`tests/site-generator-markdown.test.ts`** — 19 tests pinning the HTML emitted by the custom `marked` renderers (code blocks, headings, internal/external/source links, images, blockquotes, and callouts). These renderers had no coverage, which is why the marked major bump below was a silent breakage risk.
+- **`tests/cli-version.test.ts`** — asserts `--version` matches `package.json`, prints nothing else on stdout, and that no literal version is reintroduced into `src/cli.ts`.
+- **`docs/plans/EVAL_PLAN.md`** — rubric, automated checks, and LLM-judge design for grading generated wikis. Salvaged from the never-pushed `eval-plan` branch.
+- **`docs/plans/fine-tuning/`** — the five-document plan for fine-tuning a local wiki model. Salvaged from PR #8, which this release supersedes.
+
+### Fixed
+- `semanticwiki --version` now reads the version from `package.json` instead of a hardcoded string. It had been hardcoded twice (to `1.0.0`, then to `1.4.0` in the 1.4.0 release) and drifted from the published release both times; a test now fails if a literal version is reintroduced.
+- GitHub-style callouts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`) now render in generated sites. The blockquote renderer matched the `[!NOTE]` marker against already-rendered HTML, where it is wrapped in a `<p>`, so the branch never fired and every callout fell through to a plain `<blockquote>` — even though the `.callout-*` CSS has always shipped. Detection now runs on the token stream, and the callout body is still parsed as markdown so links and inline formatting inside it work.
+
+### Changed
+- **Minimum Node is now 20.19** (was 18). Node 18 has been end-of-life since April 2025.
+- Migrated `SiteGenerator.configureMarked()` to marked's object-argument renderer API, required by marked v13+. The renderers are now `function` expressions rather than arrows so `this.parser` is reachable for rendering child tokens. Output HTML is unchanged, and is now covered by tests.
+- `dotenv` is loaded with `quiet: true`. dotenv v17 prints a promotional banner on every load, which was contaminating `semanticwiki --version` and would corrupt the `mcp-server` stdio stream.
+- `CLAUDE.md` is now a pointer to `AGENTS.md`. The two files were byte-identical apart from their heading and were guaranteed to drift.
+- Documented the current repository baseline, deferred upgrades, and open code debt in `docs/plans/ROADMAP.md`.
+
+### Maintenance
+- **Resolved 15 of 17 dependency advisories**, including a critical `tar` file-smuggling issue and high-severity advisories in `undici`, `axios`, `brace-expansion`, `hono`, `protobufjs`, `js-yaml`, `nanoid`, `fast-uri`, `form-data`, and `ip-address`.
+- Updated direct dependencies: `@anthropic-ai/sdk` (0.111 → 0.122), `@anthropic-ai/claude-agent-sdk` (0.3.207 → 0.3.252), `axios` (1.6 → 1.20), `dotenv` (16 → 17), `glob` (10 → 13), `marked` (12 → 18), `ora` (8 → 9), `ollama` (0.5 → 0.6), `cheerio` (1.0.0-rc → 1.2), `node-llama-cpp` (3.0 → 3.20), `simple-git` (3.30 → 3.36), `@modelcontextprotocol/server-filesystem`, `@types/node` (20 → 22), `vitest` and `@vitest/coverage-v8` (4.1.10 → 4.1.11).
+- **Removed unused dependencies**: `@lepion/mcp-server-mermaid` and `better-sqlite3` (neither was imported anywhere; `better-sqlite3` also forced a native build on every install) and the `@types/pdf-parse` dev dependency (`pdf-parse` is not a dependency).
+
+### Known issues
+- `@huggingface/transformers` pins `sharp@^0.34`, which carries an unfixed high-severity libvips advisory (GHSA-f88m-g3jw-g9cj). It is not resolved by transformers v4 either. SemanticWiki uses transformers only for text embeddings and never decodes images, so the audit gate is set to `critical` and this is tracked rather than blocking.
+
+### Deferred
+- `commander` 15 and `chalk` 6 require Node >= 22; `inquirer` 14 is an API rewrite; `typescript` 7 is the native compiler port; `@huggingface/transformers` 4 moves to a new onnxruntime line. Each needs its own change and validation pass.
+
+## [1.4.0] - 2026-07-13
+
+### Changed
+- Default cloud model is now **`claude-sonnet-5`** (was `claude-sonnet-4-20250514`, which is deprecated and retires 2026-06-15). Applies to wiki generation, the direct-API agent loop, the interactive development agent, and all `--model` defaults. The `--model` flag still overrides — pass `--model claude-opus-4-8` for top-tier quality.
+- `AnthropicProvider` now sends `thinking: { type: 'disabled' }`. Current Claude models enable adaptive thinking by default when `thinking` is omitted, which emits `thinking` blocks that must be replayed unchanged on later turns; the provider reconstructs assistant turns from text/tool_use only, so thinking is disabled to keep the multi-turn tool loop working exactly as before.
+
+### Maintenance
+- Upgraded `@anthropic-ai/sdk` (0.71 → 0.111) and `@anthropic-ai/claude-agent-sdk` (0.1 → 0.3); refreshed `vitest`, `@vitest/coverage-v8`, and `@types/node` within their current majors.
+- Fixed the CLI `--version` output, which was hardcoded to `1.0.0`.
+- Added `docs/plans/ROADMAP.md` with the prioritized next-feature roadmap.
+
+### Note
+- Claude Sonnet 5 uses a newer tokenizer that counts ~30% more tokens than Sonnet 4 for the same text, so per-run token usage (and cost) will rise even though per-token pricing is unchanged.
 
 ## [1.3.0] - 2026-05-07
 

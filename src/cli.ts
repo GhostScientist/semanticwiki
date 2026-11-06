@@ -2,6 +2,7 @@
 
 import { config as loadEnv } from 'dotenv';
 import { resolve } from 'path';
+import { fileURLToPath } from 'url';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Command } from 'commander';
@@ -23,10 +24,24 @@ inquirer.registerPrompt('autocomplete', inquirerAutocomplete);
 
 // Load .env from current working directory (supports global installation)
 const workingDir = process.cwd();
-loadEnv({ path: resolve(workingDir, '.env') });
+// `quiet` suppresses the startup banner dotenv v17 prints on every load, which
+// would otherwise contaminate CLI output such as `--version` and MCP stdio traffic.
+loadEnv({ path: resolve(workingDir, '.env'), quiet: true });
 
 // Load Claude Code configuration (skills, commands, memory)
 const claudeConfig = loadClaudeConfig(workingDir);
+
+// Read the version from package.json rather than hardcoding it, so `--version`
+// cannot drift from the published release. Resolved relative to this module
+// (dist/cli.js -> ../package.json) so it works for global installs too.
+function readPackageVersion(): string {
+  try {
+    const pkgPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    return JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
 
 const program = new Command();
 
@@ -151,7 +166,7 @@ program
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
   .option('-c, --config <file>', 'Path to wiki configuration file (wiki.json)')
   .option('-t, --token <token>', 'Access token for private repositories')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-opus-4-7')
+  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
   .option('-p, --path <path>', 'Specific path within repo to focus on')
   .option('-f, --force', 'Force regeneration (ignore cache)')
   .option('-v, --verbose', 'Verbose output')
@@ -511,7 +526,7 @@ program
   .description('Update documentation based on changes since last index')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-opus-4-7')
+  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
   .option('-v, --verbose', 'Verbose output')
   .action(async (options, command: Command) => {
     try {
@@ -793,7 +808,7 @@ program
   .description('Update wiki documentation based on code changes (handles both modifications and new additions)')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-opus-4-7')
+  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
   .option('-v, --verbose', 'Verbose output')
   .option('--direct-api', 'Use Anthropic API directly (bypasses Claude Code billing)')
   .option('--dry-run', 'Show what would be updated without making changes')
@@ -1114,7 +1129,7 @@ program
   .description('Continue generating missing wiki pages (verifies completeness and creates missing pages)')
   .requiredOption('-r, --repo <path>', 'Repository path (local)')
   .option('-o, --output <dir>', 'Output directory for wiki', './wiki')
-  .option('-m, --model <model>', 'Claude model to use', 'claude-opus-4-7')
+  .option('-m, --model <model>', 'Claude model to use (e.g. claude-sonnet-5, claude-opus-4-8)', 'claude-sonnet-5')
   .option('-v, --verbose', 'Verbose output')
   .option('--verify-only', 'Only verify completeness, do not generate missing pages')
   .option('--skip-index', 'Skip indexing and use existing cached index')
