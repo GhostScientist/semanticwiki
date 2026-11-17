@@ -2,6 +2,18 @@
 
 All notable changes to semanticwiki will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `semanticwiki eval <wiki> -r <repo>`: resolves every `path:line` citation against the repository, checks structure, Mermaid syntax and links, and reports a page reward with the guards that fired. `--compare a.json b.json` gives paired deltas with bootstrap confidence intervals; `--min-reward` / `--min-validity` gate CI.
+- Local writer page contract: evidence is rendered with real line numbers in the format the SemanticWiki models were trained on, the prompt asks for `path:start-end` citations, citations are verified after generation, one repair turn runs when they do not resolve, and pages record `evidence`, `verification` and (only when every citation resolves) a `verified` event.
+- `generate --trajectories <file>` appends a JSONL record per local page attempt for offline scoring and training; `--no-citation-repair` disables the repair turn.
+- `research/`: Python mirror of the reward and prompt (held equal by shared conformance fixtures), a GRPO/RLVR trainer and a held-out evaluation runner whose reports `eval --compare` reads. See `docs/research/REWARD_LOOP.md`.
+
+### Fixed
+- Ollama replies cut off by the token limit are reported as `max_tokens`, so truncated local pages are retried instead of accepted.
+- Local source references with line ranges become clickable links; the previous pass handled single lines only.
+
 ## [2.0.0] - 2026-11-06
 
 Launch baseline (prepared in source; publication is a separate release step).

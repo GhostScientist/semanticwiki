@@ -51,3 +51,10 @@ audit.log
 .semanticwiki-repos/
 coverage/
 .firecrawl/
+
+# Python research kit
+__pycache__/
+*.pyc
+research/out/
+research/data/
+research/reports/

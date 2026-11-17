@@ -1,0 +1,14 @@
+[project]
+name = "semanticwiki-research"
+version = "0.1.0"
+description = "Verifiable reward, GRPO training and held-out evaluation for SemanticWiki writers"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+train = ["trl>=0.21", "peft>=0.15", "datasets>=3.0", "transformers>=4.51", "torch>=2.4", "accelerate>=1.0"]
+vllm = ["vllm>=0.9"]
+hub = ["huggingface_hub>=0.30", "trackio"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

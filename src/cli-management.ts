@@ -6,6 +6,7 @@ import { getRuntimePaths } from './runtime-paths.js';
 import { ConfigManager } from './config.js';
 import { DEFAULT_LOCAL_MODEL_ID, DEFAULT_LOCAL_CONTEXT_SIZE, DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL } from './llm/defaults.js';
 import { exportKnowledgeBundle } from './knowledge-export.js';
+import { compareReports, evaluateWiki, renderReportMarkdown, type EvalReport } from './eval/index.js';
 
 export function registerManagementCommands(program: Command): void {
   program.command('doctor')
@@ -39,6 +40,54 @@ export function registerManagementCommands(program: Command): void {
         console.log('Wiki indexes stay in <wiki>/.semanticwiki-cache for portability.');
         for (const legacy of report.legacyPaths) console.log(`Legacy directory left untouched: ${legacy}`);
       }
+    });
+
+  program.command('eval [wiki]')
+    .description('Score a wiki on verifiable citations, structure, diagrams and links; compare two reports')
+    .option('-r, --repo <dir>', 'Repository the wiki documents (default: recorded in .semanticwiki-run.json)')
+    .option('--json', 'Print the full machine-readable report')
+    .option('--out <file>', 'Write the JSON report to this file (default: <wiki>/.semanticwiki-eval.json)')
+    .option('--no-write', 'Do not write a report file')
+    .option('--min-reward <n>', 'Exit 1 when the mean page reward is below this threshold', parseFloat)
+    .option('--min-validity <n>', 'Exit 1 when citation validity is below this threshold', parseFloat)
+    .option('--compare <reports...>', 'Compare two JSON reports (A B): paired deltas of B minus A')
+    .action(async (wikiArg: string | undefined, options) => {
+      if (options.compare) {
+        if (options.compare.length !== 2) { console.error('eval --compare needs exactly two report files.'); process.exit(2); }
+        const [a, b] = options.compare.map((file: string) => JSON.parse(fs.readFileSync(path.resolve(file), 'utf8')) as EvalReport);
+        if (a.formatVersion !== 1 || b.formatVersion !== 1) { console.error('Both reports must be formatVersion 1 eval reports.'); process.exit(2); }
+        const comparison = compareReports(a, b);
+        if (options.json) { console.log(JSON.stringify(comparison, null, 2)); return; }
+        console.log(`Paired comparison over ${comparison.cells} shared pages (B minus A)\n`);
+        console.log('| Metric | Delta | 95% CI | p |\n| --- | ---: | --- | ---: |');
+        for (const delta of comparison.deltas) console.log(`| ${delta.metric} | ${delta.delta > 0 ? '+' : ''}${delta.delta} | [${delta.ci95[0]}, ${delta.ci95[1]}] | ${delta.pTwoSided} |`);
+        if (comparison.onlyInA.length || comparison.onlyInB.length) console.log(`\nUnpaired pages: only in A ${comparison.onlyInA.length}, only in B ${comparison.onlyInB.length}`);
+        return;
+      }
+      const wikiDir = path.resolve(wikiArg || './wiki');
+      if (!fs.existsSync(wikiDir)) { console.error(`Wiki directory not found: ${wikiDir}`); process.exit(2); }
+      let repo: string | undefined = options.repo ? path.resolve(options.repo) : undefined;
+      if (!repo) {
+        try {
+          const run = JSON.parse(fs.readFileSync(path.join(wikiDir, '.semanticwiki-run.json'), 'utf8'));
+          if (run.formatVersion === 1 && typeof run.sourcePath === 'string' && path.isAbsolute(run.sourcePath)) repo = run.sourcePath;
+        } catch { /* no run manifest */ }
+      }
+      if (!repo || !fs.existsSync(repo)) { console.error('Pass --repo <dir>: the repository is needed to verify citations.'); process.exit(2); }
+      const report = evaluateWiki(wikiDir, repo);
+      if (options.write !== false) {
+        const out = path.resolve(options.out || path.join(wikiDir, '.semanticwiki-eval.json'));
+        fs.writeFileSync(out, JSON.stringify(report, null, 2) + '\n');
+      }
+      const failures: string[] = [];
+      if (Number.isFinite(options.minReward) && report.summary.meanReward < options.minReward) failures.push(`mean reward ${report.summary.meanReward} < ${options.minReward}`);
+      if (Number.isFinite(options.minValidity) && report.summary.citations.validity < options.minValidity) failures.push(`citation validity ${report.summary.citations.validity} < ${options.minValidity}`);
+      if (options.json) console.log(JSON.stringify({ ...report, thresholds: { passed: failures.length === 0, failures } }, null, 2));
+      else {
+        console.log(renderReportMarkdown(report));
+        for (const failure of failures) console.error(`Threshold failed: ${failure}`);
+      }
+      if (failures.length) process.exit(1);
     });
 
   const models = program.command('models').description('List, prepare and verify shared local models');

@@ -174,6 +174,8 @@ program
   .option('--context-size <n>', 'Context window size for local models (default: 8192)', positiveInteger)
   .option('--threads <n>', 'CPU threads for local inference (default: auto)', positiveInteger)
   .option('--compact-search', 'Truncate search results to reduce token usage (auto-enabled for large codebases)')
+  .option('--trajectories <file>', 'Local writer: append one JSONL record per page attempt (prompt, evidence, response, score)')
+  .option('--no-citation-repair', 'Local writer: skip the repair turn when citations do not resolve')
   // Contextual retrieval options
   .option('--contextual', 'Enable contextual retrieval for better chunk understanding (uses Claude API)')
   .option('--contextual-local', 'Use local LLM for contextual retrieval instead of Claude API')
@@ -392,6 +394,8 @@ program
         contextSize: options.contextSize,
         threads: options.threads,
         compactSearch: options.compactSearch,
+        trajectoryPath: options.trajectories,
+        citationRepair: options.citationRepair,
         // Contextual retrieval options
         useContextualRetrieval: options.contextual || options.contextualLocal,
         contextualLocal: options.contextualLocal,
@@ -708,7 +712,7 @@ program
           verbose: options.verbose,
           fullLocal: options.fullLocal, useOllama: options.useOllama,
           localModel: options.localModel, modelPath: options.modelPath, ollamaHost: options.ollamaHost,
-          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns,
+          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns, trajectoryPath: options.trajectories, citationRepair: options.citationRepair,
           forceRegenerate: true  // Force re-index to update commit hash
         })) {
           if (event.type === 'phase') {
@@ -1055,7 +1059,7 @@ program
           directApi: options.directApi,
           fullLocal: options.fullLocal, useOllama: options.useOllama,
           localModel: options.localModel, modelPath: options.modelPath, ollamaHost: options.ollamaHost,
-          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns,
+          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns, trajectoryPath: options.trajectories, citationRepair: options.citationRepair,
           // Pass the surgical update context
           updateContext: {
             newFiles,
@@ -1293,7 +1297,7 @@ program
         directApi: options.directApi,
         fullLocal: options.fullLocal, useOllama: options.useOllama,
           localModel: options.localModel, modelPath: options.modelPath, ollamaHost: options.ollamaHost,
-          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns
+          contextSize: options.contextSize, gpuLayers: options.gpuLayers, threads: options.threads, maxTurns: options.maxTurns, trajectoryPath: options.trajectories, citationRepair: options.citationRepair
       };
 
       let generator;
@@ -3002,6 +3006,8 @@ for (const command of program.commands.filter(command => ['continue', 'update-do
   add('--gpu-layers <n>', 'GPU offload layers (0 for CPU)', nonnegativeInteger);
   add('--threads <n>', 'Local CPU threads', positiveInteger);
   add('--max-turns <n>', 'Maximum writer turns', positiveInteger);
+  add('--trajectories <file>', 'Local writer: append JSONL page attempts');
+  add('--no-citation-repair', 'Local writer: skip the citation repair turn');
 }
 
 // Read stdin history before parsing commander args (synchronous)

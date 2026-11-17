@@ -255,6 +255,7 @@ export class OllamaProvider implements LLMProvider {
     };
     prompt_eval_count?: number;
     eval_count?: number;
+    done_reason?: string;
   }): LLMResponse {
     const toolCalls: LLMToolCall[] = [];
 
@@ -274,7 +275,9 @@ export class OllamaProvider implements LLMProvider {
     return {
       content: response.message.content || '',
       toolCalls,
-      stopReason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+      // Ollama reports a token-limited reply as done_reason 'length'; surface it so
+      // callers can retry instead of accepting a truncated page.
+      stopReason: toolCalls.length > 0 ? 'tool_use' : response.done_reason === 'length' ? 'max_tokens' : 'end_turn',
       usage: {
         inputTokens: response.prompt_eval_count || 0,
         outputTokens: response.eval_count || 0,

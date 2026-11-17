@@ -36,4 +36,11 @@ describe('Ollama tool history', () => {
     await provider.initialize();
     await expect(provider.chat([], [], { maxTokens: 100 })).rejects.toThrow('model unavailable');
   });
+
+  it('reports a token-limited reply as max_tokens so truncated pages are retried', async () => {
+    mock.chat.mockResolvedValue({ message: { content: 'Half a page' }, done_reason: 'length' });
+    const provider = new OllamaProvider({ model: 'fixture' });
+    await provider.initialize();
+    expect((await provider.chat([{ role: 'user', content: 'Write' }], [], { maxTokens: 10 })).stopReason).toBe('max_tokens');
+  });
 });

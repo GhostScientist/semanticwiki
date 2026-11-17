@@ -47,6 +47,12 @@ jobs:
       - name: Check published contents
         run: npm pack --dry-run --ignore-scripts
 
+      - name: Reward and prompt conformance (Python mirror)
+        run: |
+          python3 -I research/tests/test_reward_conformance.py
+          python3 -I research/tests/test_prompt_conformance.py
+          python3 -I research/grpo_train.py --repos-dir . --max-repos 1 --dry-run --output /tmp/sw-dry-run
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest

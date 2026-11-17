@@ -54,6 +54,24 @@ try {
   fs.appendFileSync(path.join(wiki, 'README.md'), '\n[Missing](missing.md)\n');
   run(['continue', '-r', root, '--verify-only'], 1);
   assert.match(run(['preview', '--theme', 'invalid'], 1).stderr, /Theme must/);
+  const evalRepo = path.join(root, 'repo');
+  fs.mkdirSync(path.join(evalRepo, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(evalRepo, 'src/auth.ts'), 'export class AuthService {\n  validateToken(token: string) { return token.length > 0; }\n}\n');
+  fs.writeFileSync(path.join(wiki, 'architecture/overview.md'), `# Request lifecycle\n\n## Authentication\n\n${'The AuthService validates the session token. '.repeat(40)}\n\nThe \`AuthService.validateToken\` method rejects empty tokens (\`src/auth.ts:2\`). A phantom lives in \`src/ghost.ts:1\`. [Home](../README.md)\n`);
+  assert.match(run(['eval', path.join(root, 'nope'), '--repo', evalRepo], 2).stderr, /not found/);
+  const evalReport = JSON.parse(run(['eval', wiki, '--repo', evalRepo, '--json']).stdout);
+  assert.equal(evalReport.formatVersion, 1);
+  assert.equal(evalReport.summary.citations.total, 2);
+  assert.equal(evalReport.summary.citations.valid, 1);
+  assert.equal(evalReport.thresholds.passed, true);
+  assert.ok(fs.existsSync(path.join(wiki, '.semanticwiki-eval.json')));
+  run(['eval', wiki, '--repo', evalRepo, '--min-validity', '1', '--no-write'], 1);
+  fs.copyFileSync(path.join(wiki, '.semanticwiki-eval.json'), path.join(root, 'before.json'));
+  fs.writeFileSync(path.join(wiki, 'architecture/overview.md'), fs.readFileSync(path.join(wiki, 'architecture/overview.md'), 'utf8').replace('src/ghost.ts:1', 'src/auth.ts:1-3'));
+  run(['eval', wiki, '--repo', evalRepo, '--out', path.join(root, 'after.json')]);
+  const comparison = JSON.parse(run(['eval', '--compare', path.join(root, 'before.json'), path.join(root, 'after.json'), '--json']).stdout);
+  assert.equal(comparison.cells, 2);
+  assert.ok(comparison.deltas.find(delta => delta.metric === 'validity').delta > 0);
   assert.ok(!fs.existsSync(env.SEMANTICWIKI_HOME), 'Model-free commands must not download weights');
   console.log(`CLI contracts passed (${version}; isolated cwd, no keys or downloads).`);
 } finally {

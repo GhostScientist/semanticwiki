@@ -11,5 +11,6 @@ Start with the [README](../README.md) for installation, provider choice and ever
 - [Local testing](LOCAL_ONLY_TESTING.md): native model and fixture workflow checks.
 - [Contributing](../CONTRIBUTING.md): automated checks and release process.
 - [Product direction](PRODUCT_DIRECTION.md): longer-term design guidance, including proposals not yet shipped.
+- [Reward loop](research/REWARD_LOOP.md): how `eval`, the local writer contract and the training kit form one measurement loop, and what to run next.
 
 Historical/forward-looking plans are in the repository's [plans directory](https://github.com/GhostScientist/semanticwiki/tree/master/docs/plans). They are not the current command reference and are not included in the npm package.

@@ -222,11 +222,15 @@ describe('wiki generation contracts', () => {
     expect(prompt).toContain('documentation only, not implementation code');
     expect(prompt).toContain('missing code in this page context does not mean the repository contains only documentation');
     expect(prompt).toContain('Do not invent illustrative implementations, APIs, method names');
-    expect(prompt).toContain(readme);
+    expect(prompt).toContain('### FILE: README.md (2 lines)');
+    expect(prompt).toContain('   1| # Fixture');
     expect(prompt).not.toMatch(/React|useAuth|SECRET_OUTSIDE_REPOSITORY|MISSING_FILE_EVIDENCE/);
     const page = fs.readFileSync(path.join(wiki, 'documentation.md'), 'utf8');
     expect(matter(page).data.sources).toEqual([{ resource: 'README.md' }]);
-    expect(page).toContain('- `README.md`');
+    expect(matter(page).data.evidence).toEqual({ promptVersion: 'local-page/2', spans: [{ file: 'README.md', start: 1, end: 2 }] });
+    expect(matter(page).data.verified).toBeUndefined();
+    expect(matter(page).data.verification).toMatchObject({ citations: { total: 0, valid: 0 }, guards: ['uncited'] });
+    expect(page).toContain('- `README.md:1-2`');
     expect(page).not.toContain('invented.ts');
     expect(page).not.toContain('#L');
     expect(events.at(-1).type).toBe('complete');
@@ -249,5 +253,73 @@ describe('wiki generation contracts', () => {
     expect(index).not.toContain('```');
     expect(index).not.toBe(indexDraft);
     expect(events.at(-1).type).toBe('complete');
+  });
+  describe('citation contract', () => {
+    const source = ['export class AuthService {', '  constructor(private readonly router: Router) {}', '  validateToken(token: string): boolean {', '    return token.length > 0;', '  }', '}', ''].join('\n');
+    const prose = 'The service validates session tokens before routing a request. '.repeat(12);
+    beforeEach(() => {
+      fs.mkdirSync(path.join(repo, 'src'));
+      fs.writeFileSync(path.join(repo, 'src/auth.ts'), source);
+      mocked.search.mockResolvedValue([{ filePath: 'src/auth.ts', startLine: 1, endLine: 6, content: source }]);
+      vi.spyOn(agent as any, 'planPagesFromDiscovery').mockResolvedValue([{ title: 'Auth', filename: 'auth.md', type: 'component', context: 'Token validation', sourceFiles: ['src/auth.ts'] }]);
+    });
+
+    it('supplies line-numbered evidence, verifies citations and stamps a structural verification event', async () => {
+      const draft = `# Auth\n\n## Overview\n\n${prose}\n\nThe \`AuthService\` class is declared in \`src/auth.ts:1-6\`; \`validateToken\` rejects empty tokens (\`src/auth.ts:3-5\`).\n`;
+      mocked.chat.mockResolvedValueOnce(response({ content: draft })).mockResolvedValueOnce(response({ content: '# Index\n\n[Auth](./auth.md)' }));
+      const trajectoryPath = path.join(root, 'out/trajectories.jsonl');
+      await collect(agent.generateWikiLocalPageByPage({ repoUrl: repo, outputDir: wiki, fullLocal: true, trajectoryPath }));
+      const [messages, , chatOptions] = mocked.chat.mock.calls[0];
+      expect(chatOptions.systemPrompt).toContain('`path:line` or `path:start-end`');
+      expect(messages[0].content).toContain('### FILE: src/auth.ts (6 lines)');
+      expect(messages[0].content).toContain('   3|   validateToken(token: string): boolean {');
+      expect(mocked.chat).toHaveBeenCalledTimes(2); // no repair turn when every citation resolves
+      const page = matter(fs.readFileSync(path.join(wiki, 'auth.md'), 'utf8'));
+      expect(page.data.verification).toMatchObject({ rewardVersion: 1, repaired: false, citations: { total: 2, valid: 2, validInContext: 2 }, guards: [] });
+      expect(page.data.verified).toEqual([{ by: 'semanticwiki/citation-check@1', at: expect.any(String) }]);
+      expect(page.data.generated.by).toBe('semanticwiki/local/fake');
+      expect(page.content).toContain('[`src/auth.ts:3-5`](../src/auth.ts#L3-L5)');
+      expect(page.content).toContain('2 of 2 citations resolve');
+      const records = fs.readFileSync(trajectoryPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({ schemaVersion: 1, promptVersion: 'local-page/2', phase: 'draft', page: 'auth.md', accepted: true, evidence: [{ file: 'src/auth.ts', start: 1, end: 6 }], score: { reward: expect.any(Number) } });
+      expect(records[0].prompt).toContain('<START_OF_CONTEXT>');
+      expect(records[0].system).toBe(chatOptions.systemPrompt);
+    });
+
+    it('sends one repair turn for unresolved citations and keeps the better page', async () => {
+      const bad = `# Auth\n\n## Overview\n\n${prose}\n\nThe class lives in \`src/ghost.ts:10-20\` and \`validateToken\` is at \`src/auth.ts:3-5\`.\n`;
+      const fixed = `# Auth\n\n## Overview\n\n${prose}\n\nThe \`AuthService\` class lives in \`src/auth.ts:1-6\` and \`validateToken\` is at \`src/auth.ts:3-5\`.\n`;
+      mocked.chat.mockResolvedValueOnce(response({ content: bad })).mockResolvedValueOnce(response({ content: fixed })).mockResolvedValueOnce(response({ content: '# Index\n\n[Auth](./auth.md)' }));
+      await collect(agent.generateWikiLocalPageByPage({ repoUrl: repo, outputDir: wiki, fullLocal: true }));
+      expect(mocked.chat).toHaveBeenCalledTimes(3);
+      const repairMessages = mocked.chat.mock.calls[1][0];
+      expect(repairMessages.map((message: any) => message.role)).toEqual(['user', 'assistant', 'user']);
+      expect(repairMessages[2].content).toContain('`src/ghost.ts:10-20` (file-not-found)');
+      expect(repairMessages[2].content).toContain('- src/auth.ts: lines 1-6');
+      const page = matter(fs.readFileSync(path.join(wiki, 'auth.md'), 'utf8'));
+      expect(page.content).not.toContain('ghost.ts');
+      expect(page.data.verification).toMatchObject({ repaired: true, citations: { total: 2, valid: 2 } });
+      expect(page.data.verified).toHaveLength(1);
+    });
+
+    it('rejects a repair that does not improve the page and never stamps verification on unresolved citations', async () => {
+      const bad = `# Auth\n\n## Overview\n\n${prose}\n\nThe class lives in \`src/ghost.ts:10-20\` and \`validateToken\` is at \`src/auth.ts:3-5\`.\n`;
+      const worse = `# Auth\n\n## Overview\n\n${prose}\n\nThe class lives in \`src/ghost.ts:10-20\` and in \`src/phantom.ts:1\`.\n`;
+      mocked.chat.mockResolvedValueOnce(response({ content: bad })).mockResolvedValueOnce(response({ content: worse })).mockResolvedValueOnce(response({ content: '# Index\n\n[Auth](./auth.md)' }));
+      await collect(agent.generateWikiLocalPageByPage({ repoUrl: repo, outputDir: wiki, fullLocal: true }));
+      const page = matter(fs.readFileSync(path.join(wiki, 'auth.md'), 'utf8'));
+      expect(page.content).toContain('validateToken');
+      expect(page.data.verification).toMatchObject({ repaired: false, citations: { total: 2, valid: 1 } });
+      expect(page.data.verified).toBeUndefined();
+      expect(page.content).toContain('1 of 2 citations resolve');
+    });
+
+    it('skips the repair turn when disabled', async () => {
+      const bad = `# Auth\n\n## Overview\n\n${prose}\n\nThe class lives in \`src/ghost.ts:10-20\`.\n`;
+      mocked.chat.mockResolvedValueOnce(response({ content: bad })).mockResolvedValueOnce(response({ content: '# Index\n\n[Auth](./auth.md)' }));
+      await collect(agent.generateWikiLocalPageByPage({ repoUrl: repo, outputDir: wiki, fullLocal: true, citationRepair: false }));
+      expect(mocked.chat).toHaveBeenCalledTimes(2);
+    });
   });
 });

@@ -51,6 +51,7 @@ semanticwiki generate -r . --provider anthropic --site
 
 # Inspect the existing wiki without a model or credentials.
 semanticwiki verify -o ./wiki --json
+semanticwiki eval ./wiki -r . --json          # citations, structure, diagrams, links, reward
 semanticwiki search "authentication flow" -o ./wiki --json
 semanticwiki preview -o ./wiki --theme dark
 
@@ -64,7 +65,7 @@ semanticwiki update-embeddings -r . -o ./wiki
 semanticwiki preview -o ./wiki
 ```
 
-`verify` checks page existence and internal Markdown links. It does **not** certify that the generated explanation is factually correct or that every source citation is current. Review the wiki against its sources before publishing. Empty or incomplete generation returns a nonzero exit status; partial pages remain available for inspection and `continue`.
+`verify` checks page existence and internal Markdown links. `eval` goes further: it resolves every `path:line` citation against the repository (file exists, lines in range, non-empty, inside the evidence the writer saw), checks page structure and Mermaid syntax, and reports one page reward with the guards that fired. `eval --compare a.json b.json` gives paired deltas with confidence intervals between two runs. Neither command certifies that an explanation is factually correct: a citation that resolves can still support a wrong claim. Review the wiki against its sources before publishing. Empty or incomplete generation returns a nonzero exit status; partial pages remain available for inspection and `continue`.
 
 `update-wiki` compares current source contents with the last completed documentation snapshot. When that fingerprint changes, it conservatively refreshes **all existing wiki pages**, including pages about deleted untracked files or dirty files later reverted to Git HEAD. This costs more than a selective update; use `--dry-run` to inspect the scope first. Legacy wikis without a fingerprint use Git changes and source-reference heuristics. `update-docs` remains a broader regeneration command. Documentation commits and content fingerprints are tracked separately from the retrieval index, so refreshing embeddings does not hide pending documentation changes.
 
@@ -146,6 +147,9 @@ Run `semanticwiki <command> --help` for the complete reference.
 | Improve chunk context | `generate --contextual` (extra Anthropic requests) or `--contextual-local` |
 | Search cached code without an embedding download | `search "term" --code --mode keyword --json` |
 | Check local weights | `models list`, `models verify` |
+| Gate generated docs in CI | `eval ./wiki -r . --min-validity 0.9 --min-reward 0.6` |
+| Capture local page attempts for evaluation or training | `generate --provider local --trajectories ./runs/pages.jsonl` |
+| Skip the local citation repair turn | `generate --provider local --no-citation-repair` |
 | Share a wiki and its index | `pack -o ./wiki -f ./project.semantics` |
 | Extract a package | `unpack ./project.semantics -o ./extracted` |
 
@@ -162,7 +166,7 @@ npm run test:coverage
 npm pack --dry-run --ignore-scripts
 ```
 
-The default tests use fixtures and fake providers; they do not require API keys or large downloads. See [CONTRIBUTING.md](CONTRIBUTING.md) for native/live smoke tests, release checks and project structure. Historical plans are under [docs/plans](docs/README.md); they are not promises about implemented features.
+The default tests use fixtures and fake providers; they do not require API keys or large downloads. The evaluation loop that connects the CLI to model training (reward design, GRPO training, held-out comparison) is documented in [docs/research/REWARD_LOOP.md](docs/research/REWARD_LOOP.md) with its Python half under [research/](research/README.md). See [CONTRIBUTING.md](CONTRIBUTING.md) for native/live smoke tests, release checks and project structure. Historical plans are under [docs/plans](docs/README.md); they are not promises about implemented features.
 
 ## License
 
